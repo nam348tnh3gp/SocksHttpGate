@@ -1,6 +1,6 @@
 # Universal Proxy Pro
 
-![Proxy Icon](https://img.shields.io/badge/Version-3.5-blue) ![Python](https://img.shields.io/badge/Python-3.6%2B-brightgreen) ![License](https://img.shields.io/badge/License-MIT-yellow)
+![Proxy Icon](https://img.shields.io/badge/Version-6.0-blue) ![Python](https://img.shields.io/badge/Python-3.6%2B-brightgreen) ![License](https://img.shields.io/badge/License-MIT-yellow)
 
 A versatile proxy server written in Python that supports both SOCKS5 and HTTP/HTTPS protocols on the same port. It provides secure tunneling, authentication, real-time logging, traffic statistics, and enhanced stability for reliable connections in various network environments.
 
