@@ -21,6 +21,7 @@ import base64
 import threading
 import subprocess
 import errno
+import socketserver
 from urllib.parse import urlparse
 
 # ====================== CONFIG ======================
@@ -44,13 +45,26 @@ RED    = "\033[91m"
 BLUE   = "\033[94m"
 CYAN   = "\033[96m"
 PURPLE = "\033[95m"
+WHITE  = "\033[97m"
 RESET  = "\033[0m"
 
+# Custom formatter for connection logs
+class ConnectionFilter(logging.Filter):
+    def filter(self, record):
+        # Only show connection logs, hide debug/warning/info noise
+        return hasattr(record, 'connection') and record.connection
+
+# Setup logging with connection filter
 logging.basicConfig(
     level=logging.INFO,
     format=f'{BLUE}%(asctime)s{RESET} │ %(message)s',
     datefmt='%H:%M:%S'
 )
+
+# Create a separate logger for connection logs
+connection_logger = logging.getLogger('connection')
+connection_logger.setLevel(logging.INFO)
+connection_logger.addFilter(ConnectionFilter())
 
 stats = {
     "start": time.time(),
@@ -66,7 +80,7 @@ stats = {
     "udp_down": 0
 }
 
-active_conns = set()           # {(ip, port, type), ...}
+active_conns = set()           # {(ip, port, type, target), ...}
 udp_assocs = {}                 # {assoc_id: UDPAssociation}
 stats_lock   = threading.Lock()
 active_lock  = threading.Lock()
@@ -227,7 +241,7 @@ class UDPRelayThread(threading.Thread):
             logging.debug(f"UDP reply error: {e}")
 
 # ====================== TCP SERVER ======================
-class ThreadedProxyServer(threading.ThreadingMixIn, socket.socket):
+class ThreadedProxyServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
@@ -240,11 +254,12 @@ class ThreadedProxyServer(threading.ThreadingMixIn, socket.socket):
         super().__init__(server_address, RequestHandlerClass)
 
 # ====================== MAIN HANDLER ======================
-class ProxyHandler(socket.StreamRequestHandler):
+class ProxyHandler(socketserver.StreamRequestHandler):
 
     def handle(self):
         client_ip, client_port = self.client_address
         conn_type = None
+        target = ""
 
         with stats_lock:
             if stats["current"] >= MAX_CONNECTIONS:
@@ -267,9 +282,6 @@ class ProxyHandler(socket.StreamRequestHandler):
                 conn_type = "HTTP"
                 with stats_lock:
                     stats["http"] += 1
-                with active_lock:
-                    active_conns.add((client_ip, client_port, conn_type))
-                logging.info(f"{GREEN}HTTP   → {client_ip}:{client_port}{RESET}")
                 self.handle_http()
             else:
                 logging.warning(f"{YELLOW}Unknown protocol from {client_ip}:{client_port} (byte: {first_byte}){RESET}")
@@ -278,15 +290,16 @@ class ProxyHandler(socket.StreamRequestHandler):
         finally:
             with stats_lock:
                 stats["current"] -= 1
-            if conn_type == "HTTP":
+            if conn_type:
                 with active_lock:
-                    active_conns.discard((client_ip, client_port, "HTTP"))
+                    active_conns.discard((client_ip, client_port, conn_type, target))
 
     # ---------- SOCKS5 (TCP + UDP) ----------
     def handle_socks5(self):
         client_ip, client_port = self.client_address
         assoc = None
         conn_type = None
+        target = ""
 
         try:
             ver, nmethods = struct.unpack("!BB", self.connection.recv(2))
@@ -309,6 +322,9 @@ class ProxyHandler(socket.StreamRequestHandler):
                 if not host:
                     self._socks5_reply(0x04)
                     return
+                target = f"{host}:{port}"
+                # Log connection
+                self._log_connection(f"{GREEN}SOCKS5 TCP → {client_ip}:{client_port} → {WHITE}{target}{RESET}")
                 remote = self._connect_remote(host, port)
                 if not remote:
                     self._socks5_reply(0x05)
@@ -316,15 +332,16 @@ class ProxyHandler(socket.StreamRequestHandler):
                 bind_ip, bind_port = remote.getsockname()[:2]
                 self._socks5_reply(0x00, bind_ip, bind_port)
                 with active_lock:
-                    active_conns.add((client_ip, client_port, conn_type))
+                    active_conns.add((client_ip, client_port, conn_type, target))
                 with stats_lock:
                     stats["socks5_tcp"] += 1
-                logging.info(f"{GREEN}SOCKS5 TCP → {client_ip}:{client_port}{RESET}")
                 self._tunnel(self.connection, remote)
 
             elif cmd == SOCKS5_CMD_UDP:
                 conn_type = "SOCKS5_UDP"
                 host, port = self._read_socks5_addr(atyp)   # client requested bind address (ignored)
+                target = f"UDP:{host}:{port}" if host else "UDP:any"
+                self._log_connection(f"{PURPLE}UDP Associate → {client_ip}:{client_port} → {WHITE}{target}{RESET}")
                 udp_port = self._find_free_port()
                 assoc = UDPAssociation((client_ip, client_port), udp_port)
                 if not assoc.create_relay():
@@ -333,14 +350,13 @@ class ProxyHandler(socket.StreamRequestHandler):
                 with udp_lock:
                     udp_assocs[f"{client_ip}:{client_port}:{udp_port}"] = assoc
                 with active_lock:
-                    active_conns.add((client_ip, client_port, conn_type))
+                    active_conns.add((client_ip, client_port, conn_type, target))
                 with stats_lock:
                     stats["socks5_udp"] += 1
                 bind_ip = self.server.server_address[0]
                 if bind_ip == '0.0.0.0':
                     bind_ip = '127.0.0.1'
                 self._socks5_reply(0x00, bind_ip, udp_port)
-                logging.info(f"{PURPLE}UDP Associate → {client_ip}:{client_port} (relay port {udp_port}){RESET}")
                 self._keep_udp_association(assoc)
             else:
                 self._socks5_reply(0x07)
@@ -356,7 +372,12 @@ class ProxyHandler(socket.StreamRequestHandler):
                             break
             if conn_type:
                 with active_lock:
-                    active_conns.discard((client_ip, client_port, conn_type))
+                    active_conns.discard((client_ip, client_port, conn_type, target))
+
+    def _log_connection(self, message):
+        """Log connection with special flag for filter"""
+        extra = {'connection': True}
+        connection_logger.info(message, extra=extra)
 
     def _socks5_auth(self):
         try:
@@ -432,7 +453,11 @@ class ProxyHandler(socket.StreamRequestHandler):
 
     # ---------- HTTP/HTTPS ----------
     def handle_http(self):
+        client_ip, client_port = self.client_address
         remote = None
+        target = ""
+        method = ""
+        
         try:
             # Read request line
             request_line = self.rfile.readline(BUFFER_SIZE).decode('latin-1', errors='ignore').strip()
@@ -468,10 +493,20 @@ class ProxyHandler(socket.StreamRequestHandler):
                 host_port = url.split(':', 1)
                 host = host_port[0]
                 port = int(host_port[1]) if len(host_port) > 1 else 443
+                target = f"{host}:{port}"
             else:
                 parsed = urlparse(url if url.startswith(('http://', 'https://')) else 'http://' + url)
                 host = parsed.hostname
                 port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+                target = f"{host}:{port}"
+                if parsed.path:
+                    target += parsed.path[:50]  # Limit path length for display
+            
+            # Log HTTP connection with URL
+            self._log_connection(f"{GREEN}HTTP {method} → {client_ip}:{client_port} → {WHITE}{target}{RESET}")
+            
+            with active_lock:
+                active_conns.add((client_ip, client_port, "HTTP", target))
 
             remote = self._connect_remote(host, port)
             if not remote:
@@ -496,6 +531,8 @@ class ProxyHandler(socket.StreamRequestHandler):
                     remote.close()
                 except:
                     pass
+            with active_lock:
+                active_conns.discard((client_ip, client_port, "HTTP", target))
 
     def _http_auth(self, headers):
         auth = headers.get('proxy-authorization', '')
@@ -595,7 +632,8 @@ class ProxyHandler(socket.StreamRequestHandler):
                 sock = socket.socket(family)
                 sock.settimeout(CONNECTION_TIMEOUT)
                 sock.connect((host, port))
-                logging.info(f"{CYAN}→ {host}:{port} (try {attempt+1}){RESET}")
+                # Log successful connection with target
+                self._log_connection(f"{CYAN}✓ Connected to {host}:{port}{RESET}")
                 return sock
             except Exception as e:
                 if attempt == RETRY_ATTEMPTS - 1:
@@ -639,8 +677,10 @@ def format_bytes(b):
     return f"{b:.1f} PiB"
 
 def realtime_stats():
+    """Display realtime stats without spamming - uses carriage return to overwrite"""
     while True:
-        time.sleep(10)
+        time.sleep(2)  # Update every 2 seconds for smoother display
+        
         uptime = time.time() - stats["start"]
         h = int(uptime // 3600)
         m = int((uptime % 3600) // 60)
@@ -648,19 +688,27 @@ def realtime_stats():
 
         with active_lock:
             cur = len(active_conns)
-            s5_tcp = sum(1 for _, _, t in active_conns if t == "SOCKS5_TCP")
-            s5_udp = sum(1 for _, _, t in active_conns if t == "SOCKS5_UDP")
-            http = sum(1 for _, _, t in active_conns if t == "HTTP")
+            s5_tcp = sum(1 for _, _, t, _ in active_conns if t == "SOCKS5_TCP")
+            s5_udp = sum(1 for _, _, t, _ in active_conns if t == "SOCKS5_UDP")
+            http = sum(1 for _, _, t, _ in active_conns if t == "HTTP")
 
         with udp_lock:
             udp_assoc_count = len(udp_assocs)
-
-        logging.info(
-            f"{YELLOW}↑TCP {format_bytes(stats['bytes_up']):>9} ↓TCP {format_bytes(stats['bytes_down']):>9} │ "
-            f"↑UDP {format_bytes(stats['udp_up']):>7} ↓UDP {format_bytes(stats['udp_down']):>7}{RESET}\n"
-            f"{CYAN}  Active: {cur:>4} (TCP:{s5_tcp:>3} UDP:{s5_udp:>3} HTTP:{http:>3}) │ "
-            f"UDP Assoc: {udp_assoc_count:>3} │ Uptime {h:02d}:{m:02d}:{s:02d}{RESET}"
-        )
+        
+        # Build stats line with colors
+        line1 = (f"{YELLOW}↑TCP {format_bytes(stats['bytes_up']):>9} ↓TCP {format_bytes(stats['bytes_down']):>9} │ "
+                f"↑UDP {format_bytes(stats['udp_up']):>7} ↓UDP {format_bytes(stats['udp_down']):>7}{RESET}")
+        
+        line2 = (f"{CYAN}Active: {cur:>4} (TCP:{s5_tcp:>3} UDP:{s5_udp:>3} HTTP:{http:>3}) │ "
+                f"UDP Assoc: {udp_assoc_count:>3} │ Uptime {h:02d}:{m:02d}:{s:02d}{RESET}")
+        
+        # Move cursor up 2 lines, clear lines and print new stats
+        sys.stdout.write('\033[2A')  # Move up 2 lines
+        sys.stdout.write('\033[2K')  # Clear current line
+        sys.stdout.write(line1 + '\n')
+        sys.stdout.write('\033[2K')  # Clear next line
+        sys.stdout.write(line2 + '\n')
+        sys.stdout.flush()
 
 def kill_port(port):
     try:
@@ -678,6 +726,9 @@ def shutdown():
         for assoc in udp_assocs.values():
             assoc.close()
         udp_assocs.clear()
+    
+    # Print final stats with newline
+    sys.stdout.write('\n')  # Ensure we're on a new line
     logging.info(
         f"{RED}Proxy STOPPED │ Uptime {h:02d}:{m:02d}:{s:02d} │ "
         f"Total conn {stats['total']} │ "
@@ -713,6 +764,9 @@ def main():
     auth_str = f" (auth: {args.username}:{args.password})" if args.username else ""
     logging.info(f"{GREEN}Proxy v5.2 STARTED → {args.listen}:{args.port}{auth_str}{RESET}")
     logging.info(f"{CYAN}Features: SOCKS5 TCP/UDP + HTTP/HTTPS on same port (fixed UDP/HTTP body){RESET}")
+    
+    # Print initial empty lines for stats display
+    print("\n" * 2)
 
     threading.Thread(target=realtime_stats, daemon=True).start()
 
