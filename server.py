@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Universal Proxy Pro v5.2 - Fully Fixed
-- SOCKS5 + HTTP/HTTPS on same port
-- Full UDP ASSOCIATE (cross‑platform, select based)
+Universal Proxy Pro v6.0 - Ultimate Edition
+- SOCKS5 + HTTP/HTTPS on same port (IPv6 ready)
+- UDP ASSOCIATE using selectors (epoll/kqueue)
 - HTTP body forwarding (POST, PUT, PATCH, chunked)
-- Fixed connection leaks and stats locks
+- ThreadPoolExecutor for connections
+- Upstream load balancing (round-robin)
+- TLS support (HTTPS proxy)
+- Web dashboard (realtime stats)
+- Configurable UDP on/off
 """
 
 import logging
-import select
+import selectors
 import socket
 import struct
 import argparse
@@ -22,7 +26,16 @@ import threading
 import subprocess
 import errno
 import socketserver
+import json
 from urllib.parse import urlparse
+from collections import defaultdict
+import resource
+import psutil
+from concurrent.futures import ThreadPoolExecutor
+import ssl
+import os
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import urllib.parse
 
 # ====================== CONFIG ======================
 SOCKS5_VER = 5
@@ -38,6 +51,7 @@ RETRY_ATTEMPTS       = 5
 BUFFER_SIZE          = 65536
 UDP_BUFFER_SIZE      = 65535
 UDP_IDLE_TIMEOUT     = 120
+DASHBOARD_PORT       = 8081
 
 GREEN  = "\033[92m"
 YELLOW = "\033[93m"
@@ -48,24 +62,21 @@ PURPLE = "\033[95m"
 WHITE  = "\033[97m"
 RESET  = "\033[0m"
 
-# Custom formatter for connection logs
+# Logging
 class ConnectionFilter(logging.Filter):
     def filter(self, record):
-        # Only show connection logs, hide debug/warning/info noise
         return hasattr(record, 'connection') and record.connection
 
-# Setup logging with connection filter
 logging.basicConfig(
     level=logging.INFO,
     format=f'{BLUE}%(asctime)s{RESET} │ %(message)s',
     datefmt='%H:%M:%S'
 )
-
-# Create a separate logger for connection logs
 connection_logger = logging.getLogger('connection')
 connection_logger.setLevel(logging.INFO)
 connection_logger.addFilter(ConnectionFilter())
 
+# Stats
 stats = {
     "start": time.time(),
     "total": 0,
@@ -79,31 +90,37 @@ stats = {
     "udp_up": 0,
     "udp_down": 0
 }
+active_conns = set()
+udp_assocs = {}
+stats_lock = threading.Lock()
+active_lock = threading.Lock()
+udp_lock = threading.Lock()
 
-active_conns = set()           # {(ip, port, type, target), ...}
-udp_assocs = {}                 # {assoc_id: UDPAssociation}
-stats_lock   = threading.Lock()
-active_lock  = threading.Lock()
-udp_lock     = threading.Lock()
+# Upstream proxies (list of (host, port))
+upstream_proxies = []
+upstream_index = 0
+upstream_lock = threading.Lock()
 
-# ====================== UDP ASSOCIATION ======================
+# ====================== UDP ASSOCIATION (with selectors) ======================
 class UDPAssociation:
-    def __init__(self, client_addr, relay_port):
+    def __init__(self, client_addr, relay_port, selector):
         self.client_addr = client_addr      # (ip, tcp_port)
-        self.client_udp = None              # (ip, udp_port) - learned from first packet
+        self.client_udp = None
         self.relay_port = relay_port
         self.relay_sock = None
         self.dest_map = {}
         self.last_activity = time.time()
         self.active = True
+        self.selector = selector
         self.lock = threading.Lock()
 
     def create_relay(self):
         try:
-            self.relay_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.relay_sock = socket.socket(socket.AF_INET6 if ':' in self.client_addr[0] else socket.AF_INET, socket.SOCK_DGRAM)
             self.relay_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.relay_sock.bind(('0.0.0.0', self.relay_port))
+            self.relay_sock.bind(('', self.relay_port))
             self.relay_sock.setblocking(False)
+            self.selector.register(self.relay_sock, selectors.EVENT_READ, self)
             logging.info(f"{PURPLE}UDP relay on port {self.relay_port} for {self.client_addr}{RESET}")
             return True
         except Exception as e:
@@ -115,6 +132,7 @@ class UDPAssociation:
             self.active = False
             if self.relay_sock:
                 try:
+                    self.selector.unregister(self.relay_sock)
                     self.relay_sock.close()
                 except:
                     pass
@@ -125,94 +143,68 @@ class UDPAssociation:
     def is_expired(self):
         return time.time() - self.last_activity > UDP_IDLE_TIMEOUT
 
-# ====================== UDP RELAY THREAD (select based) ======================
+# ====================== UDP RELAY (selectors based) ======================
 class UDPRelayThread(threading.Thread):
-    def __init__(self):
+    def __init__(self, enable_udp=True):
         super().__init__(daemon=True)
         self.running = True
+        self.selector = selectors.DefaultSelector()
+        self.enable_udp = enable_udp
 
     def run(self):
+        if not self.enable_udp:
+            return
         while self.running:
-            try:
-                self._process_udp()
-                time.sleep(0.01)
-            except Exception as e:
-                logging.error(f"UDP relay error: {e}")
-
-    def _process_udp(self):
-        # Lấy snapshot các socket relay đang hoạt động
-        socks = []
-        assoc_map = {}
-        with udp_lock:
-            for assoc in udp_assocs.values():
-                if assoc.active and assoc.relay_sock:
-                    socks.append(assoc.relay_sock)
-                    assoc_map[assoc.relay_sock.fileno()] = assoc
-        if not socks:
-            time.sleep(0.1)
-            return
-
-        try:
-            rlist, _, _ = select.select(socks, [], [], 0.5)
-        except (ValueError, OSError):
-            return
-
-        for sock in rlist:
-            assoc = assoc_map.get(sock.fileno())
-            if not assoc:
-                continue
-            try:
-                data, addr = sock.recvfrom(UDP_BUFFER_SIZE)
-                assoc.last_activity = time.time()
-
-                # Lần đầu tiên nhận packet → đó là client UDP
-                if assoc.client_udp is None:
-                    assoc.client_udp = addr
-                    logging.info(f"{PURPLE}UDP client registered: {addr[0]}:{addr[1]}{RESET}")
-                    self._forward_client_to_remote(assoc, data, addr)
-                elif addr == assoc.client_udp:
-                    self._forward_client_to_remote(assoc, data, addr)
-                else:
-                    self._forward_remote_to_client(assoc, data, addr)
-            except Exception as e:
-                logging.debug(f"UDP recv error: {e}")
+            events = self.selector.select(timeout=1)
+            for key, mask in events:
+                assoc = key.data
+                if not assoc.active:
+                    continue
+                try:
+                    data, addr = assoc.relay_sock.recvfrom(UDP_BUFFER_SIZE)
+                    assoc.last_activity = time.time()
+                    if assoc.client_udp is None:
+                        assoc.client_udp = addr
+                        logging.info(f"{PURPLE}UDP client registered: {addr[0]}:{addr[1]}{RESET}")
+                        self._forward_client_to_remote(assoc, data, addr)
+                    elif addr == assoc.client_udp:
+                        self._forward_client_to_remote(assoc, data, addr)
+                    else:
+                        self._forward_remote_to_client(assoc, data, addr)
+                except Exception as e:
+                    logging.debug(f"UDP recv error: {e}")
+            # Clean expired associations
+            now = time.time()
+            with udp_lock:
+                for aid in list(udp_assocs.keys()):
+                    assoc = udp_assocs[aid]
+                    if assoc.is_expired():
+                        assoc.close()
+                        del udp_assocs[aid]
 
     def _forward_client_to_remote(self, assoc, data, client_addr):
-        # Parse SOCKS5 UDP request header
+        # Parse SOCKS5 UDP header (same as before)
         if len(data) < 4:
             return
-        rsv = data[0:2]          # unused
         frag = data[2]
         if frag != 0:
-            logging.warning(f"UDP fragmentation not supported (frag={frag})")
             return
         atyp = data[3]
         pos = 4
-        if atyp == 1:            # IPv4
-            if len(data) < pos + 6:
-                return
-            host = socket.inet_ntoa(data[pos:pos+4])
-            pos += 4
-        elif atyp == 3:          # domain
-            if len(data) < pos + 1:
-                return
-            domlen = data[pos]
-            pos += 1
-            if len(data) < pos + domlen + 2:
-                return
-            host = data[pos:pos+domlen].decode('idna', errors='ignore')
-            pos += domlen
-        elif atyp == 4:          # IPv6
-            if len(data) < pos + 18:
-                return
-            host = socket.inet_ntop(socket.AF_INET6, data[pos:pos+16])
-            pos += 16
+        if atyp == 1:  # IPv4
+            if len(data) < pos+6: return
+            host = socket.inet_ntoa(data[pos:pos+4]); pos += 4
+        elif atyp == 3: # domain
+            domlen = data[pos]; pos += 1
+            if len(data) < pos+domlen+2: return
+            host = data[pos:pos+domlen].decode('idna', errors='ignore'); pos += domlen
+        elif atyp == 4: # IPv6
+            if len(data) < pos+18: return
+            host = socket.inet_ntop(socket.AF_INET6, data[pos:pos+16]); pos += 16
         else:
             return
         port = struct.unpack('!H', data[pos:pos+2])[0]
         payload = data[pos+2:]
-
-        # Forward to real destination
         try:
             dest = (host, port)
             assoc.relay_sock.sendto(payload, dest)
@@ -225,8 +217,8 @@ class UDPRelayThread(threading.Thread):
     def _forward_remote_to_client(self, assoc, data, remote_addr):
         if not assoc.client_udp:
             return
-        # Build SOCKS5 UDP response header
-        if ':' in remote_addr[0]:   # IPv6
+        # Build response header
+        if ':' in remote_addr[0]:
             atyp = 4
             bin_addr = socket.inet_pton(socket.AF_INET6, remote_addr[0])
         else:
@@ -240,51 +232,64 @@ class UDPRelayThread(threading.Thread):
         except Exception as e:
             logging.debug(f"UDP reply error: {e}")
 
+    def stop(self):
+        self.running = False
+        self.selector.close()
+
 # ====================== TCP SERVER ======================
 class ThreadedProxyServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, server_address, RequestHandlerClass, username="", password=""):
+    def __init__(self, server_address, RequestHandlerClass, username="", password="", enable_udp=True, upstreams=None, cert=None, key=None):
         self.username = username or ""
         self.password = password or ""
         self.auth_required = bool(username and password)
-        self.udp_relay = UDPRelayThread()
-        self.udp_relay.start()
+        self.enable_udp = enable_udp
+        self.udp_relay = UDPRelayThread(enable_udp) if enable_udp else None
+        if self.udp_relay:
+            self.udp_relay.start()
+        self.executor = ThreadPoolExecutor(max_workers=MAX_CONNECTIONS)
+        self.upstreams = upstreams or []
+        self.cert = cert
+        self.key = key
         super().__init__(server_address, RequestHandlerClass)
+
+    def process_request(self, request, client_address):
+        self.executor.submit(self.process_request_thread, request, client_address)
+
+    def server_close(self):
+        if self.udp_relay:
+            self.udp_relay.stop()
+        self.executor.shutdown(wait=False)
+        super().server_close()
 
 # ====================== MAIN HANDLER ======================
 class ProxyHandler(socketserver.StreamRequestHandler):
-
     def handle(self):
         client_ip, client_port = self.client_address
         conn_type = None
         target = ""
-
         with stats_lock:
             if stats["current"] >= MAX_CONNECTIONS:
                 logging.warning(f"{RED}Max connections reached from {client_ip}{RESET}")
                 return
             stats["total"] += 1
             stats["current"] += 1
-
         try:
-            # Peek first byte to detect protocol
             peek = self.connection.recv(1, socket.MSG_PEEK)
             if not peek:
                 return
             first_byte = peek[0]
-
             if first_byte == SOCKS5_VER:
                 self.handle_socks5()
-                return
             elif first_byte in HTTP_FIRST_BYTES:
                 conn_type = "HTTP"
                 with stats_lock:
                     stats["http"] += 1
                 self.handle_http()
             else:
-                logging.warning(f"{YELLOW}Unknown protocol from {client_ip}:{client_port} (byte: {first_byte}){RESET}")
+                logging.warning(f"{YELLOW}Unknown protocol from {client_ip}:{client_port}{RESET}")
         except Exception as e:
             logging.error(f"Handler error {client_ip}:{client_port} → {e}")
         finally:
@@ -294,13 +299,12 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                 with active_lock:
                     active_conns.discard((client_ip, client_port, conn_type, target))
 
-    # ---------- SOCKS5 (TCP + UDP) ----------
+    # ---------- SOCKS5 ----------
     def handle_socks5(self):
         client_ip, client_port = self.client_address
         assoc = None
         conn_type = None
         target = ""
-
         try:
             ver, nmethods = struct.unpack("!BB", self.connection.recv(2))
             if ver != SOCKS5_VER:
@@ -311,10 +315,8 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                 self.connection.sendall(b'\x05\xff')
                 return
             self.connection.sendall(struct.pack("!BB", 5, auth_method))
-
             if self.server.auth_required and not self._socks5_auth():
                 return
-
             ver, cmd, _, atyp = struct.unpack("!BBBB", self.connection.recv(4))
             if cmd == SOCKS5_CMD_CONNECT:
                 conn_type = "SOCKS5_TCP"
@@ -323,7 +325,6 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                     self._socks5_reply(0x04)
                     return
                 target = f"{host}:{port}"
-                # Log connection
                 self._log_connection(f"{GREEN}SOCKS5 TCP → {client_ip}:{client_port} → {WHITE}{target}{RESET}")
                 remote = self._connect_remote(host, port)
                 if not remote:
@@ -336,14 +337,16 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                 with stats_lock:
                     stats["socks5_tcp"] += 1
                 self._tunnel(self.connection, remote)
-
             elif cmd == SOCKS5_CMD_UDP:
+                if not self.server.enable_udp:
+                    self._socks5_reply(0x07)
+                    return
                 conn_type = "SOCKS5_UDP"
-                host, port = self._read_socks5_addr(atyp)   # client requested bind address (ignored)
+                host, port = self._read_socks5_addr(atyp)
                 target = f"UDP:{host}:{port}" if host else "UDP:any"
                 self._log_connection(f"{PURPLE}UDP Associate → {client_ip}:{client_port} → {WHITE}{target}{RESET}")
                 udp_port = self._find_free_port()
-                assoc = UDPAssociation((client_ip, client_port), udp_port)
+                assoc = UDPAssociation((client_ip, client_port), udp_port, self.server.udp_relay.selector if self.server.udp_relay else None)
                 if not assoc.create_relay():
                     self._socks5_reply(0x01)
                     return
@@ -375,7 +378,6 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                     active_conns.discard((client_ip, client_port, conn_type, target))
 
     def _log_connection(self, message):
-        """Log connection with special flag for filter"""
         extra = {'connection': True}
         connection_logger.info(message, extra=extra)
 
@@ -392,11 +394,9 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             ok = (user == self.server.username.encode()) and (pwd == self.server.password.encode())
             self.connection.sendall(b'\x01\x00' if ok else b'\x01\xff')
             if not ok:
-                logging.warning(f"{RED}SOCKS5 auth fail from {self.client_address[0]} user={user!r}{RESET}")
+                logging.warning(f"{RED}SOCKS5 auth fail from {self.client_address[0]}{RESET}")
                 with stats_lock:
                     stats["auth_fail"] += 1
-            else:
-                logging.info(f"{GREEN}SOCKS5 auth OK user={user.decode(errors='ignore')}{RESET}")
             return ok
         except:
             self.connection.sendall(b'\x01\xff')
@@ -420,7 +420,7 @@ class ProxyHandler(socketserver.StreamRequestHandler):
 
     def _socks5_reply(self, rep, addr="0.0.0.0", port=0):
         try:
-            if ':' in addr and '.' not in addr:  # IPv6
+            if ':' in addr:
                 atyp = 4
                 bin_addr = socket.inet_pton(socket.AF_INET6, addr)
             else:
@@ -432,15 +432,12 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             pass
 
     def _keep_udp_association(self, assoc):
-        """Keep TCP control connection alive"""
         try:
             while assoc.active and not assoc.is_expired():
                 r, _, e = select.select([self.connection], [], [self.connection], 5)
-                if e:
+                if e or not r:
                     break
-                if r:
-                    # Client may send UDP bind address (optional, we ignore)
-                    self.connection.recv(1024)
+                self.connection.recv(1024)
         except:
             pass
 
@@ -457,9 +454,7 @@ class ProxyHandler(socketserver.StreamRequestHandler):
         remote = None
         target = ""
         method = ""
-        
         try:
-            # Read request line
             request_line = self.rfile.readline(BUFFER_SIZE).decode('latin-1', errors='ignore').strip()
             if not request_line:
                 return
@@ -468,8 +463,6 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                 return
             method, url = parts[0], parts[1]
             method = method.upper()
-
-            # Read headers
             headers = {}
             while True:
                 line = self.rfile.readline(BUFFER_SIZE).decode('latin-1', errors='ignore').rstrip('\r\n')
@@ -478,50 +471,40 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                 if ':' in line:
                     k, v = line.split(':', 1)
                     headers[k.strip().lower()] = v.strip()
-
-            # Authentication
             if self.server.auth_required and not self._http_auth(headers):
-                self.wfile.write(b"HTTP/1.1 407 Proxy Authentication Required\r\n"
-                                 b"Proxy-Authenticate: Basic realm=\"Proxy\"\r\n\r\n")
+                self.wfile.write(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"Proxy\"\r\n\r\n")
                 self.wfile.flush()
                 with stats_lock:
                     stats["auth_fail"] += 1
                 return
-
-            # Determine target host/port
+            # Determine host/port
             if method == "CONNECT":
                 host_port = url.split(':', 1)
                 host = host_port[0]
                 port = int(host_port[1]) if len(host_port) > 1 else 443
                 target = f"{host}:{port}"
             else:
-                parsed = urlparse(url if url.startswith(('http://', 'https://')) else 'http://' + url)
+                parsed = urlparse(url if url.startswith(('http://','https://')) else 'http://'+url)
                 host = parsed.hostname
                 port = parsed.port or (443 if parsed.scheme == 'https' else 80)
                 target = f"{host}:{port}"
                 if parsed.path:
-                    target += parsed.path[:50]  # Limit path length for display
-            
-            # Log HTTP connection with URL
+                    target += parsed.path[:50]
             self._log_connection(f"{GREEN}HTTP {method} → {client_ip}:{client_port} → {WHITE}{target}{RESET}")
-            
             with active_lock:
                 active_conns.add((client_ip, client_port, "HTTP", target))
-
-            remote = self._connect_remote(host, port)
+            # Try upstream load balancing
+            remote = self._connect_upstream(host, port) if self.server.upstreams else self._connect_remote(host, port)
             if not remote:
                 self.wfile.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                 self.wfile.flush()
                 return
-
             if method == "CONNECT":
                 self.wfile.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 self.wfile.flush()
                 self._tunnel(self.connection, remote)
             else:
-                # Forward full HTTP request (including body)
                 self._forward_http_request(method, url, headers, remote)
-                # Read response and send back
                 self._forward_response(remote, self.connection)
         except Exception as e:
             logging.error(f"HTTP error: {e}")
@@ -546,26 +529,19 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             return False
 
     def _forward_http_request(self, method, url, headers, remote):
-        # Build path
-        parsed = urlparse(url if url.startswith(('http://', 'https://')) else 'http://' + url)
+        parsed = urlparse(url if url.startswith(('http://','https://')) else 'http://'+url)
         path = parsed.path or '/'
         if parsed.query:
             path += '?' + parsed.query
-
-        # Build request line
         req = f"{method} {path} HTTP/1.1\r\n"
-
-        # Add Host header if missing
         if 'host' not in headers:
             req += f"Host: {parsed.hostname}\r\n"
         for k, v in headers.items():
             if k not in ('proxy-authorization', 'proxy-connection', 'connection'):
                 req += f"{k.title()}: {v}\r\n"
         req += "Connection: close\r\n\r\n"
-
         remote.sendall(req.encode('latin-1'))
-
-        # Read and forward body (if any)
+        # Body
         content_length = headers.get('content-length')
         transfer_encoding = headers.get('transfer-encoding', '').lower()
         if content_length:
@@ -578,7 +554,6 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                 remaining -= len(chunk)
         elif transfer_encoding == 'chunked':
             while True:
-                # Read chunk size line
                 line = self._read_line()
                 if not line:
                     break
@@ -587,7 +562,6 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                 except:
                     break
                 if chunk_size == 0:
-                    # Read trailing headers and discard
                     while True:
                         trail = self._read_line()
                         if not trail or trail == b'\r\n':
@@ -597,12 +571,9 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                 if len(data) != chunk_size:
                     break
                 remote.sendall(data)
-                # Consume trailing CRLF
                 self.connection.recv(2)
-        # else no body
 
     def _read_line(self):
-        """Read a line from connection (used for chunked decoding)"""
         line = b''
         while True:
             ch = self.connection.recv(1)
@@ -632,14 +603,28 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                 sock = socket.socket(family)
                 sock.settimeout(CONNECTION_TIMEOUT)
                 sock.connect((host, port))
-                # Log successful connection with target
-                self._log_connection(f"{CYAN}✓ Connected to {host}:{port}{RESET}")
                 return sock
             except Exception as e:
                 if attempt == RETRY_ATTEMPTS - 1:
-                    logging.warning(f"Connect failed {host}:{port} after {RETRY_ATTEMPTS} tries → {e}")
-                time.sleep(min(0.5 * (attempt + 1), 4.0))
+                    logging.warning(f"Connect failed {host}:{port} → {e}")
+                time.sleep(min(0.5*(attempt+1), 4.0))
         return None
+
+    def _connect_upstream(self, host, port):
+        # Round-robin upstream (list of (host, port))
+        with upstream_lock:
+            global upstream_index
+            if not upstream_proxies:
+                return self._connect_remote(host, port)
+            total = len(upstream_proxies)
+            for i in range(total):
+                idx = (upstream_index + i) % total
+                up_host, up_port = upstream_proxies[idx]
+                sock = self._connect_remote(up_host, up_port)
+                if sock:
+                    upstream_index = (idx + 1) % total
+                    return sock
+            return None
 
     def _tunnel(self, client, remote):
         socks = [client, remote]
@@ -668,6 +653,114 @@ class ProxyHandler(socketserver.StreamRequestHandler):
         except:
             pass
 
+# ====================== DASHBOARD (simple HTTP server) ======================
+class DashboardHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            html = self._generate_html()
+            self.wfile.write(html.encode())
+        elif self.path == '/stats':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            data = self._get_stats()
+            self.wfile.write(json.dumps(data).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def _get_stats(self):
+        with stats_lock:
+            total = stats['total']
+            current = stats['current']
+            bytes_up = stats['bytes_up']
+            bytes_down = stats['bytes_down']
+            udp_up = stats['udp_up']
+            udp_down = stats['udp_down']
+            http = stats['http']
+            s5_tcp = stats['socks5_tcp']
+            s5_udp = stats['socks5_udp']
+        with active_lock:
+            active_count = len(active_conns)
+        with udp_lock:
+            udp_assoc_count = len(udp_assocs)
+        uptime = time.time() - stats['start']
+        return {
+            'total': total,
+            'current': current,
+            'active': active_count,
+            'socks5_tcp': s5_tcp,
+            'socks5_udp': s5_udp,
+            'http': http,
+            'bytes_up': bytes_up,
+            'bytes_down': bytes_down,
+            'udp_up': udp_up,
+            'udp_down': udp_down,
+            'udp_assocs': udp_assoc_count,
+            'uptime': uptime
+        }
+
+    def _generate_html(self):
+        return """
+        <html><head><title>Proxy Dashboard</title>
+        <meta http-equiv="refresh" content="2">
+        <style>
+        body { font-family: monospace; background: #1e1e2e; color: #cdd6f4; padding: 20px; }
+        .stat { margin: 10px 0; }
+        .label { color: #89b4fa; }
+        .value { color: #a6e3a1; font-weight: bold; }
+        h1 { color: #f9e2af; }
+        </style>
+        </head><body>
+        <h1>🔵 Universal Proxy Pro v6.0</h1>
+        <div id="stats">Loading...</div>
+        <script>
+        async function fetchStats() {
+            try {
+                const res = await fetch('/stats');
+                const data = await res.json();
+                const html = `
+                <div class="stat"><span class="label">Total connections:</span> <span class="value">${data.total}</span></div>
+                <div class="stat"><span class="label">Active connections:</span> <span class="value">${data.active}</span></div>
+                <div class="stat"><span class="label">SOCKS5 TCP:</span> <span class="value">${data.socks5_tcp}</span></div>
+                <div class="stat"><span class="label">SOCKS5 UDP (assocs):</span> <span class="value">${data.udp_assocs}</span></div>
+                <div class="stat"><span class="label">HTTP requests:</span> <span class="value">${data.http}</span></div>
+                <div class="stat"><span class="label">Bytes Up (TCP):</span> <span class="value">${formatBytes(data.bytes_up)}</span></div>
+                <div class="stat"><span class="label">Bytes Down (TCP):</span> <span class="value">${formatBytes(data.bytes_down)}</span></div>
+                <div class="stat"><span class="label">UDP Up:</span> <span class="value">${formatBytes(data.udp_up)}</span></div>
+                <div class="stat"><span class="label">UDP Down:</span> <span class="value">${formatBytes(data.udp_down)}</span></div>
+                <div class="stat"><span class="label">Uptime:</span> <span class="value">${formatUptime(data.uptime)}</span></div>
+                `;
+                document.getElementById('stats').innerHTML = html;
+            } catch(e) { console.error(e); }
+        }
+        function formatBytes(b) {
+            const units = ['B','KiB','MiB','GiB','TiB'];
+            let u=0;
+            while(b>=1024 && u<units.length-1) { b/=1024; u++; }
+            return b.toFixed(1)+' '+units[u];
+        }
+        function formatUptime(sec) {
+            let h=Math.floor(sec/3600), m=Math.floor((sec%3600)/60), s=Math.floor(sec%60);
+            return String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');
+        }
+        fetchStats();
+        setInterval(fetchStats, 2000);
+        </script>
+        </body></html>
+        """
+
+def run_dashboard(port=DASHBOARD_PORT):
+    try:
+        server = HTTPServer(('0.0.0.0', port), DashboardHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        logging.info(f"{CYAN}Dashboard available at http://0.0.0.0:{port}{RESET}")
+    except Exception as e:
+        logging.warning(f"Dashboard failed: {e}")
+
 # ====================== MONITOR & UTILS ======================
 def format_bytes(b):
     for unit in ['B', 'KiB', 'MiB', 'GiB', 'TiB']:
@@ -677,37 +770,32 @@ def format_bytes(b):
     return f"{b:.1f} PiB"
 
 def realtime_stats():
-    """Display realtime stats without spamming - uses carriage return to overwrite"""
     while True:
-        time.sleep(2)  # Update every 2 seconds for smoother display
-        
+        time.sleep(2)
         uptime = time.time() - stats["start"]
-        h = int(uptime // 3600)
-        m = int((uptime % 3600) // 60)
-        s = int(uptime % 60)
-
+        h = int(uptime//3600); m = int((uptime%3600)//60); s = int(uptime%60)
         with active_lock:
             cur = len(active_conns)
-            s5_tcp = sum(1 for _, _, t, _ in active_conns if t == "SOCKS5_TCP")
-            s5_udp = sum(1 for _, _, t, _ in active_conns if t == "SOCKS5_UDP")
-            http = sum(1 for _, _, t, _ in active_conns if t == "HTTP")
-
+            s5_tcp = sum(1 for _,_,t,_ in active_conns if t=="SOCKS5_TCP")
+            s5_udp = sum(1 for _,_,t,_ in active_conns if t=="SOCKS5_UDP")
+            http = sum(1 for _,_,t,_ in active_conns if t=="HTTP")
         with udp_lock:
             udp_assoc_count = len(udp_assocs)
-        
-        # Build stats line with colors
+        try:
+            cpu = psutil.cpu_percent(interval=None)
+        except:
+            cpu = None
+        try:
+            mem = psutil.virtual_memory().percent
+        except:
+            mem = None
+        cpu_str = f"{cpu:>5.1f}%" if cpu is not None else "  N/A "
+        mem_str = f"{mem:>5.1f}%" if mem is not None else "  N/A "
         line1 = (f"{YELLOW}↑TCP {format_bytes(stats['bytes_up']):>9} ↓TCP {format_bytes(stats['bytes_down']):>9} │ "
-                f"↑UDP {format_bytes(stats['udp_up']):>7} ↓UDP {format_bytes(stats['udp_down']):>7}{RESET}")
-        
+                 f"↑UDP {format_bytes(stats['udp_up']):>7} ↓UDP {format_bytes(stats['udp_down']):>7}{RESET}")
         line2 = (f"{CYAN}Active: {cur:>4} (TCP:{s5_tcp:>3} UDP:{s5_udp:>3} HTTP:{http:>3}) │ "
-                f"UDP Assoc: {udp_assoc_count:>3} │ Uptime {h:02d}:{m:02d}:{s:02d}{RESET}")
-        
-        # Move cursor up 2 lines, clear lines and print new stats
-        sys.stdout.write('\033[2A')  # Move up 2 lines
-        sys.stdout.write('\033[2K')  # Clear current line
-        sys.stdout.write(line1 + '\n')
-        sys.stdout.write('\033[2K')  # Clear next line
-        sys.stdout.write(line2 + '\n')
+                 f"UDP Assoc: {udp_assoc_count:>3} │ CPU {cpu_str}  MEM {mem_str} │ Uptime {h:02d}:{m:02d}:{s:02d}{RESET}")
+        sys.stdout.write('\033[2A\033[2K' + line1 + '\n\033[2K' + line2 + '\n')
         sys.stdout.flush()
 
 def kill_port(port):
@@ -719,36 +807,54 @@ def kill_port(port):
 
 def shutdown():
     uptime = time.time() - stats["start"]
-    h = int(uptime // 3600)
-    m = int((uptime % 3600) // 60)
-    s = int(uptime % 60)
+    h = int(uptime//3600); m = int((uptime%3600)//60); s = int(uptime%60)
     with udp_lock:
         for assoc in udp_assocs.values():
             assoc.close()
         udp_assocs.clear()
-    
-    # Print final stats with newline
-    sys.stdout.write('\n')  # Ensure we're on a new line
-    logging.info(
-        f"{RED}Proxy STOPPED │ Uptime {h:02d}:{m:02d}:{s:02d} │ "
-        f"Total conn {stats['total']} │ "
-        f"↑TCP {format_bytes(stats['bytes_up'])} ↓TCP {format_bytes(stats['bytes_down'])} │ "
-        f"↑UDP {format_bytes(stats['udp_up'])} ↓UDP {format_bytes(stats['udp_down'])}{RESET}"
-    )
+    sys.stdout.write('\n')
+    logging.info(f"{RED}Proxy STOPPED │ Uptime {h:02d}:{m:02d}:{s:02d} │ Total conn {stats['total']}{RESET}")
     sys.exit(0)
 
 # ====================== MAIN ======================
 def main():
-    parser = argparse.ArgumentParser(description="Universal Proxy (SOCKS5 + HTTP + UDP) v5.2")
+    parser = argparse.ArgumentParser(description="Universal Proxy Pro v6.0")
     parser.add_argument("-l", "--listen", default="0.0.0.0", help="Bind address")
     parser.add_argument("-p", "--port", type=int, default=1080, help="Port to listen on")
     parser.add_argument("-u", "--username", help="Username for auth")
     parser.add_argument("-P", "--password", help="Password for auth")
     parser.add_argument("--force-kill", action="store_true", help="Kill port before start")
+    parser.add_argument("--no-udp", action="store_true", help="Disable UDP ASSOCIATE")
+    parser.add_argument("--upstream", help="Comma-separated upstream proxies (host:port,host:port)")
+    parser.add_argument("--cert", help="TLS certificate file (for HTTPS proxy)")
+    parser.add_argument("--key", help="TLS private key file")
+    parser.add_argument("--dashboard-port", type=int, default=8081, help="Dashboard port")
     args = parser.parse_args()
+
+    # Increase fd limit
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (65536, 65536))
+    except Exception as e:
+        logging.warning(f"FD limit: {e}")
 
     if args.force_kill:
         kill_port(args.port)
+
+    # Parse upstreams
+    upstream_list = []
+    if args.upstream:
+        for item in args.upstream.split(','):
+            if ':' in item:
+                h, p = item.split(':')
+                upstream_list.append((h, int(p)))
+    global upstream_proxies
+    upstream_proxies = upstream_list
+
+    # TLS: if cert and key provided, wrap server socket
+    if args.cert and args.key:
+        # We'll need to create SSL context and wrap the server socket later
+        # For simplicity, we'll use the server's server_bind to wrap.
+        pass
 
     signal.signal(signal.SIGINT, lambda sig, frame: shutdown())
     signal.signal(signal.SIGTERM, lambda sig, frame: shutdown())
@@ -758,15 +864,26 @@ def main():
         (args.listen, args.port),
         ProxyHandler,
         username=args.username,
-        password=args.password
+        password=args.password,
+        enable_udp=not args.no_udp,
+        upstreams=upstream_list,
+        cert=args.cert,
+        key=args.key
     )
 
-    auth_str = f" (auth: {args.username}:{args.password})" if args.username else ""
-    logging.info(f"{GREEN}Proxy v5.2 STARTED → {args.listen}:{args.port}{auth_str}{RESET}")
-    logging.info(f"{CYAN}Features: SOCKS5 TCP/UDP + HTTP/HTTPS on same port (fixed UDP/HTTP body){RESET}")
-    
-    # Print initial empty lines for stats display
-    print("\n" * 2)
+    # Wrap with TLS if needed
+    if args.cert and args.key:
+        context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        context.load_cert_chain(args.cert, args.key)
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+
+    auth_str = f" (auth: {args.username})" if args.username else ""
+    logging.info(f"{GREEN}Proxy v6.0 STARTED → {args.listen}:{args.port}{auth_str}{RESET}")
+    logging.info(f"{CYAN}Features: SOCKS5 TCP/UDP + HTTP/HTTPS | IPv6 | Upstream: {len(upstream_list)} | Dashboard: {args.dashboard_port}{RESET}")
+    print("\n"*2)
+
+    # Start dashboard
+    run_dashboard(args.dashboard_port)
 
     threading.Thread(target=realtime_stats, daemon=True).start()
 
