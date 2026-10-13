@@ -1,0 +1,2735 @@
+#!/usr/bin/env node
+'use strict';
+// ============================================================================
+// Universal Proxy Pro v6.3 — Node.js port (parity với proxy.go)
+// SOCKS5 TCP/UDP + HTTP/HTTPS + multi-user + quota + dashboard + SSE.
+// Không dependency ngoài, chỉ stdlib Node >= 18.
+//
+// Chạy đơn process:      node proxy.js -p 1080 -P pass -u admin
+// Chạy đa process:       node cluster.js -p 1080 -P pass -u admin
+//                        WORKERS=4 node cluster.js -p 1080 -P pass -u admin
+// Single-port mode:      node proxy.js -p 8080 --single-port -P pass -u admin
+// ============================================================================
+
+const net = require('net');
+const dgram = require('dgram');
+const http = require('http');
+const fs = require('fs');
+const crypto = require('crypto');
+const dns = require('dns');
+const { URL } = require('url');
+const cluster = require('cluster');
+
+// ============================================================================
+// CLUSTER MODE
+// ============================================================================
+// Chạy bình thường (không cluster): IS_CLUSTER_MODE = false → mọi cluster logic bỏ qua.
+// Chạy `node cluster.js`: master spawn N worker qua cluster.fork(). Worker nào có
+// cluster.worker.id === 1 sẽ serve dashboard. Các worker khác chỉ chạy proxy listener.
+const IS_CLUSTER_MODE = !!process.env.CLUSTER_MODE;
+const IS_WORKER = IS_CLUSTER_MODE && cluster.isWorker;
+const IS_DASHBOARD_LEADER = !IS_CLUSTER_MODE
+  || !cluster.isWorker
+  || (cluster.worker && cluster.worker.id === 1);
+const MY_WORKER_ID = IS_WORKER && cluster.worker ? cluster.worker.id : 0;
+
+// Bảng lưu stats nhận từ các worker khác (chỉ dashboard leader dùng).
+// Key: workerId, value: { payload, t }.
+const peerStats = new Map();
+
+// ============================================================================
+// CẤU HÌNH
+// ============================================================================
+const MAX_CONNECTIONS = 4000;
+const CONNECTION_TIMEOUT_MS = 25000;
+const IDLE_TIMEOUT_MS = 180000;
+const UDP_IDLE_TIMEOUT_MS = 120000;
+const HANDSHAKE_TIMEOUT_MS = 30000;
+const MAX_LINE_BYTES = 8192;
+const MAX_HEADER_LINES = 100;
+const MAX_HEADER_BYTES = 16384;
+const HASH_ITERATIONS = 200000;
+const HASH_MAX_ITERATIONS = 5000000;
+const PW_HASH_MAX = 160;
+const AUTH_FAIL_THRESHOLD = 5;
+const AUTH_FAIL_WINDOW_MS = 5 * 60 * 1000;
+const AUTH_BLOCK_DURATION_MS = 15 * 60 * 1000;
+const DASHBOARD_AUTH_FAIL_THRESHOLD = 30;
+const AUDIT_LOG_MAX = 200;
+const RELOAD_HISTORY_MAX = 30;
+const HISTORY_MAX_SAMPLES = 300;
+const BANDWIDTH_RAMP_STEPS = 10;
+const BANDWIDTH_RAMP_INTERVAL_MS = 500;
+const PW_CACHE_TTL_MS = 5 * 60 * 1000;
+const UDP_DEST_MAX = 4096;
+const MAX_USERS = 1000;
+const MAX_TOKENS = 100;
+const NAME_LEN = 64;
+const DASH_MAX_SSE = 16;
+
+// ============================================================================
+// CLI ARGS
+// ============================================================================
+function parseArgs(argv) {
+  const a = {
+    l: '0.0.0.0', p: 1080, u: '', P: '', 'force-kill': false,
+    'no-udp': false, upstream: '', cert: '', key: '',
+    'dashboard-port': 8081, 'dashboard-bind': '127.0.0.1',
+    config: 'proxy_config.json', 'dashboard-user': 'admin',
+    'dashboard-pass': '', allow: '', deny: '',
+    'usage-file': 'proxy_usage.json', 'log-file': '',
+    'log-max-size-mb': 20, 'log-max-backups': 5,
+    'single-port': false, help: false,
+  };
+  for (let i = 2; i < argv.length; i++) {
+    let k = argv[i];
+    if (!k.startsWith('-')) continue;
+    k = k.replace(/^--?/, '');
+    const next = argv[i + 1];
+    if (k === 'help' || k === 'h') { a.help = true; continue; }
+    if (['force-kill', 'no-udp', 'single-port'].includes(k)) { a[k] = true; continue; }
+    if (next === undefined || (next.startsWith('-') && isNaN(parseInt(next, 10)))) {
+      a[k] = true; continue;
+    }
+    i++;
+    if (['p', 'dashboard-port', 'log-max-size-mb', 'log-max-backups'].includes(k)) {
+      a[k] = parseInt(next, 10);
+    } else {
+      a[k] = next;
+    }
+  }
+  return a;
+}
+
+const cliArgv = process.env.ARGV ? [process.argv[0], process.argv[1], ...JSON.parse(process.env.ARGV)] : process.argv;
+const args = parseArgs(cliArgv);
+if (args.help) {
+  console.log(`Usage: proxy.js [-l addr] [-p port] [-u user] [-P pass] [--no-udp]
+  [--config file] [--usage-file file]
+  [--dashboard-port port] [--dashboard-bind addr]
+  [--dashboard-user user] [--dashboard-pass pass]   (chỉ lần chạy đầu)
+  [--allow cidr,...] [--deny cidr,...] [--upstream host:port,...]
+  [--single-port] [--log-file file]`);
+  process.exit(0);
+}
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+const stats = {
+  startTime: Date.now(),
+  total: 0, current: 0,
+  socks5TCP: 0, socks5UDP: 0, http: 0, authFail: 0,
+  bytesUp: 0, bytesDown: 0, udpUp: 0, udpDown: 0,
+};
+
+const activeConns = new Map();
+let connIDCounter = 0;
+const nextConnID = () => 'c' + (++connIDCounter);
+
+const udpAssocs = new Map();
+
+const statHistory = [];        // ring buffer cho biểu đồ SSE
+const sseClients = new Set();  // các response SSE đang mở
+
+let shuttingDown = false;
+let globalServerOpts = { serverUsername: '', serverPassword: '', authEnabled: false };
+
+// ============================================================================
+// LOGGING
+// ============================================================================
+let logFileStream = null;
+let logFileSize = 0;
+const logMaxSizeBytes = (args['log-max-size-mb'] || 20) * 1024 * 1024;
+const logMaxBackups = args['log-max-backups'] || 5;
+const logFilePath = args['log-file'] || '';
+
+function rotateLog() {
+  if (!logFileStream) return;
+  try { logFileStream.end(); } catch {}
+  for (let i = logMaxBackups - 1; i >= 1; i--) {
+    const oldp = `${logFilePath}.${i}`, newp = `${logFilePath}.${i + 1}`;
+    try { if (fs.existsSync(oldp)) fs.renameSync(oldp, newp); } catch {}
+  }
+  if (logMaxBackups > 0) {
+    try { if (fs.existsSync(logFilePath)) fs.renameSync(logFilePath, logFilePath + '.1'); } catch {}
+  }
+  try {
+    logFileStream = fs.createWriteStream(logFilePath, { flags: 'a' });
+    logFileSize = 0;
+  } catch { logFileStream = null; }
+}
+
+function initLog() {
+  if (!logFilePath) return;
+  try {
+    logFileStream = fs.createWriteStream(logFilePath, { flags: 'a' });
+    try { logFileSize = fs.statSync(logFilePath).size; } catch {}
+  } catch (e) {
+    console.error(`[FATAL] Không mở được log file ${logFilePath}:`, e.message);
+    process.exit(1);
+  }
+}
+
+function tsFmt() {
+  const d = new Date();
+  const p = n => String(n).padStart(2, '0');
+  return `[${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}]`;
+}
+
+function logLine(prefix, msg) {
+  const line = `${tsFmt()} ${prefix}${msg}\n`;
+  process.stdout.write(line);
+  if (logFileStream) {
+    if (logMaxSizeBytes > 0 && logFileSize + line.length > logMaxSizeBytes) rotateLog();
+    try { logFileStream.write(line); logFileSize += line.length; } catch {}
+  }
+}
+
+const logInfo = (...a) => logLine('', a.join(' '));
+const logErr = (...a) => logLine('ERROR: ', a.join(' '));
+const logWarn = (...a) => logLine('WARN: ', a.join(' '));
+
+// ============================================================================
+// UTIL
+// ============================================================================
+function formatBytes(b) {
+  if (b < 1024) return b + ' B';
+  const u = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let i = 0; let v = b;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return v.toFixed(1) + ' ' + u[i];
+}
+
+function ctEqual(a, b) {
+  const ba = Buffer.from(String(a));
+  const bb = Buffer.from(String(b));
+  if (ba.length !== bb.length) {
+    let diff = ba.length ^ bb.length;
+    const n = Math.max(ba.length, bb.length);
+    for (let i = 0; i < n; i++) diff |= (ba[i] || 0) ^ (bb[i] || 0);
+    return diff === 0;
+  }
+  return crypto.timingSafeEqual(ba, bb);
+}
+
+// ============================================================================
+// IP / CIDR
+// ============================================================================
+function expandIPv6(ip) {
+  if (!ip.includes(':')) return null;
+  if (ip.includes('::')) {
+    const [a, b] = ip.split('::');
+    const left = a ? a.split(':') : [];
+    const right = b ? b.split(':') : [];
+    const zeros = 8 - left.length - right.length;
+    if (zeros < 0) return null;
+    return [...left, ...Array(zeros).fill('0'), ...right].join(':');
+  }
+  return ip.split(':').length === 8 ? ip : null;
+}
+
+function ipToBigInt(ip) {
+  if (!ip) return null;
+  if (ip.includes('.')) {
+    const p = ip.split('.').map(x => parseInt(x, 10));
+    if (p.length !== 4 || p.some(v => isNaN(v) || v < 0 || v > 255)) return null;
+    return (BigInt(p[0]) << 24n) | (BigInt(p[1]) << 16n) | (BigInt(p[2]) << 8n) | BigInt(p[3]);
+  }
+  const e = expandIPv6(ip);
+  if (!e) return null;
+  let v = 0n;
+  for (const g of e.split(':')) v = (v << 16n) | BigInt(parseInt(g, 16) || 0);
+  return v;
+}
+
+function parseCIDR(cidr) {
+  const [ip, bitsStr] = cidr.split('/');
+  const bits = parseInt(bitsStr, 10);
+  const isV6 = ip.includes(':');
+  const totalBits = isV6 ? 128 : 32;
+  if (isNaN(bits) || bits < 0 || bits > totalBits) return null;
+  let v = ipToBigInt(ip);
+  if (v === null) return null;
+  if (!isV6) v = v & ((1n << 32n) - 1n);
+  const mask = bits === 0 ? 0n : ((~0n << BigInt(totalBits - bits)) & ((1n << BigInt(totalBits)) - 1n));
+  return { net: v & mask, mask, isV6, bits };
+}
+
+function ipInCIDR(ip, cidr) {
+  const isV6 = ip.includes(':');
+  if (isV6 !== cidr.isV6) return false;
+  let v = ipToBigInt(ip);
+  if (v === null) return false;
+  if (!isV6) v = v & ((1n << 32n) - 1n);
+  return (v & cidr.mask) === cidr.net;
+}
+
+// ============================================================================
+// SSRF GUARD
+// ============================================================================
+const extraBlockedNets = ['0.0.0.0/8', '100.64.0.0/10', '192.0.0.0/24', '198.18.0.0/15']
+  .map(parseCIDR).filter(Boolean);
+
+function isBlockedIP(ipStr) {
+  if (!ipStr) return true;
+  ipStr = ipStr.split('%')[0];
+  // Chuẩn hoá IPv4-mapped IPv6 (mọi biến thể hoa/thường).
+  const lower = ipStr.toLowerCase();
+  if (lower.startsWith('::ffff:')) ipStr = ipStr.slice(7);
+  const v = ipToBigInt(ipStr);
+  if (v === null) return true;
+  const isV6 = ipStr.includes(':');
+  for (const n of extraBlockedNets) {
+    if (n.isV6 !== isV6) continue;
+    let vv = isV6 ? v : (v & ((1n << 32n) - 1n));
+    if ((vv & n.mask) === n.net) return true;
+  }
+  if (!isV6) {
+    const a = Number((v >> 24n) & 0xffn);
+    const b = Number((v >> 16n) & 0xffn);
+    if (a === 0 || a === 10 || a === 127) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true;
+    if (a === 198 && (b === 18 || b === 19)) return true;
+    if (a >= 224) return true;
+  } else {
+    if (v === 0n || v === 1n) return true;
+    if ((v >> 121n) === 0b1111110n) return true;
+    if ((v >> 118n) === 0b1111111010n) return true;
+    if ((v >> 120n) === 0xffn) return true;
+  }
+  return false;
+}
+
+function resolveAndCheck(host) {
+  return new Promise((resolve, reject) => {
+    if (/^\d+\.\d+\.\d+\.\d+$/.test(host) || host.includes(':')) {
+      if (isBlockedIP(host)) return reject(new Error(`target IP ${host} bị chặn`));
+      return resolve([host]);
+    }
+    dns.lookup(host, { all: true }, (err, addrs) => {
+      if (err) return reject(err);
+      if (!addrs.length) return reject(new Error(`không phân giải được host ${host}`));
+      for (const a of addrs) {
+        if (isBlockedIP(a.address)) {
+          return reject(new Error(`target host ${host} phân giải ra IP nội bộ (${a.address}), bị chặn`));
+        }
+      }
+      resolve(addrs.map(a => a.address));
+    });
+  });
+}
+
+// ============================================================================
+// IP WHITELIST/BLACKLIST
+// ============================================================================
+let allowedCIDRs = [];
+let deniedCIDRs = [];
+
+function parseCIDRList(items) {
+  const result = [], invalid = [];
+  for (const raw of items || []) {
+    const s = String(raw || '').trim();
+    if (!s) continue;
+    const cidr = s.includes('/') ? s : (s + (s.includes(':') ? '/128' : '/32'));
+    const n = parseCIDR(cidr);
+    if (!n) { invalid.push(s); logWarn(`CIDR không hợp lệ, bỏ qua: ${s}`); continue; }
+    result.push(n);
+  }
+  return { result, invalid };
+}
+
+function ipAllowed(ipStr) {
+  if (!ipStr) return false;
+  for (const d of deniedCIDRs) if (ipInCIDR(ipStr, d)) return false;
+  if (allowedCIDRs.length === 0) return true;
+  for (const a of allowedCIDRs) if (ipInCIDR(ipStr, a)) return true;
+  return false;
+}
+
+// ============================================================================
+// BRUTE-FORCE PROTECTION
+// ============================================================================
+const failCounts = new Map();
+const failLastFail = new Map();
+const blockedUntil = new Map();
+
+function recordAuthFail(ip, threshold) {
+  if (!ip) return;
+  const now = Date.now();
+  const last = failLastFail.get(ip) || 0;
+  if (last && now - last > AUTH_FAIL_WINDOW_MS) failCounts.set(ip, 0);
+  failLastFail.set(ip, now);
+  const c = (failCounts.get(ip) || 0) + 1;
+  if (c >= threshold) {
+    blockedUntil.set(ip, now + AUTH_BLOCK_DURATION_MS);
+    logWarn(`IP ${ip} bị chặn ${AUTH_BLOCK_DURATION_MS / 60000} phút do auth fail quá ${threshold} lần`);
+    failCounts.set(ip, 0);
+  } else {
+    failCounts.set(ip, c);
+  }
+}
+
+function resetAuthFail(ip) {
+  if (!ip) return;
+  failCounts.delete(ip);
+  failLastFail.delete(ip);
+  blockedUntil.delete(ip);
+}
+
+function isAuthBlocked(ip) {
+  if (!ip) return false;
+  const until = blockedUntil.get(ip);
+  if (!until) return false;
+  if (Date.now() > until) { blockedUntil.delete(ip); return false; }
+  return true;
+}
+
+// ============================================================================
+// CRYPTO: PASSWORD HASH + CACHE
+// ============================================================================
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16);
+  const dg = crypto.pbkdf2Sync(String(password), salt, HASH_ITERATIONS, 32, 'sha256');
+  return `${HASH_ITERATIONS}:${salt.toString('hex')}:${dg.toString('hex')}`;
+}
+
+function verifyPassword(password, stored) {
+  if (!stored || stored.length > PW_HASH_MAX) return false;
+  const parts = String(stored).split(':');
+  if (parts.length !== 3) return false;
+  const iters = parseInt(parts[0], 10);
+  if (!iters || iters <= 0 || iters > HASH_MAX_ITERATIONS) return false;
+  let salt, want;
+  try {
+    salt = Buffer.from(parts[1], 'hex');
+    want = Buffer.from(parts[2], 'hex');
+  } catch { return false; }
+  if (want.length !== 32) return false;
+  const got = crypto.pbkdf2Sync(String(password), salt, iters, 32, 'sha256');
+  return crypto.timingSafeEqual(got, want);
+}
+
+const pwCache = new Map();
+function verifyPasswordCached(password, stored) {
+  const key = crypto.createHash('sha256').update(String(stored) + '\x00' + String(password)).digest('hex');
+  const now = Date.now();
+  const exp = pwCache.get(key);
+  if (exp && exp > now) return true;
+  if (!verifyPassword(password, stored)) return false;
+  if (pwCache.size >= 1024) {
+    for (const [k, e] of pwCache) if (e <= now) pwCache.delete(k);
+    if (pwCache.size >= 1024) pwCache.clear();
+  }
+  pwCache.set(key, now + PW_CACHE_TTL_MS);
+  return true;
+}
+
+// ============================================================================
+// API TOKEN
+// ============================================================================
+const generateAPIToken = () => crypto.randomBytes(32).toString('hex');
+const hashAPIToken = t => crypto.createHash('sha256').update(String(t)).digest('hex');
+
+// ============================================================================
+// CONFIG
+// ============================================================================
+let appConfig = {
+  dashboard_user: '', dashboard_password_hash: '',
+  users: [], allow_list: [], deny_list: [], upstream_proxies: [],
+  api_tokens: [], require_proxy_auth: false,
+};
+let dashboardUser = '';
+let dashboardPassHash = '';
+let configPath = args.config;
+
+function loadOrInitConfig() {
+  if (fs.existsSync(configPath)) {
+    let raw;
+    try { raw = fs.readFileSync(configPath, 'utf8'); }
+    catch (e) { throw new Error(`Không đọc được config file: ${e.message}`); }
+    let cfg;
+    try { cfg = JSON.parse(raw); }
+    catch (e) { throw new Error(`config file lỗi định dạng JSON: ${e.message}`); }
+    if (!cfg.dashboard_user || !cfg.dashboard_password_hash) {
+      throw new Error('config file thiếu dashboard_user/dashboard_password_hash');
+    }
+    cfg.users = cfg.users || [];
+    cfg.allow_list = cfg.allow_list || [];
+    cfg.deny_list = cfg.deny_list || [];
+    cfg.upstream_proxies = cfg.upstream_proxies || [];
+    cfg.api_tokens = cfg.api_tokens || [];
+    return { cfg, created: false };
+  }
+  const cfg = {
+    dashboard_user: args['dashboard-user'] || 'admin',
+    dashboard_password_hash: hashPassword(args['dashboard-pass']),
+    users: [], allow_list: [], deny_list: [], upstream_proxies: [], api_tokens: [],
+    require_proxy_auth: false,
+  };
+  saveConfigSync(cfg);
+  logInfo(`Đã tạo config file mới tại ${configPath}`);
+  return { cfg, created: true };
+}
+
+// Ghi đồng bộ chỉ dùng ở luồng khởi động (loadOrInitConfig).
+function saveConfigSync(cfg) {
+  const data = JSON.stringify(cfg, null, 2);
+  const tmp = configPath + '.tmp';
+  try {
+    fs.writeFileSync(tmp, data, { mode: 0o600 });
+    fs.renameSync(tmp, configPath);
+  } catch (e) {
+    try { fs.writeFileSync(configPath, data, { mode: 0o600 }); }
+    catch { throw e; }
+  }
+}
+
+// Ghi bất đồng bộ cho runtime (dashboard action) — không block event loop khi disk chậm.
+let _configSavePending = false;
+let _configSaveQueued = false;
+let _configSaveQueuedCfg = null;
+function saveConfig(cfg) {
+  if (_configSavePending) { _configSaveQueued = true; _configSaveQueuedCfg = cfg; return; }
+  _configSavePending = true;
+  let data;
+  try { data = JSON.stringify(cfg, null, 2); }
+  catch (e) { _configSavePending = false; logWarn(`Không serialize được config: ${e.message}`); return; }
+  const tmp = configPath + '.tmp';
+  fs.writeFile(tmp, data, { mode: 0o600 }, (err) => {
+    if (err) {
+      _configSavePending = false;
+      logWarn(`Không ghi được config tmp: ${err.message}`);
+      if (_configSaveQueued) { _configSaveQueued = false; const c = _configSaveQueuedCfg; _configSaveQueuedCfg = null; saveConfig(c); }
+      return;
+    }
+    fs.rename(tmp, configPath, (err2) => {
+      _configSavePending = false;
+      if (err2) logWarn(`Không rename được config: ${err2.message}`);
+      if (_configSaveQueued) { _configSaveQueued = false; const c = _configSaveQueuedCfg; _configSaveQueuedCfg = null; saveConfig(c); }
+    });
+  });
+}
+
+// ============================================================================
+// USAGE / QUOTA
+// ============================================================================
+let usage = {};
+const usagePath = args['usage-file'] || 'proxy_usage.json';
+
+function currentPeriod() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+
+function loadUsage() {
+  if (!usagePath || !fs.existsSync(usagePath)) return;
+  try {
+    const data = JSON.parse(fs.readFileSync(usagePath, 'utf8'));
+    if (data && typeof data === 'object') usage = data;
+  } catch (e) { logWarn(`File usage lỗi định dạng, bỏ qua: ${e.message}`); }
+}
+
+let _usageSavePending = false;
+let _usageSaveQueued = false;
+function saveUsage() {
+  if (!usagePath) return;
+  if (_usageSavePending) { _usageSaveQueued = true; return; }
+  _usageSavePending = true;
+  let data;
+  try { data = JSON.stringify(usage, null, 2); }
+  catch (e) { _usageSavePending = false; logWarn(`Không serialize được usage: ${e.message}`); return; }
+  const tmp = usagePath + '.tmp';
+  fs.writeFile(tmp, data, (err) => {
+    if (err) {
+      _usageSavePending = false;
+      logWarn(`Không ghi được usage tmp: ${err.message}`);
+      if (_usageSaveQueued) { _usageSaveQueued = false; saveUsage(); }
+      return;
+    }
+    fs.rename(tmp, usagePath, (err2) => {
+      _usageSavePending = false;
+      if (err2) logWarn(`Không rename được usage: ${err2.message}`);
+      if (_usageSaveQueued) { _usageSaveQueued = false; saveUsage(); }
+    });
+  });
+}
+
+function addUsage(username, bytes) {
+  if (!username || bytes <= 0) return;
+  const per = currentPeriod();
+  const rec = usage[username];
+  if (!rec || rec.period !== per) usage[username] = { period: per, bytes_used: bytes };
+  else rec.bytes_used += bytes;
+}
+
+function getUsage(username) {
+  const per = currentPeriod();
+  const rec = usage[username];
+  if (!rec || rec.period !== per) return 0;
+  return rec.bytes_used || 0;
+}
+
+const isOverQuota = (username, quotaBytes) => quotaBytes > 0 && getUsage(username) >= quotaBytes;
+
+// ============================================================================
+// AUDIT + RELOAD HISTORY
+// ============================================================================
+const auditLog = [];
+function recordAudit(actor, action, details) {
+  auditLog.push({ t: Math.floor(Date.now() / 1000), actor, action, details: details || '' });
+  if (auditLog.length > AUDIT_LOG_MAX) auditLog.splice(0, auditLog.length - AUDIT_LOG_MAX);
+}
+
+const reloadHistory = [];
+function recordReloadEvent(ev) {
+  reloadHistory.push(ev);
+  if (reloadHistory.length > RELOAD_HISTORY_MAX) reloadHistory.splice(0, reloadHistory.length - RELOAD_HISTORY_MAX);
+}
+
+// ============================================================================
+// RELOAD CONFIG
+// ============================================================================
+function reloadConfig(source) {
+  const ev = { t: Math.floor(Date.now() / 1000), source, success: false };
+  let raw;
+  try { raw = fs.readFileSync(configPath, 'utf8'); }
+  catch (e) { ev.error = `không đọc được config file: ${e.message}`; recordReloadEvent(ev); return ev.error; }
+  let cfg;
+  try { cfg = JSON.parse(raw); }
+  catch (e) { ev.error = `config file lỗi định dạng JSON: ${e.message}`; recordReloadEvent(ev); return ev.error; }
+  if (!cfg.dashboard_user || !cfg.dashboard_password_hash) {
+    ev.error = 'config file thiếu dashboard_user/dashboard_password_hash';
+    recordReloadEvent(ev); return ev.error;
+  }
+  cfg.users = cfg.users || [];
+  cfg.allow_list = cfg.allow_list || [];
+  cfg.deny_list = cfg.deny_list || [];
+  cfg.upstream_proxies = cfg.upstream_proxies || [];
+  cfg.api_tokens = cfg.api_tokens || [];
+
+  const ap = parseCIDRList(cfg.allow_list);
+  const dp = parseCIDRList(cfg.deny_list);
+  allowedCIDRs = ap.result;
+  deniedCIDRs = dp.result;
+  const invalid = [...ap.invalid, ...dp.invalid];
+
+  appConfig = cfg;
+  dashboardUser = cfg.dashboard_user;
+  dashboardPassHash = cfg.dashboard_password_hash;
+
+  for (const u of cfg.users) applyLiveBandwidthLimit(u.username, u.max_bandwidth_bps || 0);
+
+  ev.success = true;
+  ev.allow_count = allowedCIDRs.length;
+  ev.deny_count = deniedCIDRs.length;
+  ev.upstream_count = cfg.upstream_proxies.length;
+  ev.user_count = cfg.users.length;
+  if (invalid.length) ev.invalid_cidrs = invalid;
+  recordReloadEvent(ev);
+  logInfo(`Đã reload config (nguồn: ${source}): ${ev.allow_count} allow, ${ev.deny_count} deny, ${ev.upstream_count} upstream, ${ev.user_count} user${invalid.length ? ` (CẢNH BÁO: ${invalid.length} CIDR sai)` : ''}`);
+  return null;
+}
+
+// ============================================================================
+// USER / AUTH
+// ============================================================================
+function getUserConfig(username) {
+  if (!username) return null;
+  return appConfig.users.find(u => u.username === username) || null;
+}
+
+function countUserConns(username) {
+  let n = 0;
+  for (const ci of activeConns.values()) if (ci.username === username) n++;
+  return n;
+}
+
+function checkUserLimits(username) {
+  if (!username) return { ok: true };
+  const cfg = getUserConfig(username);
+  if (!cfg) return { ok: true };
+  const maxc = cfg.max_connections || 0;
+  const quota = cfg.quota_bytes_per_month || 0;
+  if (maxc > 0 && countUserConns(username) >= maxc) {
+    return { ok: false, reason: `đã đạt giới hạn ${maxc} connection đồng thời` };
+  }
+  if (quota > 0 && isOverQuota(username, quota)) {
+    return { ok: false, reason: 'đã vượt quota dung lượng tháng này' };
+  }
+  return { ok: true };
+}
+
+function authenticateProxyUser(user, pass) {
+  if (globalServerOpts.authEnabled
+      && user === globalServerOpts.serverUsername
+      && pass === globalServerOpts.serverPassword) {
+    return { ok: true, limit: 0, user };
+  }
+  for (const u of appConfig.users) {
+    if (u.username === user && verifyPasswordCached(pass, u.password_hash)) {
+      return { ok: true, limit: u.max_bandwidth_bps || 0, user: u.username };
+    }
+  }
+  return { ok: false };
+}
+
+function authRequired() {
+  if (globalServerOpts.authEnabled) return true;
+  return !!(appConfig.require_proxy_auth || appConfig.users.length > 0);
+}
+
+// ============================================================================
+// CONNECTION TRACKING
+// ============================================================================
+function makeConnInfo(opts) {
+  const ci = {
+    id: nextConnID(),
+    ip: opts.ip, port: opts.port,
+    type: opts.type, target: opts.target,
+    startTime: Date.now(),
+    bytesUp: 0, bytesDown: 0,
+    rateLimitBps: opts.rateLimitBps || 0,
+    username: opts.username || '',
+    socket: opts.socket,
+    flushedUp: 0, flushedDown: 0,
+  };
+  activeConns.set(ci.id, ci);
+  return ci;
+}
+
+function flushConnStats(ci) {
+  const dUp = ci.bytesUp - ci.flushedUp;
+  const dDown = ci.bytesDown - ci.flushedDown;
+  ci.flushedUp = ci.bytesUp;
+  ci.flushedDown = ci.bytesDown;
+  if (dUp <= 0 && dDown <= 0) return;
+  stats.bytesUp += dUp;
+  stats.bytesDown += dDown;
+  addUsage(ci.username, dUp + dDown);
+}
+
+function applyLiveBandwidthLimit(username, newLimitBps) {
+  if (!username) return;
+  let n = 0;
+  for (const ci of activeConns.values()) {
+    if (ci.username !== username) continue;
+    if (ci._rampInterval) { clearInterval(ci._rampInterval); ci._rampInterval = null; }
+    if (ci.rateLimitBps > 0 && newLimitBps > 0 && ci.rateLimitBps !== newLimitBps) {
+      const from = ci.rateLimitBps, to = newLimitBps;
+      let i = 0;
+      ci._rampInterval = setInterval(() => {
+        i++;
+        ci.rateLimitBps = from + Math.floor((to - from) * i / BANDWIDTH_RAMP_STEPS);
+        if (i >= BANDWIDTH_RAMP_STEPS) {
+          clearInterval(ci._rampInterval);
+          ci._rampInterval = null;
+        }
+      }, BANDWIDTH_RAMP_INTERVAL_MS);
+    } else {
+      ci.rateLimitBps = newLimitBps > 0 ? newLimitBps : 0;
+    }
+    n++;
+  }
+  if (n) logInfo(`Áp dụng giới hạn băng thông mới (${newLimitBps} bytes/s) cho ${n} conn của '${username}'`);
+}
+
+// ============================================================================
+// THROTTLE
+// ============================================================================
+async function throttledWrite(socket, buf, ci) {
+  if (!socket.writable) return false;
+  const ok = socket.write(buf);
+  const rate = ci.rateLimitBps;
+  if (rate > 0) {
+    const delayMs = (buf.length / rate) * 1000;
+    if (delayMs >= 1) await new Promise(r => setTimeout(r, Math.min(delayMs, 1500)));
+  }
+  if (!ok) await new Promise(r => socket.once('drain', r));
+  return true;
+}
+
+// ============================================================================
+// BUFFERED READER
+// ============================================================================
+class BufferedReader {
+  constructor(socket) {
+    this.socket = socket;
+    this.buffer = Buffer.alloc(0);
+    this._waiter = null;
+    this._eof = false;
+    this._err = null;
+    this._onData = c => {
+      this.buffer = Buffer.concat([this.buffer, c]);
+      this._tryResolve();
+    };
+    this._onEnd = () => { this._eof = true; this._tryResolve(); };
+    this._onErr = e => { this._err = e; this._tryResolve(); };
+    socket.on('data', this._onData);
+    socket.on('end', this._onEnd);
+    socket.on('error', this._onErr);
+    socket.pause();
+  }
+
+  _tryResolve() {
+    if (this._waiter) this._waiter.check();
+  }
+
+  unread(buf) {
+    if (!buf || buf.length === 0) return;
+    this.buffer = Buffer.concat([buf, this.buffer]);
+    this._tryResolve();
+  }
+
+  read(n) {
+    return new Promise((resolve, reject) => {
+      const check = () => {
+        if (this.buffer.length >= n) {
+          const out = this.buffer.slice(0, n);
+          this.buffer = this.buffer.slice(n);
+          this._waiter = null;
+          resolve(out);
+          return true;
+        }
+        if (this._err) { this._waiter = null; reject(this._err); return true; }
+        if (this._eof) { this._waiter = null; reject(new Error('EOF')); return true; }
+        return false;
+      };
+      if (check()) return;
+      this._waiter = { check };
+      this.socket.resume();
+    });
+  }
+
+  readLine(maxLen = MAX_LINE_BYTES) {
+    return new Promise((resolve, reject) => {
+      const check = () => {
+        const idx = this.buffer.indexOf(0x0A);
+        if (idx >= 0) {
+          let end = idx;
+          if (end > 0 && this.buffer[end - 1] === 0x0D) end--;
+          const line = this.buffer.slice(0, end).toString('latin1');
+          this.buffer = this.buffer.slice(idx + 1);
+          this._waiter = null;
+          resolve(line);
+          return true;
+        }
+        if (this.buffer.length > maxLen) { this._waiter = null; reject(new Error('line too long')); return true; }
+        if (this._err) { this._waiter = null; reject(this._err); return true; }
+        if (this._eof) { this._waiter = null; reject(new Error('EOF')); return true; }
+        return false;
+      };
+      if (check()) return;
+      this._waiter = { check };
+      this.socket.resume();
+    });
+  }
+
+  drain() {
+    const out = this.buffer;
+    this.buffer = Buffer.alloc(0);
+    return out;
+  }
+
+  detach() {
+    this.socket.removeListener('data', this._onData);
+    this.socket.removeListener('end', this._onEnd);
+    this.socket.removeListener('error', this._onErr);
+    this.socket.pause();
+    const left = this.drain();
+    if (left.length > 0) {
+      try { this.socket.unshift(left); } catch {}
+    }
+  }
+}
+
+// ============================================================================
+// CONNECT TARGET
+// ============================================================================
+async function connectTarget(host, port) {
+  if (appConfig.upstream_proxies && appConfig.upstream_proxies.length) {
+    for (const up of appConfig.upstream_proxies) {
+      const m = up.match(/^(?:socks5|http|https):\/\/(.+)$/i);
+      const cleaned = m ? m[1] : up;
+      const idx = cleaned.lastIndexOf(':');
+      if (idx <= 0) continue;
+      const uh = cleaned.slice(0, idx);
+      const upPort = parseInt(cleaned.slice(idx + 1), 10);
+      if (!uh || !upPort || upPort < 1 || upPort > 65535) continue;
+      try {
+        const sock = await new Promise((resolve, reject) => {
+          const s = net.createConnection({ host: uh, port: upPort, timeout: CONNECTION_TIMEOUT_MS },
+            () => { s.setTimeout(0); resolve(s); });
+          s.once('error', reject);
+          s.once('timeout', () => { s.destroy(); reject(new Error('timeout')); });
+        });
+        return sock;
+      } catch (e) {
+        logWarn(`Upstream ${up} lỗi: ${e.message}`);
+      }
+    }
+  }
+  const ips = await resolveAndCheck(host);
+  return new Promise((resolve, reject) => {
+    const ip = ips[0];
+    const s = net.createConnection({ host: ip, port, timeout: CONNECTION_TIMEOUT_MS },
+      () => { s.setTimeout(0); s.setNoDelay(true); resolve(s); });
+    s.once('error', reject);
+    s.once('timeout', () => { s.destroy(); reject(new Error('timeout')); });
+  });
+}
+
+// ============================================================================
+// TUNNEL
+// ============================================================================
+async function pump(src, dst, ci, dir) {
+  while (true) {
+    const chunk = await new Promise((resolve) => {
+      let done = false;
+      const cleanup = () => {
+        src.removeListener('data', onData);
+        src.removeListener('end', onEnd);
+        src.removeListener('error', onEnd);
+      };
+      const onData = (c) => {
+        if (done) return;
+        done = true;
+        src.pause();
+        cleanup();
+        resolve(c);
+      };
+      const onEnd = () => {
+        if (done) return;
+        done = true;
+        cleanup();
+        resolve(null);
+      };
+      src.on('data', onData);
+      src.once('end', onEnd);
+      src.once('error', onEnd);
+      src.resume();
+    });
+    if (chunk === null) break;
+    try {
+      await throttledWrite(dst, chunk, ci);
+    } catch { break; }
+    if (dir === 'up') ci.bytesUp += chunk.length;
+    else ci.bytesDown += chunk.length;
+  }
+  try { dst.end(); } catch {}
+}
+
+async function tunnel(socketA, socketB, ci) {
+  const p1 = pump(socketA, socketB, ci, 'up');
+  const p2 = pump(socketB, socketA, ci, 'down');
+  try { await Promise.all([p1, p2]); } catch {}
+  flushConnStats(ci);
+  try { socketA.destroy(); } catch {}
+  try { socketB.destroy(); } catch {}
+}
+
+// ============================================================================
+// SOCKS5
+// ============================================================================
+function ipv4ToBuf(ip) {
+  const p = ip.split('.').map(x => parseInt(x, 10));
+  return Buffer.from(p);
+}
+function ipv6ToBuf(ip) {
+  const e = expandIPv6(ip);
+  if (!e) return Buffer.alloc(16);
+  const g = e.split(':').map(x => parseInt(x, 16));
+  const b = Buffer.alloc(16);
+  for (let i = 0; i < 8; i++) b.writeUInt16BE(g[i] || 0, i * 2);
+  return b;
+}
+function bufToIP(buf, atyp) {
+  if (atyp === 0x01) return buf.slice(0, 4).join('.');
+  if (atyp === 0x04) {
+    const g = [];
+    for (let i = 0; i < 8; i++) g.push(buf.readUInt16BE(i * 2).toString(16));
+    return g.join(':');
+  }
+  return null;
+}
+
+function socks5Reply(socket, rep, ipStr, port) {
+  let atyp, ipBuf;
+  if (!ipStr) ipStr = '0.0.0.0';
+  if (ipStr.includes(':')) { atyp = 0x04; ipBuf = ipv6ToBuf(ipStr); }
+  else { atyp = 0x01; ipBuf = ipv4ToBuf(ipStr); }
+  const pb = Buffer.alloc(2);
+  pb.writeUInt16BE(port || 0, 0);
+  try { socket.write(Buffer.concat([Buffer.from([5, rep, 0, atyp]), ipBuf, pb])); } catch {}
+}
+
+async function handleSOCKS5(socket, reader) {
+  const clientIP = (socket.remoteAddress || '').replace(/^::ffff:/, '');
+  const clientPort = socket.remotePort;
+  let username = '', rateLimitBps = 0;
+  let ci = null;
+
+  try {
+    const ver = await reader.read(1);
+    if (ver[0] !== 0x05) { socket.destroy(); return; }
+    const nm = await reader.read(1);
+    const methods = await reader.read(nm[0]);
+    const needAuth = authRequired();
+    const want = needAuth ? 0x02 : 0x00;
+    if (!methods.includes(want)) {
+      socket.write(Buffer.from([5, 0xFF]));
+      socket.destroy();
+      return;
+    }
+    socket.write(Buffer.from([5, want]));
+
+    if (needAuth) {
+      const av = await reader.read(1);
+      if (av[0] !== 1) { socket.write(Buffer.from([1, 0xFF])); socket.destroy(); return; }
+      const ulen = (await reader.read(1))[0];
+      const u = (await reader.read(ulen)).toString('utf8');
+      const plen = (await reader.read(1))[0];
+      const p = (await reader.read(plen)).toString('utf8');
+      const res = authenticateProxyUser(u, p);
+      if (!res.ok) {
+        socket.write(Buffer.from([1, 0xFF]));
+        logWarn(`SOCKS5 auth fail from ${clientIP}`);
+        stats.authFail++;
+        recordAuthFail(clientIP, AUTH_FAIL_THRESHOLD);
+        socket.destroy();
+        return;
+      }
+      socket.write(Buffer.from([1, 0x00]));
+      resetAuthFail(clientIP);
+      username = res.user;
+      rateLimitBps = res.limit;
+      const lim = checkUserLimits(username);
+      if (!lim.ok) {
+        logWarn(`SOCKS5 từ chối user '${username}': ${lim.reason}`);
+        socks5Reply(socket, 0x02, null, 0);
+        socket.destroy();
+        return;
+      }
+    }
+
+    const req = await reader.read(4);
+    if (req[0] !== 5) { socket.destroy(); return; }
+    const cmd = req[1], atyp = req[3];
+
+    let host = '', port = 0;
+    if (atyp === 0x01) {
+      const ipb = await reader.read(4);
+      const pb = await reader.read(2);
+      host = ipb.join('.');
+      port = pb.readUInt16BE(0);
+    } else if (atyp === 0x03) {
+      const len = (await reader.read(1))[0];
+      const h = await reader.read(len);
+      const pb = await reader.read(2);
+      host = h.toString('ascii');
+      port = pb.readUInt16BE(0);
+      if (!host || !/^[A-Za-z0-9._\-:]+$/.test(host)) {
+        socks5Reply(socket, 0x01, null, 0); socket.destroy(); return;
+      }
+    } else if (atyp === 0x04) {
+      const ipb = await reader.read(16);
+      const pb = await reader.read(2);
+      host = bufToIP(ipb, 0x04);
+      port = pb.readUInt16BE(0);
+    } else {
+      socks5Reply(socket, 0x08, null, 0); socket.destroy(); return;
+    }
+
+    if (cmd === 0x01) {
+      const target = `${host}:${port}`;
+      logInfo(`SOCKS5 TCP → ${clientIP}:${clientPort} → ${target}`);
+      ci = makeConnInfo({ ip: clientIP, port: clientPort, type: 'SOCKS5_TCP', target, rateLimitBps, username, socket });
+      stats.socks5TCP++;
+
+      let remote;
+      try {
+        remote = await connectTarget(host, port);
+      } catch (e) {
+        logWarn(`SOCKS5 connect fail: ${e.message}`);
+        socks5Reply(socket, 0x05, null, 0);
+        activeConns.delete(ci.id);
+        socket.destroy();
+        return;
+      }
+      const la = remote.localAddress || '0.0.0.0';
+      const lp = remote.localPort || 0;
+      socks5Reply(socket, 0x00, la, lp);
+
+      reader.detach();
+
+      await tunnel(socket, remote, ci);
+      activeConns.delete(ci.id);
+    } else if (cmd === 0x03) {
+      if (args['no-udp']) {
+        socks5Reply(socket, 0x07, null, 0);
+        socket.destroy();
+        return;
+      }
+      const target = host ? `UDP:${host}:${port}` : 'UDP:any';
+      logInfo(`SOCKS5 UDP → ${clientIP}:${clientPort} → ${target}`);
+      await handleUDPAssociate(socket, reader, clientIP, clientPort, username, rateLimitBps, target);
+    } else {
+      socks5Reply(socket, 0x07, null, 0);
+      socket.destroy();
+    }
+  } catch (e) {
+    if (ci) { flushConnStats(ci); activeConns.delete(ci.id); }
+    try { socket.destroy(); } catch {}
+  }
+}
+
+// ============================================================================
+// UDP ASSOCIATE
+// ============================================================================
+async function handleUDPAssociate(socket, reader, clientIP, clientPort, username, rateLimitBps, target) {
+  const family = socket.remoteFamily === 'IPv6' ? 'udp6' : 'udp4';
+  const relay = dgram.createSocket(family);
+  try {
+    await new Promise((resolve, reject) => {
+      relay.once('error', reject);
+      relay.bind(0, () => resolve());
+    });
+  } catch (e) {
+    logErr(`UDP relay bind thất bại: ${e.message}`);
+    socks5Reply(socket, 0x01, null, 0);
+    socket.destroy();
+    return;
+  }
+  const boundPort = relay.address().port;
+
+  const ci = makeConnInfo({ ip: clientIP, port: clientPort, type: 'SOCKS5_UDP', target, rateLimitBps, username, socket });
+  stats.socks5UDP++;
+
+  const replyIP = (socket.localAddress || '0.0.0.0').replace(/^::ffff:/, '');
+  socks5Reply(socket, 0x00, replyIP, boundPort);
+  logInfo(`UDP relay bound ${replyIP}:${boundPort}`);
+
+  const assoc = {
+    clientIP, clientPort: null, clientKnown: false,
+    relaySocket: relay,
+    destMap: new Map(),
+    lastActivity: Date.now(),
+    username,
+    active: true,
+    ci,
+  };
+  const key = `${clientIP}:${clientPort}`;
+  udpAssocs.set(key, assoc);
+
+  relay.on('message', (msg, rinfo) => {
+    assoc.lastActivity = Date.now();
+    const fIP = rinfo.address.replace(/^::ffff:/, '');
+    const fPort = rinfo.port;
+
+    if (!assoc.clientKnown) {
+      if (fIP !== clientIP) {
+        logWarn(`UDP bỏ packet từ ${fIP}:${fPort} (khác client TCP ${clientIP})`);
+        return;
+      }
+      assoc.clientKnown = true;
+      assoc.clientPort = fPort;
+      logInfo(`UDP client learned: ${fIP}:${fPort}`);
+    }
+    if (fIP === assoc.clientIP && fPort === assoc.clientPort) {
+      handleUDPFromClient(assoc, msg, ci);
+    } else if (assoc.clientKnown) {
+      handleUDPFromRemote(assoc, msg, fIP, fPort, ci);
+    }
+  });
+
+  relay.on('error', (e) => logWarn(`UDP relay error: ${e.message}`));
+
+  const idleTimer = setInterval(() => {
+    if (Date.now() - assoc.lastActivity > UDP_IDLE_TIMEOUT_MS) shutdown();
+  }, 5000);
+
+  socket.once('close', () => shutdown());
+  socket.once('error', () => shutdown());
+  socket.once('end', () => shutdown());
+
+  let shutdown = function () {
+    if (!assoc.active) return;
+    assoc.active = false;
+    clearInterval(idleTimer);
+    try { relay.close(); } catch {}
+    udpAssocs.delete(key);
+    flushConnStats(ci);
+    activeConns.delete(ci.id);
+    try { socket.destroy(); } catch {}
+    logInfo(`UDP association ended (${clientIP}:${clientPort})`);
+  };
+
+  try { reader.detach(); } catch {}
+  socket.on('data', () => { /* ignore control bytes */ });
+  socket.resume();
+
+  await new Promise(resolve => {
+    const origShutdown = shutdown;
+    shutdown = function () {
+      origShutdown();
+      resolve();
+    };
+    if (!assoc.active) resolve();
+  });
+}
+
+function handleUDPFromClient(assoc, pkt, ci) {
+  if (pkt.length < 4 || pkt[2] !== 0) return;
+  const atyp = pkt[3];
+  let pos = 4, host = '';
+  if (atyp === 0x01) {
+    if (pkt.length < pos + 6) return;
+    host = `${pkt[pos]}.${pkt[pos + 1]}.${pkt[pos + 2]}.${pkt[pos + 3]}`;
+    pos += 4;
+  } else if (atyp === 0x03) {
+    if (pkt.length < pos + 1) return;
+    const len = pkt[pos]; pos++;
+    if (pkt.length < pos + len + 2 || len === 0) return;
+    host = pkt.slice(pos, pos + len).toString('ascii');
+    pos += len;
+    if (!/^[A-Za-z0-9._\-:]+$/.test(host)) return;
+  } else if (atyp === 0x04) {
+    if (pkt.length < pos + 18) return;
+    host = bufToIP(pkt.slice(pos, pos + 16), 0x04);
+    pos += 16;
+  } else return;
+  const port = pkt.readUInt16BE(pos); pos += 2;
+  const payload = pkt.slice(pos);
+
+  resolveAndCheck(host).then(ips => {
+    const destIP = ips[0];
+    const destKey = `${destIP}:${port}`;
+    if (assoc.destMap.size >= UDP_DEST_MAX) assoc.destMap.clear();
+    assoc.destMap.set(destKey, Date.now());
+    assoc.relaySocket.send(payload, port, destIP, (err) => {
+      if (err) { logWarn(`UDP sendto ${destIP}:${port} fail: ${err.message}`); return; }
+      stats.udpUp += payload.length;
+      ci.bytesUp += payload.length;
+      addUsage(assoc.username, payload.length);
+    });
+  }).catch(e => logWarn(`UDP relay bị chặn tới ${host}:${port}: ${e.message}`));
+}
+
+function handleUDPFromRemote(assoc, data, fromIP, fromPort, ci) {
+  if (!assoc.clientKnown || !assoc.clientPort) return;
+  const key = `${fromIP}:${fromPort}`;
+  if (!assoc.destMap.has(key)) return;
+  let atyp, addrBuf;
+  if (fromIP.includes(':')) { atyp = 0x04; addrBuf = ipv6ToBuf(fromIP); }
+  else { atyp = 0x01; addrBuf = ipv4ToBuf(fromIP); }
+  const pb = Buffer.alloc(2);
+  pb.writeUInt16BE(fromPort, 0);
+  const out = Buffer.concat([Buffer.from([0, 0, 0, atyp]), addrBuf, pb, data]);
+  assoc.relaySocket.send(out, assoc.clientPort, assoc.clientIP, (err) => {
+    if (err) { logWarn(`UDP reply→client fail: ${err.message}`); return; }
+    stats.udpDown += data.length;
+    ci.bytesDown += data.length;
+    addUsage(assoc.username, data.length);
+  });
+}
+
+// ============================================================================
+// HTTP PROXY
+// ============================================================================
+async function handleHTTP(socket, reader) {
+  const clientIP = (socket.remoteAddress || '').replace(/^::ffff:/, '');
+  const clientPort = socket.remotePort;
+  let ci = null;
+
+  try {
+    const reqLine = await reader.readLine();
+    const parts = reqLine.split(/\s+/);
+    if (parts.length < 3) {
+      socket.write('HTTP/1.1 400 Bad Request\r\n\r\n'); socket.destroy(); return;
+    }
+    const method = parts[0].toUpperCase();
+    const rawURL = parts[1];
+
+    const headers = {};
+    for (let i = 0; i < MAX_HEADER_LINES; i++) {
+      const line = await reader.readLine();
+      if (line === '') break;
+      const idx = line.indexOf(':');
+      if (idx > 0) {
+        const k = line.slice(0, idx).trim().toLowerCase();
+        const v = line.slice(idx + 1).trim();
+        if (!headers[k]) headers[k] = [];
+        headers[k].push(v);
+      }
+    }
+
+    let username = '', rateLimitBps = 0;
+    if (authRequired()) {
+      const auth = (headers['proxy-authorization'] || [])[0] || '';
+      const decoded = basicAuthDecode(auth);
+      if (!decoded) {
+        socket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="Proxy"\r\n\r\n');
+        socket.destroy(); return;
+      }
+      const res = authenticateProxyUser(decoded.user, decoded.pass);
+      if (!res.ok) {
+        try { socket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="Proxy"\r\n\r\n'); } catch {}
+        stats.authFail++;
+        recordAuthFail(clientIP, AUTH_FAIL_THRESHOLD);
+        socket.destroy(); return;
+      }
+      resetAuthFail(clientIP);
+      username = res.user;
+      rateLimitBps = res.limit;
+      const lim = checkUserLimits(username);
+      if (!lim.ok) {
+        logWarn(`HTTP từ chối user '${username}': ${lim.reason}`);
+        try { socket.write(`HTTP/1.1 429 Too Many Requests\r\nContent-Type: text/plain\r\n\r\n${lim.reason}`); } catch {}
+        socket.destroy(); return;
+      }
+    }
+
+    let host = '', port = 0, parsedURL = null;
+    if (method === 'CONNECT') {
+      const m = rawURL.match(/^\[([^\]]+)\]:(\d+)$/) || rawURL.match(/^([^:]+):(\d+)$/);
+      if (!m) { socket.write('HTTP/1.1 400 Bad Request\r\n\r\n'); socket.destroy(); return; }
+      host = m[1];
+      port = parseInt(m[2], 10);
+      if (!port || port < 1 || port > 65535) { socket.write('HTTP/1.1 400 Bad Request\r\n\r\n'); socket.destroy(); return; }
+    } else {
+      let u;
+      try { u = new URL(rawURL); } catch { socket.write('HTTP/1.1 400 Bad Request\r\n\r\n'); socket.destroy(); return; }
+      host = u.hostname;
+      port = u.port ? parseInt(u.port, 10) : (u.protocol === 'https:' ? 443 : 80);
+      parsedURL = u;
+    }
+
+    const target = net.isIPv6(host) ? `[${host}]:${port}` : `${host}:${port}`;
+    logInfo(`HTTP ${method} → ${clientIP}:${clientPort} → ${target}`);
+    ci = makeConnInfo({ ip: clientIP, port: clientPort, type: 'HTTP', target, rateLimitBps, username, socket });
+    stats.http++;
+
+    let remote;
+    try {
+      remote = await connectTarget(host, port);
+    } catch (e) {
+      logWarn(`HTTP connect fail: ${e.message}`);
+      socket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+      activeConns.delete(ci.id);
+      socket.destroy(); return;
+    }
+
+    if (method === 'CONNECT') {
+      try { socket.write('HTTP/1.1 200 Connection Established\r\n\r\n'); } catch {}
+      reader.detach();
+      await tunnel(socket, remote, ci);
+      flushConnStats(ci);
+      activeConns.delete(ci.id);
+      return;
+    }
+
+    const path = (parsedURL.pathname || '/') + (parsedURL.search || '');
+    const outLines = [`${method} ${path} HTTP/1.1`];
+    const hostHeader = parsedURL.port && !isDefaultPort(parsedURL)
+      ? `${parsedURL.hostname}:${parsedURL.port}`
+      : parsedURL.hostname;
+    if (!headers['host']) outLines.push(`Host: ${hostHeader}`);
+    for (const [k, vals] of Object.entries(headers)) {
+      if (['proxy-authorization', 'proxy-connection', 'connection', 'keep-alive', 'expect', 'upgrade', 'te'].includes(k)) continue;
+      for (const v of vals) outLines.push(`${k}: ${v}`);
+    }
+    outLines.push('Connection: close');
+    outLines.push('');
+    outLines.push('');
+    const reqBuf = Buffer.from(outLines.join('\r\n'), 'latin1');
+    await throttledWrite(remote, reqBuf, ci);
+    ci.bytesUp += reqBuf.length;
+
+    const cl = headers['content-length'] ? parseInt(headers['content-length'][0], 10) : -1;
+    const te = (headers['transfer-encoding'] || []).map(s => s.toLowerCase());
+    if (cl >= 0 && te.length > 0) {
+      logWarn(`HTTP request có cả Content-Length và Transfer-Encoding — từ chối`);
+      try { socket.write('HTTP/1.1 400 Bad Request\r\n\r\n'); } catch {}
+      activeConns.delete(ci.id);
+      socket.destroy();
+      return;
+    }
+    if (te.length > 0 && !(te.length === 1 && te[0] === 'chunked')) {
+      try { socket.write('HTTP/1.1 400 Bad Request\r\n\r\n'); } catch {}
+      activeConns.delete(ci.id);
+      socket.destroy();
+      return;
+    }
+    if (cl >= 0 && te.length === 0) {
+      if (cl > 0) {
+        const body = await reader.read(cl);
+        await throttledWrite(remote, body, ci);
+        ci.bytesUp += body.length;
+      }
+    } else if (te.length === 1 && te[0] === 'chunked') {
+      while (true) {
+        const line = await reader.readLine(1024);
+        const semi = line.indexOf(';');
+        const szStr = (semi >= 0 ? line.slice(0, semi) : line).trim();
+        const sz = parseInt(szStr, 16);
+        if (isNaN(sz) || sz < 0) break;
+        await throttledWrite(remote, Buffer.from(line + '\r\n'), ci);
+        if (sz === 0) {
+          for (let t = 0; t < MAX_HEADER_LINES; t++) {
+            const tl = await reader.readLine();
+            await throttledWrite(remote, Buffer.from(tl + '\r\n'), ci);
+            if (tl === '') break;
+          }
+          break;
+        }
+        const chunk = await reader.read(sz);
+        await throttledWrite(remote, chunk, ci);
+        const crlf = await reader.read(2);
+        await throttledWrite(remote, crlf, ci);
+        ci.bytesUp += sz + 2;
+      }
+    }
+
+    reader.detach();
+    const p2 = pump(remote, socket, ci, 'down');
+    await p2.catch(() => {});
+    flushConnStats(ci);
+    activeConns.delete(ci.id);
+    try { remote.destroy(); } catch {}
+    try { socket.destroy(); } catch {}
+  } catch (e) {
+    if (ci) { flushConnStats(ci); activeConns.delete(ci.id); }
+    try { socket.destroy(); } catch {}
+  }
+}
+
+function isDefaultPort(u) {
+  return (u.protocol === 'http:' && u.port === '80') || (u.protocol === 'https:' && u.port === '443');
+}
+
+function basicAuthDecode(authHeader) {
+  if (!authHeader) return null;
+  const m = authHeader.match(/^Basic\s+(.+)$/i);
+  if (!m) return null;
+  try {
+    const decoded = Buffer.from(m[1], 'base64').toString('utf8');
+    const idx = decoded.indexOf(':');
+    if (idx < 0) return null;
+    return { user: decoded.slice(0, idx), pass: decoded.slice(idx + 1) };
+  } catch { return null; }
+}
+
+// ============================================================================
+// CONNECTION ROUTER
+// ============================================================================
+function isHTTPMethodByte(b) {
+  return [0x43, 0x47, 0x50, 0x44, 0x48, 0x4f, 0x54, 0x55, 0x4c, 0x45].includes(b);
+}
+
+function handleConnection(socket) {
+  const clientIP = (socket.remoteAddress || '').replace(/^::ffff:/, '');
+  if (clientIP && !ipAllowed(clientIP)) {
+    logWarn(`IP ${clientIP} bị từ chối bởi whitelist/blacklist`);
+    socket.destroy(); return;
+  }
+  if (clientIP && isAuthBlocked(clientIP)) {
+    logWarn(`IP ${clientIP} bị chặn do auth fail`);
+    socket.destroy(); return;
+  }
+
+  stats.total++;
+  stats.current++;
+
+  socket.setNoDelay(true);
+  socket.setTimeout(HANDSHAKE_TIMEOUT_MS);
+
+  const reader = new BufferedReader(socket);
+  socket.once('timeout', () => { socket.destroy(); });
+
+  reader.read(1).then(first => {
+    socket.setTimeout(0);
+    const b = first[0];
+    reader.unread(first);
+    if (b === 0x05) {
+      return handleSOCKS5(socket, reader);
+    } else if (isHTTPMethodByte(b)) {
+      return handleHTTP(socket, reader);
+    } else {
+      logWarn(`Unknown protocol from ${clientIP}`);
+      socket.destroy();
+    }
+  }).catch(() => {
+    socket.destroy();
+  }).finally(() => {
+    stats.current--;
+  });
+}
+
+// ============================================================================
+// DASHBOARD HTML
+// ============================================================================
+const DASHBOARD_HTML = `<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Proxy Dashboard</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0f0f1a;--fg:#e0e0e0;--container-bg:#14141f;--box-bg:#1a1a2e;--box-hover:#22223b;--border:#2a2a3a;--border2:#28283a;--th-bg:#1e1e32;--muted:#9999bb;--muted2:#b4b4d4;--accent:#f0c27a;--btn-bg:#2a2a3a;--btn-border:#3a3a52;--danger-fg:#fca5a5;--ok-fg:#86efac}
+html[data-theme="light"]{--bg:#f4f4f9;--fg:#1c1c2a;--container-bg:#fff;--box-bg:#f0f0f7;--box-hover:#e6e6f2;--border:#dcdce8;--border2:#e4e4f0;--th-bg:#ececf5;--muted:#52526a;--muted2:#33334a;--accent:#8a5010;--btn-bg:#ececf5;--btn-border:#c8c8dc;--danger-fg:#b91c1c;--ok-fg:#15803d}
+body{background:var(--bg);color:var(--fg);font-family:'Segoe UI','Roboto',monospace;padding:30px 20px}
+.container{max-width:1400px;margin:0 auto}
+h1{font-size:2.2rem;font-weight:300;color:var(--accent);display:flex;align-items:center;gap:10px}
+h1 span{background:var(--btn-bg);padding:0 12px;border-radius:30px;font-size:.8rem;color:var(--muted)}
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:15px;margin:20px 0}
+.stat-box{background:var(--box-bg);padding:14px 16px;border-radius:12px;border-left:4px solid #6c6c9a}
+.stat-box:hover{background:var(--box-hover)}
+.stat-label{font-size:.8rem;text-transform:uppercase;color:var(--muted)}
+.stat-value{font-size:1.7rem;font-weight:600;margin-top:4px;color:#7dd3fc}
+.section{margin-top:30px;background:var(--container-bg);border-radius:14px;padding:20px;border:1px solid var(--border)}
+.section-title{font-size:1.2rem;color:var(--muted2);margin-bottom:15px}
+table{width:100%;border-collapse:collapse;font-size:.9rem}
+th{text-align:left;padding:10px 8px;background:var(--th-bg);color:var(--muted);font-weight:500;white-space:nowrap}
+td{padding:8px;border-bottom:1px solid var(--border2)}
+tr:hover td{background:var(--box-bg)}
+.badge{display:inline-block;padding:2px 12px;border-radius:20px;font-size:.7rem;font-weight:600;background:#2a2a4a;color:#c0c0e0}
+.badge.socks5-tcp{background:#1e3a5f;color:#7dd3fc}
+.badge.socks5-udp{background:#3b1f4a;color:#d8b4fe}
+.badge.http{background:#2d4a2d;color:#86efac}
+.header-bar{display:flex;align-items:center;justify-content:space-between;border-bottom:2px solid var(--border);padding-bottom:15px;margin-bottom:10px;flex-wrap:wrap;gap:10px}
+.header-actions{display:flex;gap:8px;flex-wrap:wrap}
+.btn{background:var(--btn-bg);color:var(--fg);border:1px solid var(--btn-border);padding:8px 16px;border-radius:8px;cursor:pointer;font-size:.85rem}
+.btn:hover{border-color:var(--accent)}
+.btn-sm{padding:4px 10px;font-size:.75rem}
+.btn-danger{border-color:#7a3030;color:var(--danger-fg)}
+.btn-primary{background:var(--accent);color:#1a1a2e;border-color:var(--accent);font-weight:600}
+input,textarea{background:var(--box-bg);border:1px solid var(--border);border-radius:8px;padding:8px;color:var(--fg);width:100%;font-family:inherit}
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);align-items:center;justify-content:center;z-index:100}
+.modal-overlay.open{display:flex}
+.modal{background:var(--container-bg);border:1px solid var(--border);border-radius:14px;padding:24px;width:400px;max-width:90vw}
+.modal h2{font-size:1.1rem;color:var(--accent);margin-bottom:16px}
+.modal label{display:block;font-size:.8rem;color:var(--muted);margin:12px 0 4px}
+.modal-actions{display:flex;gap:10px;margin-top:20px}
+.modal-actions .btn{flex:1}
+.modal-msg{margin-top:12px;font-size:.82rem;min-height:18px}
+.modal-msg.error{color:var(--danger-fg)}
+.modal-msg.success{color:var(--ok-fg)}
+#trafficChart{width:100%;height:200px}
+</style></head><body>
+<div class="container">
+<div class="header-bar"><h1>⚡ Proxy Pro <span>v6.3 (Node)</span></h1>
+<div class="header-actions">
+<button class="btn" id="themeToggleBtn" onclick="toggleTheme()">🌙 Theme</button>
+<button class="btn" onclick="openPwModal()">🔒 Change Password</button>
+</div></div>
+<div id="statsGrid" class="stats-grid">Loading...</div>
+
+<div class="section">
+<div class="section-title">📈 Real-time Traffic <span id="streamStatus" style="font-size:.75rem;color:var(--muted)">(connecting...)</span></div>
+<canvas id="trafficChart"></canvas>
+</div>
+
+<div class="section">
+<div class="section-title">🔗 Active Connections <span id="connCount"></span></div>
+<input type="text" id="connFilter" placeholder="Filter..." oninput="renderConns()" style="margin-bottom:8px">
+<div id="connTable">Loading...</div>
+</div>
+
+<div class="section">
+<div class="section-title">👤 Proxy Users</div>
+<div style="margin-bottom:8px"><button class="btn btn-sm" onclick="openUserModal()">+ Add / Update User</button></div>
+<div id="usersTable">Loading...</div>
+</div>
+
+<div class="section">
+<div class="section-title">🌐 Network Rules</div>
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px">
+<div><label style="display:block;font-size:.8rem;color:var(--muted);margin-bottom:4px">Whitelist IP/CIDR</label>
+<textarea id="netAllow" rows="5" style="font-family:monospace;font-size:.82rem"></textarea></div>
+<div><label style="display:block;font-size:.8rem;color:var(--muted);margin-bottom:4px">Blacklist IP/CIDR</label>
+<textarea id="netDeny" rows="5" style="font-family:monospace;font-size:.82rem"></textarea></div>
+<div><label style="display:block;font-size:.8rem;color:var(--muted);margin-bottom:4px">Upstream proxies</label>
+<textarea id="netUpstream" rows="5" style="font-family:monospace;font-size:.82rem"></textarea></div>
+</div>
+<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+<button class="btn btn-primary" onclick="saveNet()">Save & Apply</button>
+<button class="btn" onclick="reloadFromDisk()">↻ Reload from disk</button>
+</div>
+<div class="modal-msg" id="netMsg"></div>
+</div>
+
+<div class="section">
+<div class="section-title">🔑 API Tokens</div>
+<div style="margin-bottom:8px"><button class="btn btn-sm" onclick="openTokenModal()">+ Create Token</button></div>
+<div id="tokensTable">Loading...</div>
+</div>
+
+<div class="section">
+<div class="section-title">📋 Audit Log</div>
+<div id="auditTable">Loading...</div>
+</div>
+
+<div class="section">
+<div class="section-title">🕒 Reload History</div>
+<div id="reloadTable">Loading...</div>
+</div>
+
+<div class="section">
+<div class="section-title">💾 Backup / Restore</div>
+<div style="display:flex;gap:8px">
+<a class="btn btn-sm" href="/api/config/export" download>⬇ Download Backup</a>
+<input type="file" id="restoreFile" style="display:none" onchange="restoreConfig(event)">
+<button class="btn btn-sm" onclick="document.getElementById('restoreFile').click()">⬆ Restore</button>
+</div>
+<div class="modal-msg" id="backupMsg"></div>
+</div>
+</div>
+
+<div class="modal-overlay" id="userModalOverlay"><div class="modal">
+<h2>👤 Add / Update User</h2>
+<form id="userForm" onsubmit="return submitUser(event)">
+<label>Username</label><input type="text" id="uUsername" required>
+<label>Password (blank = keep current)</label><input type="password" id="uPassword">
+<label>Max bandwidth KB/s (0 = unlimited)</label><input type="number" id="uBandwidth" value="0" min="0">
+<label>Max conns (0 = unlimited)</label><input type="number" id="uMaxConn" value="0" min="0">
+<label>Quota MB/tháng (0 = unlimited)</label><input type="number" id="uQuota" value="0" min="0">
+<div class="modal-msg" id="userMsg"></div>
+<div class="modal-actions"><button type="button" class="btn" onclick="closeUserModal()">Cancel</button>
+<button type="submit" class="btn btn-primary">Save</button></div></form>
+</div></div>
+
+<div class="modal-overlay" id="tokenModalOverlay"><div class="modal">
+<h2>🔑 Create API Token</h2>
+<form id="tokenForm" onsubmit="return submitToken(event)">
+<label>Token name</label><input type="text" id="tName" required>
+<div class="modal-msg" id="tokenMsg"></div>
+<div id="tokenResultBox" style="display:none;margin-top:12px;padding:10px;background:var(--box-bg);border-radius:8px">
+<div style="font-size:.78rem;color:var(--danger-fg);margin-bottom:6px">⚠️ Chỉ hiện MỘT LẦN:</div>
+<code id="tokenResultValue" style="word-break:break-all;font-size:.8rem"></code></div>
+<div class="modal-actions"><button type="button" class="btn" onclick="closeTokenModal()">Close</button>
+<button type="submit" class="btn btn-primary" id="tokenSubmitBtn">Create</button></div></form>
+</div></div>
+
+<div class="modal-overlay" id="pwModalOverlay"><div class="modal">
+<h2>🔒 Change Dashboard Credentials</h2>
+<form id="pwForm" onsubmit="return submitPw(event)">
+<label>Current password</label><input type="password" id="curPass" required>
+<label>New username (blank = keep)</label><input type="text" id="newUser">
+<label>New password (min 8)</label><input type="password" id="newPass" minlength="8" required>
+<label>Confirm</label><input type="password" id="newPass2" minlength="8" required>
+<div class="modal-msg" id="pwMsg"></div>
+<div class="modal-actions"><button type="button" class="btn" onclick="closePwModal()">Cancel</button>
+<button type="submit" class="btn btn-primary">Save</button></div></form>
+</div></div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script>
+let lastConns=[], trafficChart=null;
+const CHART_MAX=150;
+function esc(v){return String(v==null?'':v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+function fmtB(b){if(b==null)return '0 B';const u=['B','KiB','MiB','GiB','TiB'];let i=0;while(b>=1024&&i<u.length-1){b/=1024;i++}return b.toFixed(1)+' '+u[i]}
+function fmtT(s){if(!s)return '00:00:00';const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),x=Math.floor(s%60);return String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(x).padStart(2,'0')}
+function applyTheme(t){document.documentElement.setAttribute('data-theme',t);document.getElementById('themeToggleBtn').textContent=t==='light'?'☀️ Theme':'🌙 Theme';try{localStorage.setItem('dashboard-theme',t)}catch(e){}}
+function toggleTheme(){const c=document.documentElement.getAttribute('data-theme')||'dark';applyTheme(c==='light'?'dark':'light')}
+(function(){let s='dark';try{s=localStorage.getItem('dashboard-theme')||'dark'}catch(e){}applyTheme(s)})();
+
+function initChart(){
+  if(typeof Chart==='undefined')return;
+  const ctx=document.getElementById('trafficChart').getContext('2d');
+  trafficChart=new Chart(ctx,{type:'line',data:{labels:[],datasets:[
+    {label:'Upload (B/s)',data:[],borderColor:'#ea580c',backgroundColor:'rgba(234,88,12,0.1)',tension:0.3,pointRadius:0,borderWidth:2,fill:true},
+    {label:'Download (B/s)',data:[],borderColor:'#0891b2',backgroundColor:'rgba(8,145,178,0.1)',tension:0.3,pointRadius:0,borderWidth:2,fill:true}
+  ]},options:{responsive:true,maintainAspectRatio:false,animation:false,
+    interaction:{mode:'index',intersect:false},
+    scales:{x:{ticks:{color:'#9999bb',maxTicksLimit:10},grid:{color:'#28283a'}},
+            y:{ticks:{color:'#9999bb',callback:v=>fmtB(v)+'/s'},grid:{color:'#28283a'},beginAtZero:true}},
+    plugins:{legend:{labels:{color:'#9999bb'}}}}});
+}
+function pushSample(s){
+  if(!trafficChart)return;
+  trafficChart.data.labels.push(new Date(s.t*1000).toLocaleTimeString());
+  trafficChart.data.datasets[0].data.push(s.up_bps);
+  trafficChart.data.datasets[1].data.push(s.down_bps);
+  if(trafficChart.data.labels.length>CHART_MAX){
+    trafficChart.data.labels.shift();
+    trafficChart.data.datasets[0].data.shift();
+    trafficChart.data.datasets[1].data.shift();
+  }
+  trafficChart.update('none');
+}
+let _es=null,_esRetryMs=1000;
+function connectStream(){
+  const st=document.getElementById('streamStatus');
+  if(_es){try{_es.close()}catch(e){}}
+  _es=new EventSource('/api/stream');
+  _es.addEventListener('history',e=>{try{JSON.parse(e.data).forEach(pushSample);st.textContent='(live)';st.style.color='#86efac';_esRetryMs=1000}catch(err){}});
+  _es.addEventListener('sample',e=>{try{pushSample(JSON.parse(e.data))}catch(err){}});
+  _es.onerror=()=>{
+    st.textContent='(reconnecting...)';st.style.color='#fca5a5';
+    try{_es.close()}catch(e){}
+    _esRetryMs=Math.min(_esRetryMs*2,30000);
+    setTimeout(connectStream,_esRetryMs);
+  };
+  _es.onopen=()=>{st.textContent='(live)';st.style.color='#86efac';_esRetryMs=1000};
+}
+async function api(url,opt){
+  const ctl=new AbortController();
+  const timer=setTimeout(()=>ctl.abort(),15000);
+  try{
+    const r=await fetch(url,Object.assign({signal:ctl.signal},opt||{}));
+    const t=await r.text();
+    let d;try{d=JSON.parse(t)}catch(e){d={error:t}}
+    if(!r.ok)throw new Error(d.error||('HTTP '+r.status));
+    return d;
+  }finally{clearTimeout(timer)}
+}
+async function refresh(){
+  try{
+    const d=await api('/api/all');
+    const boxes=[['Total',d.total],['Active',d.active],['SOCKS5 TCP',d.socks5_tcp],
+      ['SOCKS5 UDP',d.socks5_udp],['HTTP',d.http],['UDP Assoc',d.udp_assocs||0],
+      ['Bytes Up',fmtB(d.bytes_up)],['Bytes Down',fmtB(d.bytes_down)],
+      ['UDP Up',fmtB(d.udp_up)],['UDP Down',fmtB(d.udp_down)],['Uptime',fmtT(d.uptime)]];
+    document.getElementById('statsGrid').innerHTML=boxes.map(b=>'<div class="stat-box"><div class="stat-label">'+b[0]+'</div><div class="stat-value">'+b[1]+'</div></div>').join('');
+    lastConns=d.active_connections||[];
+    renderConns();
+  }catch(e){document.getElementById('statsGrid').innerHTML='<div style="color:#fca5a5">⚠️ '+esc(e.message)+'</div>'}
+}
+function renderConns(){
+  const f=(document.getElementById('connFilter').value||'').toLowerCase();
+  let cs=lastConns.slice();
+  if(f)cs=cs.filter(c=>(c.ip||'').toLowerCase().includes(f)||(c.target||'').toLowerCase().includes(f)||(c.type||'').toLowerCase().includes(f));
+  document.getElementById('connCount').textContent='('+cs.length+')';
+  if(!cs.length){document.getElementById('connTable').innerHTML='<div style="color:var(--muted);padding:10px">No active connections</div>';return;}
+  let h='<table><thead><tr><th>IP</th><th>Type</th><th>Target</th><th>User</th><th>Duration</th><th>Up</th><th>Down</th><th></th></tr></thead><tbody>';
+  cs.forEach(c=>{
+    let cls=c.type==='SOCKS5_TCP'?'socks5-tcp':c.type==='SOCKS5_UDP'?'socks5-udp':c.type==='HTTP'?'http':'';
+    h+='<tr><td>'+esc(c.ip)+'</td><td><span class="badge '+cls+'">'+esc(c.type)+'</span></td><td>'+esc(c.target||'')+'</td><td>'+esc(c.user||'')+'</td><td>'+fmtT(c.duration)+'</td><td>'+fmtB(c.bytes_up)+'</td><td>'+fmtB(c.bytes_down)+'</td><td><button class="btn btn-sm btn-danger" onclick="kick(\''+esc(c.id)+'\')">Kick</button></td></tr>';
+  });
+  document.getElementById('connTable').innerHTML=h+'</tbody></table>';
+}
+async function kick(id){try{await api('/api/kick',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});refresh()}catch(e){alert(e.message)}}
+async function refreshUsers(){
+  try{
+    const d=await api('/api/users');
+    if(!d.users.length){document.getElementById('usersTable').innerHTML='<div style="color:var(--muted)">No users</div>';return;}
+    let h='<table><thead><tr><th>Username</th><th>Max BW</th><th>Max Conns</th><th>Quota</th><th>Used</th><th></th></tr></thead><tbody>';
+    d.users.forEach(u=>{
+      const bw=u.max_bandwidth_bps>0?fmtB(u.max_bandwidth_bps)+'/s':'∞';
+      const mc=u.max_connections>0?u.max_connections:'∞';
+      const q=u.quota_bytes_per_month>0?fmtB(u.quota_bytes_per_month):'∞';
+      const used=fmtB(u.usage_bytes_this_month||0);
+      h+='<tr><td>'+esc(u.username)+'</td><td>'+bw+'</td><td>'+mc+'</td><td>'+q+'</td><td>'+used+'</td><td><button class="btn btn-sm btn-danger" onclick="delUser(\''+esc(u.username)+'\')">Delete</button></td></tr>';
+    });
+    document.getElementById('usersTable').innerHTML=h+'</tbody></table>';
+  }catch(e){}
+}
+async function delUser(u){if(!confirm('Delete "'+u+'"?'))return;try{await api('/api/users/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u})});refreshUsers()}catch(e){alert(e.message)}}
+function openUserModal(){document.getElementById('userMsg').textContent='';document.getElementById('userForm').reset();document.getElementById('userModalOverlay').classList.add('open')}
+function closeUserModal(){document.getElementById('userModalOverlay').classList.remove('open')}
+async function submitUser(e){
+  e.preventDefault();
+  const m=document.getElementById('userMsg');
+  try{
+    await api('/api/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+      username:document.getElementById('uUsername').value.trim(),
+      password:document.getElementById('uPassword').value,
+      max_bandwidth_bps:Math.round((parseFloat(document.getElementById('uBandwidth').value)||0)*1024),
+      max_connections:parseInt(document.getElementById('uMaxConn').value)||0,
+      quota_bytes_per_month:Math.round((parseFloat(document.getElementById('uQuota').value)||0)*1024*1024)
+    })});
+    closeUserModal();refreshUsers();
+  }catch(err){m.textContent=err.message;m.className='modal-msg error'}
+  return false;
+}
+async function refreshNet(){
+  try{
+    const d=await api('/api/network-config');
+    document.getElementById('netAllow').value=(d.allow_list||[]).join('\n');
+    document.getElementById('netDeny').value=(d.deny_list||[]).join('\n');
+    document.getElementById('netUpstream').value=(d.upstream_proxies||[]).join('\n');
+  }catch(e){}
+}
+function lines(t){return t.split('\n').map(s=>s.trim()).filter(s=>s)}
+async function saveNet(){
+  const m=document.getElementById('netMsg');m.textContent='Saving...';
+  try{
+    await api('/api/network-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+      allow_list:lines(document.getElementById('netAllow').value),
+      deny_list:lines(document.getElementById('netDeny').value),
+      upstream_proxies:lines(document.getElementById('netUpstream').value)
+    })});
+    m.textContent='Saved';m.className='modal-msg success';refreshReload();
+  }catch(e){m.textContent=e.message;m.className='modal-msg error'}
+}
+async function reloadFromDisk(){
+  const m=document.getElementById('netMsg');m.textContent='Reloading...';
+  try{await api('/api/reload',{method:'POST'});m.textContent='Reloaded';m.className='modal-msg success';refreshNet();refreshReload()}
+  catch(e){m.textContent=e.message;m.className='modal-msg error'}
+}
+async function refreshTokens(){
+  try{
+    const d=await api('/api/tokens');
+    if(!d.tokens.length){document.getElementById('tokensTable').innerHTML='<div style="color:var(--muted)">No tokens</div>';return;}
+    let h='<table><thead><tr><th>Name</th><th>Created</th><th></th></tr></thead><tbody>';
+    d.tokens.forEach(t=>{h+='<tr><td>'+esc(t.name)+'</td><td>'+new Date(t.created_at*1000).toLocaleString()+'</td><td><button class="btn btn-sm btn-danger" onclick="delToken(\''+esc(t.name)+'\')">Revoke</button></td></tr>'});
+    document.getElementById('tokensTable').innerHTML=h+'</tbody></table>';
+  }catch(e){}
+}
+async function delToken(n){if(!confirm('Revoke "'+n+'"?'))return;try{await api('/api/tokens/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n})});refreshTokens()}catch(e){alert(e.message)}}
+function openTokenModal(){document.getElementById('tokenMsg').textContent='';document.getElementById('tokenResultBox').style.display='none';document.getElementById('tokenForm').reset();document.getElementById('tName').disabled=false;document.getElementById('tokenSubmitBtn').style.display='inline-block';document.getElementById('tokenModalOverlay').classList.add('open')}
+function closeTokenModal(){document.getElementById('tokenModalOverlay').classList.remove('open');refreshTokens()}
+async function submitToken(e){
+  e.preventDefault();
+  try{
+    const d=await api('/api/tokens',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:document.getElementById('tName').value.trim()})});
+    document.getElementById('tokenResultValue').textContent=d.token;
+    document.getElementById('tokenResultBox').style.display='block';
+    document.getElementById('tName').disabled=true;document.getElementById('tokenSubmitBtn').style.display='none';
+  }catch(err){document.getElementById('tokenMsg').textContent=err.message;document.getElementById('tokenMsg').className='modal-msg error'}
+  return false;
+}
+async function refreshAudit(){
+  try{
+    const d=await api('/api/audit-log');
+    if(!d.events.length){document.getElementById('auditTable').innerHTML='<div style="color:var(--muted)">No events</div>';return;}
+    let h='<table><thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Details</th></tr></thead><tbody>';
+    d.events.slice(0,30).forEach(e=>{h+='<tr><td>'+new Date(e.t*1000).toLocaleString()+'</td><td>'+esc(e.actor)+'</td><td>'+esc(e.action)+'</td><td>'+esc(e.details||'')+'</td></tr>'});
+    document.getElementById('auditTable').innerHTML=h+'</tbody></table>';
+  }catch(e){}
+}
+async function refreshReload(){
+  try{
+    const d=await api('/api/reload-history');
+    if(!d.history.length){document.getElementById('reloadTable').innerHTML='<div style="color:var(--muted)">No reloads</div>';return;}
+    let h='<table><thead><tr><th>Time</th><th>Source</th><th>Status</th><th>Details</th></tr></thead><tbody>';
+    d.history.forEach(e=>{h+='<tr><td>'+new Date(e.t*1000).toLocaleString()+'</td><td>'+esc(e.source)+'</td><td>'+(e.success?'OK':'FAIL')+'</td><td>'+esc(e.error||(e.allow_count+' allow, '+e.deny_count+' deny, '+e.upstream_count+' upstream, '+e.user_count+' users'))+'</td></tr>'});
+    document.getElementById('reloadTable').innerHTML=h+'</tbody></table>';
+  }catch(e){}
+}
+async function restoreConfig(e){
+  const f=e.target.files[0];if(!f)return;
+  const m=document.getElementById('backupMsg');
+  if(!confirm('Restore from '+f.name+'?')){e.target.value='';return;}
+  try{
+    const text=await f.text();
+    await api('/api/config/import',{method:'POST',headers:{'Content-Type':'application/json'},body:text});
+    m.textContent='Restored. Reloading...';m.className='modal-msg success';setTimeout(()=>location.reload(),1500);
+  }catch(err){m.textContent=err.message;m.className='modal-msg error'}finally{e.target.value=''}
+}
+function openPwModal(){document.getElementById('pwMsg').textContent='';document.getElementById('pwForm').reset();document.getElementById('pwModalOverlay').classList.add('open')}
+function closePwModal(){document.getElementById('pwModalOverlay').classList.remove('open')}
+async function submitPw(e){
+  e.preventDefault();
+  const m=document.getElementById('pwMsg');
+  const p1=document.getElementById('newPass').value,p2=document.getElementById('newPass2').value;
+  if(p1!==p2){m.textContent='Passwords do not match';m.className='modal-msg error';return false}
+  try{
+    await api('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+      current_password:document.getElementById('curPass').value,
+      new_username:document.getElementById('newUser').value.trim(),
+      new_password:p1
+    })});
+    m.textContent='Changed. Reloading...';m.className='modal-msg success';setTimeout(()=>location.reload(),1500);
+  }catch(err){m.textContent=err.message;m.className='modal-msg error'}
+  return false;
+}
+document.addEventListener('DOMContentLoaded',()=>{initChart();connectStream()});
+refresh();refreshUsers();refreshNet();refreshTokens();refreshAudit();refreshReload();
+setInterval(refresh,5000);
+setInterval(refreshUsers,15000);
+setInterval(refreshTokens,15000);
+setInterval(refreshAudit,15000);
+setInterval(refreshReload,15000);
+</script></body></html>`;
+
+// ============================================================================
+// DASHBOARD SERVER (HTTP handler)
+// ============================================================================
+async function dashboardAuth(req, res) {
+  const ip = (req.socket.remoteAddress || '').replace(/^::ffff:/, '');
+  const safeWrite = (code, headers, body) => {
+    if (res.writableEnded || res.destroyed) return;
+    try { res.writeHead(code, headers); res.end(body); } catch {}
+  };
+  if (isAuthBlocked(ip)) {
+    safeWrite(429, { 'Content-Type': 'application/json' }, '{"error":"Too many requests"}');
+    return null;
+  }
+  const authHeader = req.headers['authorization'] || '';
+  if (authHeader.startsWith('Bearer ')) {
+    const token = authHeader.slice(7);
+    const th = hashAPIToken(token);
+    const found = (appConfig.api_tokens || []).find(t => ctEqual(t.token_hash, th));
+    if (found) { resetAuthFail(ip); return 'token:' + found.name; }
+    recordAuthFail(ip, DASHBOARD_AUTH_FAIL_THRESHOLD);
+    safeWrite(401, { 'Content-Type': 'application/json' }, '{"error":"Unauthorized (invalid token)"}');
+    return null;
+  }
+  if (authHeader.startsWith('Basic ')) {
+    let decoded = '';
+    try { decoded = Buffer.from(authHeader.slice(6), 'base64').toString('utf8'); } catch {}
+    const idx = decoded.indexOf(':');
+    if (idx >= 0) {
+      const u = decoded.slice(0, idx), p = decoded.slice(idx + 1);
+      if (ctEqual(u, dashboardUser) && verifyPasswordCached(p, dashboardPassHash)) {
+        resetAuthFail(ip);
+        return 'dashboard:' + u;
+      }
+    }
+  }
+  recordAuthFail(ip, DASHBOARD_AUTH_FAIL_THRESHOLD);
+  safeWrite(401, {
+    'WWW-Authenticate': 'Basic realm="Dashboard"',
+    'Content-Type': 'application/json',
+  }, '{"error":"Unauthorized"}');
+  return null;
+}
+
+const DASH_REQ_TIMEOUT_MS = 30000;
+
+async function handleDashboardRequest(req, res) {
+  let watchdogFired = false;
+  const watchdog = setTimeout(() => {
+    watchdogFired = true;
+    if (!res.writableEnded && !res.destroyed) {
+      try {
+        res.writeHead(504, { 'Content-Type': 'application/json' });
+        res.end('{"error":"request timeout"}');
+      } catch {}
+    }
+    try { req.socket.destroy(); } catch {}
+  }, DASH_REQ_TIMEOUT_MS);
+  res.once('finish', () => clearTimeout(watchdog));
+  res.once('close', () => clearTimeout(watchdog));
+
+  try {
+    await handleDashboardRequestInner(req, res);
+  } catch (e) {
+    if (!watchdogFired && !res.writableEnded && !res.destroyed) {
+      try {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: (e && e.message) || 'internal error' }));
+      } catch {}
+    }
+  } finally {
+    clearTimeout(watchdog);
+  }
+}
+
+async function handleDashboardRequestInner(req, res) {
+  const p = (req.url || '').split('?')[0];
+
+  if (p === '/healthz') {
+    res.writeHead(shuttingDown ? 503 : 200, { 'Content-Type': 'application/json' });
+    return res.end(shuttingDown ? '{"status":"shutting_down"}' : '{"status":"ok"}');
+  }
+  if (p === '/metrics') {
+    return metricsHandler(req, res);
+  }
+
+  const actor = await dashboardAuth(req, res);
+  if (!actor) return;
+
+  if (req.method === 'POST') {
+    const ct = (req.headers['content-type'] || '').toLowerCase();
+    if (!ct.startsWith('application/json')) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      return res.end('{"error":"CSRF check failed (content-type)"}');
+    }
+    const site = req.headers['sec-fetch-site'];
+    if (site && site !== 'same-origin' && site !== 'none') {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      return res.end('{"error":"CSRF check failed (sec-fetch-site)"}');
+    }
+    const origin = req.headers['origin'];
+    if (origin) {
+      let ok = false;
+      try {
+        const u = new URL(origin);
+        const hostHeader = (req.headers['host'] || '').toLowerCase();
+        if (u.host.toLowerCase() === hostHeader) ok = true;
+      } catch {}
+      if (!ok) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        return res.end('{"error":"CSRF check failed (origin)"}');
+      }
+    }
+  }
+
+  if (p === '/') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    return res.end(DASHBOARD_HTML);
+  }
+  if (p === '/api/all') {
+    return sendJSON(res, 200, getAllStats());
+  }
+  if (p === '/api/stream') {
+    return streamHandler(req, res);
+  }
+  if (p === '/api/kick') return await hKick(req, res, actor);
+  if (p === '/api/users') return await hUsers(req, res, actor);
+  if (p === '/api/users/delete') return await hDeleteUser(req, res, actor);
+  if (p === '/api/tokens') return await hTokens(req, res, actor);
+  if (p === '/api/tokens/delete') return await hDeleteToken(req, res, actor);
+  if (p === '/api/audit-log') {
+    return sendJSON(res, 200, { events: [...auditLog].reverse() });
+  }
+  if (p === '/api/reload-history') {
+    return sendJSON(res, 200, { history: [...reloadHistory].reverse() });
+  }
+  if (p === '/api/network-config') return await hNetworkConfig(req, res, actor);
+  if (p === '/api/reload') {
+    const err = reloadConfig(actor);
+    if (err) { res.writeHead(400); return res.end(JSON.stringify({ error: err })); }
+    recordAudit(actor, 'reload_config', 'manual');
+    return sendJSON(res, 200, { success: true });
+  }
+  if (p === '/api/change-password') return await hChangePassword(req, res, actor);
+  if (p === '/api/config/export') {
+    recordAudit(actor, 'export_config_backup', '');
+    const data = JSON.stringify(appConfig, null, 2);
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Content-Disposition': `attachment; filename=proxy_config_backup_${Date.now()}.json`,
+    });
+    return res.end(data);
+  }
+  if (p === '/api/config/import') return await hImportConfig(req, res, actor);
+
+  res.writeHead(404); res.end('{"error":"not found"}');
+}
+
+function sendJSON(res, code, obj) {
+  const body = JSON.stringify(obj);
+  res.writeHead(code, { 'Content-Type': 'application/json' });
+  res.end(body);
+}
+
+const READ_BODY_TIMEOUT_MS = 30000;
+
+async function readJSONBody(req, limit = 65536) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    let done = false;
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      req.removeListener('data', onData);
+      req.removeListener('end', onEnd);
+      req.removeListener('error', onErr);
+      req.removeListener('aborted', onAbort);
+    };
+    const finish = (fn, val) => {
+      if (done) return;
+      done = true;
+      cleanup();
+      fn(val);
+    };
+    const timer = setTimeout(() => {
+      try { req.destroy(); } catch {}
+      finish(reject, new Error('request body timeout'));
+    }, READ_BODY_TIMEOUT_MS);
+    const onData = (c) => {
+      if (done) return;
+      total += c.length;
+      if (total > limit) {
+        try { req.destroy(); } catch {}
+        return finish(reject, new Error('body too large'));
+      }
+      chunks.push(c);
+    };
+    const onEnd = () => {
+      if (done) return;
+      if (chunks.length === 0) return finish(resolve, {});
+      try {
+        const text = Buffer.concat(chunks).toString('utf8');
+        finish(resolve, JSON.parse(text));
+      } catch (e) {
+        finish(reject, e);
+      }
+    };
+    const onErr = (e) => finish(reject, e);
+    const onAbort = () => finish(reject, new Error('request aborted'));
+
+    req.on('data', onData);
+    req.on('end', onEnd);
+    req.on('error', onErr);
+    req.on('aborted', onAbort);
+  });
+}
+
+async function hKick(req, res, actor) {
+  if (req.method !== 'POST') {
+    res.writeHead(405); return res.end('{"error":"POST only"}');
+  }
+  let body;
+  try { body = await readJSONBody(req, 2048); }
+  catch (e) { res.writeHead(400); return res.end(JSON.stringify({ error: e.message })); }
+  if (!body.id) { res.writeHead(400); return res.end('{"error":"missing id"}'); }
+  const ci = activeConns.get(body.id);
+  if (!ci) { res.writeHead(404); return res.end('{"error":"not found"}'); }
+  try { ci.socket.destroy(); } catch {}
+  logInfo(`Dashboard kicked ${ci.id} (${ci.ip} → ${ci.target})`);
+  recordAudit(actor, 'kick_connection', `id=${ci.id} ip=${ci.ip} target=${ci.target} user=${ci.username}`);
+  sendJSON(res, 200, { success: true, id: ci.id });
+}
+
+async function hUsers(req, res, actor) {
+  if (req.method === 'GET') {
+    return sendJSON(res, 200, {
+      users: appConfig.users.map(u => ({
+        username: u.username,
+        max_bandwidth_bps: u.max_bandwidth_bps || 0,
+        max_connections: u.max_connections || 0,
+        quota_bytes_per_month: u.quota_bytes_per_month || 0,
+        usage_bytes_this_month: getUsage(u.username),
+      })),
+    });
+  }
+  let body;
+  try { body = await readJSONBody(req, 4096); }
+  catch { res.writeHead(400); return res.end('{"error":"invalid JSON"}'); }
+  const uname = String(body.username || '').trim();
+  if (!uname || uname.length >= NAME_LEN) { res.writeHead(400); return res.end('{"error":"invalid username"}'); }
+  const pwd = String(body.password || '');
+  if (pwd && pwd.length < 4) { res.writeHead(400); return res.end('{"error":"password too short"}'); }
+  const bw = Math.max(0, parseInt(body.max_bandwidth_bps, 10) || 0);
+  const mc = Math.max(0, parseInt(body.max_connections, 10) || 0);
+  const q = Math.max(0, parseInt(body.quota_bytes_per_month, 10) || 0);
+
+  let existing = appConfig.users.find(u => u.username === uname);
+  if (existing) {
+    if (pwd) existing.password_hash = hashPassword(pwd);
+    existing.max_bandwidth_bps = bw;
+    existing.max_connections = mc;
+    existing.quota_bytes_per_month = q;
+  } else {
+    if (!pwd) { res.writeHead(400); return res.end('{"error":"password required for new user"}'); }
+    if (appConfig.users.length >= MAX_USERS) { res.writeHead(400); return res.end('{"error":"too many users"}'); }
+    appConfig.users.push({
+      username: uname,
+      password_hash: hashPassword(pwd),
+      max_bandwidth_bps: bw,
+      max_connections: mc,
+      quota_bytes_per_month: q,
+    });
+    appConfig.require_proxy_auth = true;
+  }
+  try { saveConfig(appConfig); }
+  catch (e) { res.writeHead(500); return res.end(JSON.stringify({ error: e.message })); }
+  applyLiveBandwidthLimit(uname, bw);
+  logInfo(`Dashboard: upsert user '${uname}' (bw=${bw}, mc=${mc}, q=${q}, pwd_change=${!!pwd})`);
+  recordAudit(actor, 'upsert_user', `username=${uname} bw=${bw} mc=${mc} q=${q} pwd_changed=${!!pwd}`);
+  sendJSON(res, 200, { success: true });
+}
+
+async function hDeleteUser(req, res, actor) {
+  let body;
+  try { body = await readJSONBody(req, 2048); }
+  catch { res.writeHead(400); return res.end('{"error":"invalid body"}'); }
+  if (!body.username) { res.writeHead(400); return res.end('{"error":"missing username"}'); }
+  const idx = appConfig.users.findIndex(u => u.username === body.username);
+  if (idx < 0) { res.writeHead(404); return res.end('{"error":"not found"}'); }
+  appConfig.users.splice(idx, 1);
+  try { saveConfig(appConfig); }
+  catch (e) { res.writeHead(500); return res.end(JSON.stringify({ error: e.message })); }
+  logInfo(`Dashboard: deleted user '${body.username}'`);
+  recordAudit(actor, 'delete_user', `username=${body.username}`);
+  sendJSON(res, 200, { success: true });
+}
+
+async function hTokens(req, res, actor) {
+  if (req.method === 'GET') {
+    return sendJSON(res, 200, {
+      tokens: appConfig.api_tokens.map(t => ({ name: t.name, created_at: t.created_at })),
+    });
+  }
+  let body;
+  try { body = await readJSONBody(req, 2048); }
+  catch { res.writeHead(400); return res.end('{"error":"invalid body"}'); }
+  const name = String(body.name || '').trim();
+  if (!name) { res.writeHead(400); return res.end('{"error":"name required"}'); }
+  if (name.length >= NAME_LEN) { res.writeHead(400); return res.end('{"error":"name too long"}'); }
+  if (appConfig.api_tokens.find(t => t.name === name)) {
+    res.writeHead(409); return res.end('{"error":"name exists"}');
+  }
+  if (appConfig.api_tokens.length >= MAX_TOKENS) {
+    res.writeHead(400); return res.end('{"error":"too many tokens"}');
+  }
+  const token = generateAPIToken();
+  appConfig.api_tokens.push({ name, token_hash: hashAPIToken(token), created_at: Math.floor(Date.now() / 1000) });
+  try { saveConfig(appConfig); }
+  catch (e) { res.writeHead(500); return res.end(JSON.stringify({ error: e.message })); }
+  logInfo(`Dashboard: created token '${name}'`);
+  recordAudit(actor, 'create_api_token', `name=${name}`);
+  sendJSON(res, 200, { success: true, token, name });
+}
+
+async function hDeleteToken(req, res, actor) {
+  let body;
+  try { body = await readJSONBody(req, 2048); }
+  catch { res.writeHead(400); return res.end('{"error":"invalid body"}'); }
+  if (!body.name) { res.writeHead(400); return res.end('{"error":"missing name"}'); }
+  const idx = appConfig.api_tokens.findIndex(t => t.name === body.name);
+  if (idx < 0) { res.writeHead(404); return res.end('{"error":"not found"}'); }
+  appConfig.api_tokens.splice(idx, 1);
+  try { saveConfig(appConfig); }
+  catch (e) { res.writeHead(500); return res.end(JSON.stringify({ error: e.message })); }
+  recordAudit(actor, 'revoke_api_token', `name=${body.name}`);
+  sendJSON(res, 200, { success: true });
+}
+
+async function hNetworkConfig(req, res, actor) {
+  if (req.method === 'GET') {
+    return sendJSON(res, 200, {
+      allow_list: appConfig.allow_list || [],
+      deny_list: appConfig.deny_list || [],
+      upstream_proxies: appConfig.upstream_proxies || [],
+    });
+  }
+  let body;
+  try { body = await readJSONBody(req, 65536); }
+  catch { res.writeHead(400); return res.end('{"error":"invalid body"}'); }
+  appConfig.allow_list = Array.isArray(body.allow_list) ? body.allow_list : [];
+  appConfig.deny_list = Array.isArray(body.deny_list) ? body.deny_list : [];
+  appConfig.upstream_proxies = Array.isArray(body.upstream_proxies) ? body.upstream_proxies : [];
+  try { saveConfig(appConfig); }
+  catch (e) { res.writeHead(500); return res.end(JSON.stringify({ error: e.message })); }
+  const err = reloadConfig(actor);
+  if (err) { res.writeHead(500); return res.end(JSON.stringify({ error: err })); }
+  recordAudit(actor, 'update_network_config', '');
+  sendJSON(res, 200, { success: true });
+}
+
+async function hChangePassword(req, res, actor) {
+  let body;
+  try { body = await readJSONBody(req, 4096); }
+  catch { res.writeHead(400); return res.end('{"error":"invalid body"}'); }
+  const cur = String(body.current_password || '');
+  const nu = String(body.new_username || '').trim();
+  const np = String(body.new_password || '');
+  if (!verifyPassword(cur, dashboardPassHash)) {
+    res.writeHead(403); return res.end('{"error":"current password incorrect"}');
+  }
+  if (np.length < 8) { res.writeHead(400); return res.end('{"error":"password too short"}'); }
+  if (np === cur) { res.writeHead(400); return res.end('{"error":"same password"}'); }
+  const newHash = hashPassword(np);
+  const oldUser = dashboardUser;
+  dashboardPassHash = newHash;
+  if (nu) dashboardUser = nu;
+  appConfig.dashboard_user = dashboardUser;
+  appConfig.dashboard_password_hash = dashboardPassHash;
+  try { saveConfig(appConfig); }
+  catch (e) { logWarn(`Đổi mật khẩu OK nhưng không ghi được config: ${e.message}`); }
+  logInfo(`Dashboard creds changed: ${oldUser} → ${dashboardUser}`);
+  recordAudit(actor, 'change_dashboard_password', `user: ${oldUser} → ${dashboardUser}`);
+  sendJSON(res, 200, { success: true, username: dashboardUser });
+}
+
+async function hImportConfig(req, res, actor) {
+  let body;
+  try { body = await readJSONBody(req, 5 * 1024 * 1024); }
+  catch (e) { res.writeHead(400); return res.end(JSON.stringify({ error: e.message })); }
+  if (!body || typeof body !== 'object' || !body.dashboard_user || !body.dashboard_password_hash) {
+    res.writeHead(400); return res.end('{"error":"not a valid backup"}');
+  }
+  body.users = body.users || [];
+  body.allow_list = body.allow_list || [];
+  body.deny_list = body.deny_list || [];
+  body.upstream_proxies = body.upstream_proxies || [];
+  body.api_tokens = body.api_tokens || [];
+  parseCIDRList(body.allow_list);
+  parseCIDRList(body.deny_list);
+  try { saveConfigSync(body); }
+  catch (e) { res.writeHead(500); return res.end(JSON.stringify({ error: e.message })); }
+  const err = reloadConfig(actor);
+  if (err) { res.writeHead(500); return res.end(JSON.stringify({ error: err })); }
+  recordAudit(actor, 'import_config_backup', `${body.users.length} users, ${body.api_tokens.length} tokens`);
+  logInfo('Dashboard: config restored from backup');
+  sendJSON(res, 200, { success: true });
+}
+
+function metricsHandler(req, res) {
+  const lines = [];
+  const push = (name, help, typ, val) =>
+    lines.push(`# HELP proxy_${name} ${help}\n# TYPE proxy_${name} ${typ}\nproxy_${name} ${val}`);
+  push('connections_total', 'Total', 'counter', stats.total);
+  push('connections_current', 'Current', 'gauge', stats.current);
+  push('connections_active', 'Active', 'gauge', activeConns.size);
+  push('socks5_tcp_total', '', 'counter', stats.socks5TCP);
+  push('socks5_udp_total', '', 'counter', stats.socks5UDP);
+  push('http_requests_total', '', 'counter', stats.http);
+  push('bytes_up_total', '', 'counter', stats.bytesUp);
+  push('bytes_down_total', '', 'counter', stats.bytesDown);
+  push('udp_bytes_up_total', '', 'counter', stats.udpUp);
+  push('udp_bytes_down_total', '', 'counter', stats.udpDown);
+  push('udp_associations', '', 'gauge', udpAssocs.size);
+  push('auth_fail_total', '', 'counter', stats.authFail);
+  push('uptime_seconds', '', 'gauge', Math.floor((Date.now() - stats.startTime) / 1000));
+  res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' });
+  res.end(lines.join('\n') + '\n');
+}
+
+function getAllStats() {
+  const localStats = getAllStatsLocal();
+  if (IS_DASHBOARD_LEADER && peerStats.size > 0) {
+    for (const [wId, entry] of peerStats) {
+      if (Date.now() - entry.t > 5000) continue;
+      const p = entry.payload;
+      localStats.total += p.total || 0;
+      localStats.current += p.current || 0;
+      localStats.active = (localStats.active || 0) + (p.current || 0);
+      localStats.socks5_tcp += p.socks5TCP || 0;
+      localStats.socks5_udp += p.socks5UDP || 0;
+      localStats.http += p.http || 0;
+      localStats.auth_fail += p.authFail || 0;
+      localStats.bytes_up += p.bytesUp || 0;
+      localStats.bytes_down += p.bytesDown || 0;
+      localStats.udp_up += p.udpUp || 0;
+      localStats.udp_down += p.udpDown || 0;
+      localStats.udp_assocs += p.udpAssocs || 0;
+      if (p.active_connections) {
+        localStats.active_connections = localStats.active_connections.concat(p.active_connections);
+      }
+    }
+  }
+  return localStats;
+}
+function getAllStatsLocal() {
+  const conns = [];
+  for (const ci of activeConns.values()) {
+    conns.push({
+      id: ci.id, ip: ci.ip, port: ci.port, type: ci.type, target: ci.target,
+      user: ci.username,
+      start_time: Math.floor(ci.startTime / 1000),
+      bytes_up: ci.bytesUp, bytes_down: ci.bytesDown,
+      duration: (Date.now() - ci.startTime) / 1000,
+    });
+  }
+  return {
+    total: stats.total, current: stats.current, active: activeConns.size,
+    socks5_tcp: stats.socks5TCP, socks5_udp: stats.socks5UDP, http: stats.http,
+    bytes_up: stats.bytesUp, bytes_down: stats.bytesDown,
+    udp_up: stats.udpUp, udp_down: stats.udpDown,
+    udp_assocs: udpAssocs.size,
+    uptime: (Date.now() - stats.startTime) / 1000,
+    active_connections: conns,
+    upstream: {
+      proxies: appConfig.upstream_proxies || [],
+      current_index: 0,
+      status: (appConfig.upstream_proxies || []).map(addr => ({ addr, alive: true })),
+    },
+    udp_associations: {},
+  };
+}
+
+function streamHandler(req, res) {
+  if (sseClients.size >= DASH_MAX_SSE) {
+    let oldest = null;
+    for (const c of sseClients) {
+      if (!oldest || (c.lastActivity || 0) < (oldest.lastActivity || 0)) oldest = c;
+    }
+    if (oldest) {
+      if (oldest.keepalive) clearInterval(oldest.keepalive);
+      sseClients.delete(oldest);
+      try { oldest.res.end(); } catch {}
+    }
+  }
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    'X-Accel-Buffering': 'no',
+    'Connection': 'keep-alive',
+  });
+  if (res.socket) {
+    try {
+      res.socket.setNoDelay(true);
+      res.socket.setTimeout(0);
+      res.socket.setKeepAlive(true, 30000);
+    } catch {}
+  }
+  try { res.write(`event: history\ndata: ${JSON.stringify(statHistory)}\n\n`); }
+  catch { return; }
+
+  const client = { res, lastActivity: Date.now(), keepalive: null, _bp: 0, _dead: false };
+  sseClients.add(client);
+
+  client.keepalive = setInterval(() => {
+    if (client._dead) return;
+    if (res.writableEnded || res.destroyed) { cleanup(); return; }
+    try {
+      const ok = res.write(': keepalive\n\n');
+      client.lastActivity = Date.now();
+      if (!ok) {
+        client._bp = (client._bp || 0) + 1;
+        if (client._bp >= 3) { cleanup(); return; }
+      } else {
+        client._bp = 0;
+      }
+    } catch { cleanup(); }
+  }, 15000);
+
+  req.on('close', cleanup);
+  req.on('error', cleanup);
+  res.on('error', cleanup);
+
+  function cleanup() {
+    if (client._dead) return;
+    client._dead = true;
+    clearInterval(client.keepalive);
+    sseClients.delete(client);
+    try { res.end(); } catch {}
+  }
+}
+
+function broadcastSample(sample) {
+  if (sseClients.size === 0) return;
+  const dead = [];
+  const data = `event: sample\ndata: ${JSON.stringify(sample)}\n\n`;
+  for (const c of sseClients) {
+    if (c.res.writableEnded || c.res.destroyed) { dead.push(c); continue; }
+    try {
+      const ok = c.res.write(data);
+      c.lastActivity = Date.now();
+      if (!ok) {
+        c._bp = (c._bp || 0) + 1;
+        if (c._bp >= 5) dead.push(c);
+      } else {
+        c._bp = 0;
+      }
+    } catch { dead.push(c); }
+  }
+  for (const c of dead) {
+    if (c._dead) continue;
+    c._dead = true;
+    if (c.keepalive) clearInterval(c.keepalive);
+    sseClients.delete(c);
+    try { c.res.end(); } catch {}
+  }
+}
+
+// ============================================================================
+// STATS REPORTER
+// ============================================================================
+function statsReporter() {
+  const interval = 2000;
+  let lastUp = 0, lastDown = 0;
+  let first = true;
+  let tick = 0;
+  setInterval(() => {
+    tick++;
+    for (const ci of activeConns.values()) flushConnStats(ci);
+
+    const cur = stats.current;
+    const up = stats.bytesUp, down = stats.bytesDown;
+    const udpUp = stats.udpUp, udpDown = stats.udpDown;
+    let s5TCP = 0, s5UDP = 0, httpCount = 0;
+    for (const ci of activeConns.values()) {
+      if (ci.type === 'SOCKS5_TCP') s5TCP++;
+      else if (ci.type === 'SOCKS5_UDP') s5UDP++;
+      else if (ci.type === 'HTTP') httpCount++;
+    }
+    logInfo(`[STATS] Active:${cur} TCP:${s5TCP} UDP:${s5UDP} HTTP:${httpCount} | UDP Assoc:${udpAssocs.size} | Up:${formatBytes(up)} Down:${formatBytes(down)} | UDP Up:${formatBytes(udpUp)} Down:${formatBytes(udpDown)} | Uptime:${Math.floor((Date.now() - stats.startTime) / 1000)}s`);
+
+    let upBps = 0, downBps = 0;
+    if (!first) {
+      upBps = Math.floor((up - lastUp) / (interval / 1000));
+      downBps = Math.floor((down - lastDown) / (interval / 1000));
+    }
+    lastUp = up; lastDown = down; first = false;
+
+    const sample = {
+      t: Math.floor(Date.now() / 1000),
+      up_bps: upBps, down_bps: downBps,
+      active: cur, udp_assocs: udpAssocs.size,
+    };
+    statHistory.push(sample);
+    if (statHistory.length > HISTORY_MAX_SAMPLES) statHistory.shift();
+    broadcastSample(sample);
+
+    if (tick % 5 === 0) enforceQuotaOnActiveConns();
+    if (tick % 15 === 0) {
+      try { saveUsage(); } catch (e) { logWarn(`saveUsage lỗi: ${e.message}`); }
+    }
+  }, interval);
+}
+
+function enforceQuotaOnActiveConns() {
+  const overQuotaUsers = new Set();
+  for (const ci of activeConns.values()) {
+    if (!ci.username || overQuotaUsers.has(ci.username)) continue;
+    const cfg = getUserConfig(ci.username);
+    if (!cfg || !cfg.quota_bytes_per_month) continue;
+    if (isOverQuota(ci.username, cfg.quota_bytes_per_month)) overQuotaUsers.add(ci.username);
+  }
+  if (overQuotaUsers.size === 0) return;
+  const toKick = [];
+  for (const ci of activeConns.values()) {
+    if (overQuotaUsers.has(ci.username)) toKick.push(ci);
+  }
+  for (const ci of toKick) { try { ci.socket.destroy(); } catch {} }
+  if (toKick.length) {
+    logWarn(`Ngắt ${toKick.length} connection do ${overQuotaUsers.size} user vượt quota: ${[...overQuotaUsers].join(', ')}`);
+  }
+}
+
+// ============================================================================
+// SINGLE-PORT ROUTER
+// ============================================================================
+function handleSinglePortConnection(socket) {
+  const clientIP = (socket.remoteAddress || '').replace(/^::ffff:/, '');
+  if (clientIP && !ipAllowed(clientIP)) {
+    logWarn(`IP ${clientIP} bị từ chối`);
+    socket.destroy(); return;
+  }
+  if (clientIP && isAuthBlocked(clientIP)) {
+    logWarn(`IP ${clientIP} bị chặn`);
+    socket.destroy(); return;
+  }
+  stats.total++; stats.current++;
+  socket.setNoDelay(true);
+  socket.setTimeout(HANDSHAKE_TIMEOUT_MS);
+
+  const reader = new BufferedReader(socket);
+  socket.once('timeout', () => socket.destroy());
+
+  reader.read(1).then(async first => {
+    socket.setTimeout(0);
+    const b = first[0];
+    reader.unread(first);
+    if (b === 0x05) {
+      return handleSOCKS5(socket, reader);
+    }
+    if (isHTTPMethodByte(b)) {
+      const line = await reader.readLine();
+      const parts = line.split(/\s+/);
+      if (parts.length < 3) { socket.destroy(); return; }
+      const method = parts[0].toUpperCase();
+      const rawURL = parts[1];
+      const isProxy = method === 'CONNECT' || rawURL.startsWith('http://') || rawURL.startsWith('https://');
+      reader.unread(Buffer.from(line + '\r\n', 'latin1'));
+
+      if (isProxy) {
+        return handleHTTP(socket, reader);
+      } else {
+        return routeDashboardOnSocket(socket, reader);
+      }
+    }
+    logWarn(`Unknown protocol from ${clientIP}`);
+    socket.destroy();
+  }).catch(() => socket.destroy()).finally(() => { stats.current--; });
+}
+
+let _singlePortDashServer = null;
+
+function routeDashboardOnSocket(socket, reader) {
+  if (reader) {
+    try { reader.detach(); } catch {}
+  }
+  if (!_singlePortDashServer) {
+    _singlePortDashServer = http.createServer((req, res) => {
+      handleDashboardRequest(req, res).catch(() => { try { res.end(); } catch {} });
+    });
+    _singlePortDashServer.requestTimeout = 30000;
+    _singlePortDashServer.headersTimeout = 15000;
+    _singlePortDashServer.keepAliveTimeout = 10000;
+    _singlePortDashServer.on('error', (e) => logWarn(`single-port dashboard server error: ${e.message}`));
+  }
+  try {
+    _singlePortDashServer.emit('connection', socket);
+    // FIX: BufferedReader.detach() đã pause() socket; Node không tự resume khi
+    // gắn listener 'data' sau khi pause → HTTP parser không đọc được bytes đã
+    // unshift → dashboard treo. Resume tường minh ngay sau khi emit.
+    socket.resume();
+  } catch (e) {
+    logWarn(`routeDashboardOnSocket fail: ${e.message}`);
+    try { socket.destroy(); } catch {}
+  }
+}
+
+// ============================================================================
+// SIGNALS
+// ============================================================================
+function setupSignals(...servers) {
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGHUP', () => {
+    logInfo('Nhận SIGHUP, đang reload config...');
+    const err = reloadConfig('SIGHUP');
+    if (err) logWarn(`Reload thất bại: ${err}`);
+  });
+
+  function shutdown(sig) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    logInfo(`Nhận ${sig}, graceful shutdown...`);
+    for (const s of servers) try { s.close(); } catch {}
+    for (const ci of activeConns.values()) try { ci.socket.destroy(); } catch {}
+    saveUsage();
+    setTimeout(() => process.exit(0), 500);
+  }
+}
+
+process.on('uncaughtException', (e) => {
+  logErr(`uncaughtException: ${e.stack || e.message}`);
+});
+process.on('unhandledRejection', (e) => {
+  logErr(`unhandledRejection: ${(e && e.stack) || e}`);
+});
+
+// ============================================================================
+// MAIN
+// ============================================================================
+function main() {
+  initLog();
+  loadUsage();
+
+  if (!fs.existsSync(configPath) && !args['dashboard-pass']) {
+    args['dashboard-pass'] = generateAPIToken().slice(0, 16);
+    logWarn(`Dashboard lần đầu — user: ${args['dashboard-user']} | password: ${args['dashboard-pass']} (chỉ hiện MỘT LẦN, hãy đổi ngay)`);
+  }
+
+  let cfgResult;
+  try { cfgResult = loadOrInitConfig(); }
+  catch (e) { logErr(`[FATAL] ${e.message}`); process.exit(1); }
+
+  if (cfgResult.created) {
+    for (const item of String(args.allow || '').split(',')) {
+      if (item.trim()) cfgResult.cfg.allow_list.push(item.trim());
+    }
+    for (const item of String(args.deny || '').split(',')) {
+      if (item.trim()) cfgResult.cfg.deny_list.push(item.trim());
+    }
+    for (const item of String(args.upstream || '').split(',')) {
+      if (item.trim()) cfgResult.cfg.upstream_proxies.push(item.trim());
+    }
+    try { saveConfigSync(cfgResult.cfg); } catch {}
+  }
+
+  appConfig = cfgResult.cfg;
+  dashboardUser = appConfig.dashboard_user;
+  dashboardPassHash = appConfig.dashboard_password_hash;
+  const ap = parseCIDRList(appConfig.allow_list);
+  const dp = parseCIDRList(appConfig.deny_list);
+  allowedCIDRs = ap.result;
+  deniedCIDRs = dp.result;
+
+  globalServerOpts = {
+    serverUsername: args.u || '',
+    serverPassword: args.P || '',
+    authEnabled: !!(args.u && args.P),
+  };
+
+  const singlePort = !!args['single-port'];
+  const listenAddr = args.l;
+  const listenPort = args.p;
+  const dashboardPort = args['dashboard-port'];
+  const dashboardBind = args['dashboard-bind'];
+
+  const servers = [];
+
+  if (singlePort) {
+    const server = net.createServer(handleSinglePortConnection);
+    server.on('error', e => logErr(`Listener error: ${e.message}`));
+    server.listen(listenPort, listenAddr, () => {
+      logInfo(`Proxy v6.3 (Node, single-port) STARTED → ${listenAddr}:${listenPort}`);
+      logInfo(`Features: SOCKS5 TCP/UDP + HTTP/HTTPS + Dashboard | Auth: ${authRequired() ? 'yes' : 'no'} | Users: ${appConfig.users.length} | Upstream: ${appConfig.upstream_proxies.length} | Config: ${configPath}`);
+    });
+    servers.push(server);
+
+    logInfo(`Dashboard (single-port mode) cùng port với proxy: ${listenAddr}:${listenPort}`);
+  } else {
+    const proxyServer = net.createServer(handleConnection);
+    proxyServer.on('error', e => logErr(`Proxy listener error: ${e.message}`));
+    proxyServer.listen(listenPort, listenAddr, () => {
+      logInfo(`Proxy v6.3 (Node) STARTED → ${listenAddr}:${listenPort} [worker ${MY_WORKER_ID || 'main'}]`);
+      logInfo(`Features: SOCKS5 TCP/UDP + HTTP/HTTPS | Auth: ${authRequired() ? 'yes' : 'no'} | Users: ${appConfig.users.length} | Upstream: ${appConfig.upstream_proxies.length} | Config: ${configPath}`);
+    });
+    servers.push(proxyServer);
+
+    if (IS_DASHBOARD_LEADER) {
+      const dashServer = http.createServer((req, res) => {
+        handleDashboardRequest(req, res).catch(e => {
+          try { res.writeHead(500); res.end('{"error":"internal"}'); } catch {}
+        });
+      });
+      dashServer.requestTimeout = 30000;
+      dashServer.headersTimeout = 15000;
+      dashServer.keepAliveTimeout = 10000;
+      dashServer.maxRequestsPerSocket = 0;
+      dashServer.on('error', e => logErr(`Dashboard listener error: ${e.message}`));
+      dashServer.listen(dashboardPort, dashboardBind, () => {
+        logInfo(`Dashboard available at http://${dashboardBind}:${dashboardPort} (user: ${dashboardUser})`);
+      });
+      servers.push(dashServer);
+    } else {
+      logInfo(`[worker ${MY_WORKER_ID}] Skip dashboard listener (chỉ worker 1 mở port ${dashboardPort})`);
+    }
+  }
+
+  setupSignals(...servers);
+  statsReporter();
+
+  if (IS_WORKER) {
+    if (IS_DASHBOARD_LEADER) {
+      process.on('message', (msg) => {
+        if (!msg) return;
+        if (msg.type === 'peer_stats') {
+          peerStats.set(msg.workerId, { payload: msg.payload, t: Date.now() });
+        } else if (msg.type === 'kick') {
+          const ci = activeConns.get(msg.id);
+          if (ci) { try { ci.socket.destroy(); } catch {} }
+        } else if (msg.type === 'reload') {
+          try { reloadConfig('master'); } catch {}
+        }
+      });
+    } else {
+      process.on('message', (msg) => {
+        if (!msg) return;
+        if (msg.type === 'kick') {
+          const ci = activeConns.get(msg.id);
+          if (ci) { try { ci.socket.destroy(); } catch {} }
+        } else if (msg.type === 'reload') {
+          try { reloadConfig('master'); } catch {}
+        }
+      });
+
+      setInterval(() => {
+        if (!process.send) return;
+        try {
+          const conns = [];
+          for (const ci of activeConns.values()) {
+            conns.push({
+              id: ci.id, ip: ci.ip, port: ci.port, type: ci.type, target: ci.target,
+              user: ci.username,
+              start_time: Math.floor(ci.startTime / 1000),
+              bytes_up: ci.bytesUp, bytes_down: ci.bytesDown,
+              duration: (Date.now() - ci.startTime) / 1000,
+            });
+          }
+          process.send({
+            type: 'stats',
+            payload: {
+              total: stats.total, current: stats.current,
+              socks5TCP: stats.socks5TCP, socks5UDP: stats.socks5UDP,
+              http: stats.http, authFail: stats.authFail,
+              bytesUp: stats.bytesUp, bytesDown: stats.bytesDown,
+              udpUp: stats.udpUp, udpDown: stats.udpDown,
+              udpAssocs: udpAssocs.size,
+              active_connections: conns,
+              uptime: (Date.now() - stats.startTime) / 1000,
+            },
+          });
+        } catch {}
+      }, 1000);
+    }
+  }
+
+  logInfo(`Gửi SIGHUP (kill -HUP ${process.pid}) để reload config không cần restart`);
+  if (!authRequired()) logWarn('Proxy KHÔNG có xác thực — bất kỳ ai kết nối được đều dùng được');
+}
+
+main();

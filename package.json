@@ -1,0 +1,10 @@
+{
+  "name": "sockshttpgate",
+  "version": "6.3.0",
+  "description": "Universal SOCKS5/HTTP proxy with dashboard",
+  "main": "proxy.js",
+  "bin": { "sockshttpgate": "./proxy.js" },
+  "scripts": { "start": "node proxy.js" },
+  "engines": { "node": ">=18.0.0" },
+  "license": "MIT"
+}
