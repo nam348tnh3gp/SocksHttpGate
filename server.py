@@ -3,33 +3,21 @@
 """
 Universal Proxy Pro v6.3 — Python (FULL parity với C/Go)
 
-FIXES v6.3.5 (so với v6.3.4):
-  - CRITICAL: TCP partial-read. `recv(n)` không đảm bảo đọc đủ n byte.
-    Thêm helper _recv_exact / _recv_one_byte; áp dụng cho SOCKS5 auth,
-    SOCKS5 addr, chunked body. (Trước đây khi chạy qua mạng thật, một
-    gói có thể bị chẻ đôi → parse sai/sai dữ liệu.)
-  - CRITICAL: Không dùng self.rfile cho HTTP proxy nữa. Trước đây
-    readline() trên BufferedReader đọc trước nhiều KB, các byte dư
-    (vd TLS ClientHello sau CONNECT) bị kẹt trong buffer rồi biến mất
-    khi tunnel() đọc thẳng từ self.connection. Thay bằng _read_http_line()
-    đọc từng byte từ raw socket.
-  - CRITICAL: Byte counters (ci.bytes_up / ci.bytes_down) không còn dùng
-    `+=` trực tiếp. Python `+=` trên int không atomic → stats/quota sai
-    lệch khi nhiều thread cùng cập nhật. Thêm lock riêng cho mỗi ci.
-  - Handshake timeout: set socket timeout trong handle() để chống
-    slowloris (đối xứng với Go bản Go).
-  - SOCKS5 domain decode: 'idna' → 'ascii' + errors='replace' (idna codec
-    của Python không dùng để decode domain bytes thô).
-  - UDP relay: dùng self.connection.family thay vì dò dấu ':' trong IP,
-    để chọn AF_INET/AF_INET6 chính xác cả với IPv4-mapped IPv6.
-  - SSE: đặt Connection: close + close_connection=True (HTTP/1.1 đúng đắn).
-  - Header forwarding dùng latin-1 với errors='replace' để không crash
-    khi header value có ký tự ngoài ASCII.
-  - Loại bỏ self.wfile trong ProxyHandler (dùng self.connection.sendall
-    trực tiếp) để tránh interleave giữa buffer của wfile và raw socket.
+FIXES v6.3.6 (so với v6.3.5):
+  - CRITICAL: HTTP CONNECT với IPv6 literal ("[::1]:443") bị crash do
+    url.split(':',1). Thay bằng parser riêng hỗ trợ [v6]:port và validate port.
+  - CRITICAL: SOCKS5 UDP ASSOCIATE reply trả IP client → theo RFC 1928 BND.ADDR
+    phải là địa chỉ PROXY. Sửa thành self.connection.getsockname()[0].
+  - CRITICAL: HTTP request smuggling. Từ chối 400 khi:
+      * có cả Content-Length lẫn Transfer-Encoding
+      * nhiều Content-Length với giá trị khác nhau
+      * Transfer-Encoding không đúng "chunked"
+  - Perf + correctness: buffered reader cho HTTP header + SOCKS5 handshake.
+    Buffer còn dư được chuyển tiếp vào tunnel dưới dạng `initial` — trước đây
+    byte client gửi sớm (TLS ClientHello, pipelined) bị mất.
 
-Giữ nguyên: SOCKS5 TCP/UDP, HTTP/HTTPS, upstream, multi-user, quota,
-API token, audit log, reload history, SSE real-time, /metrics, /healthz.
+Giữ nguyên: SOCKS5 TCP/UDP, HTTP/HTTPS, upstream, multi-user, quota, API token,
+audit log, reload history, SSE real-time, /metrics, /healthz.
 """
 
 import argparse, atexit, base64, csv, hashlib, hmac, io, ipaddress, json, logging
@@ -71,7 +59,7 @@ HTTP_FIRST_BYTES = {ord(c) for c in "CGPDAHOT"}
 MAX_CONNECTIONS      = 4000
 CONNECTION_TIMEOUT   = 25
 IDLE_TIMEOUT         = 180
-HANDSHAKE_TIMEOUT    = 30         # chống slowloris (giây)
+HANDSHAKE_TIMEOUT    = 30
 RETRY_ATTEMPTS       = 5
 BUFFER_SIZE          = 65536
 UDP_BUFFER_SIZE      = 65535
@@ -620,52 +608,70 @@ class ThreadedProxyServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         self.executor.shutdown(wait=False)
         super().server_close()
 
+
 class ProxyHandler(socketserver.StreamRequestHandler):
     """Handler cho từng kết nối TCP client.
 
-    Lưu ý quan trọng: KHÔNG dùng self.rfile/self.wfile cho phần handshake của
-    HTTP proxy. Chúng là BufferedReader/BufferedWriter có đệm sẵn — khi đọc
-    dòng xong, các byte thừa bị kẹt trong bộ đệm và sẽ biến mất khi ta đọc
-    thẳng từ self.connection (khi vào tunnel). Thay vào đó, dùng các helper
-    đọc từ raw socket.
+    v6.3.6 dùng buffer nội bộ (self._rbuf) cho handshake. Buffer được đọc trước
+    (recv 4096) để tăng tốc đọc dòng HTTP và SOCKS5. Khi vào tunnel, mọi byte
+    còn dư trong buffer được gửi trước vào remote — nếu không làm vậy, TLS
+    ClientHello (hoặc byte pipelined) mà client gửi ngay sau CONNECT sẽ bị mất.
     """
 
-    # ---------- helpers ----------
-    def _recv_exact(self, n):
-        """Đọc chính xác n byte từ self.connection. TCP là stream, recv(n)
-        không đảm bảo trả đủ n byte trong 1 lần gọi."""
-        buf = b''
-        while len(buf) < n:
-            chunk = self.connection.recv(n - len(buf))
+    # ---------- buffered raw-socket I/O ----------
+    def _init_rbuf(self):
+        self._rbuf = bytearray()
+
+    def _rbuf_fill(self, want=1):
+        while len(self._rbuf) < want:
+            try:
+                chunk = self.connection.recv(4096)
+            except (OSError, socket.timeout):
+                return False
             if not chunk:
-                raise ConnectionError(f"EOF sau {len(buf)}/{n} byte")
-            buf += chunk
-        return buf
+                return False
+            self._rbuf += chunk
+        return True
+
+    def _recv_exact(self, n):
+        if n <= 0: return b''
+        if not self._rbuf_fill(n):
+            raise ConnectionError(f"EOF sau {len(self._rbuf)}/{n} byte")
+        data = bytes(self._rbuf[:n])
+        del self._rbuf[:n]
+        return data
 
     def _recv_one_byte(self):
-        b = self.connection.recv(1)
-        if not b:
+        if not self._rbuf_fill(1):
             raise ConnectionError("EOF")
-        return b[0]
+        b = self._rbuf[0]
+        del self._rbuf[:1]
+        return b
 
     def _read_http_line(self, max_len=8192):
-        """Đọc 1 dòng HTTP (kết thúc bằng CRLF hoặc LF) từ raw socket, từng byte.
-        Trả về bytes (không có CRLF cuối) hoặc None nếu EOF/quá dài."""
-        buf = bytearray()
-        while len(buf) < max_len:
-            b = self.connection.recv(1)
-            if not b:
+        while True:
+            idx = self._rbuf.find(b'\n')
+            if idx >= 0:
+                line = bytes(self._rbuf[:idx])
+                del self._rbuf[:idx + 1]
+                if line and line[-1:] == b'\r':
+                    line = line[:-1]
+                return line
+            if len(self._rbuf) > max_len:
                 return None
-            if b == b'\n':
-                if buf and buf[-1:] == b'\r':
-                    buf = buf[:-1]
-                return bytes(buf)
-            buf += b
-        return None
+            try:
+                chunk = self.connection.recv(4096)
+            except (OSError, socket.timeout):
+                return None
+            if not chunk:
+                return None
+            self._rbuf += chunk
 
     def _read_http_headers(self):
-        """Đọc request line + toàn bộ header, trả về (req_line:str, headers:dict)
-        hoặc (None, None) nếu lỗi. Dùng raw socket, KHÔNG dùng rfile."""
+        """Đọc request line + toàn bộ header. Trả về (req_line, headers).
+        headers là dict[str, list[str]] — giữ mọi giá trị của header trùng tên,
+        để kiểm tra xung đột Content-Length / Transfer-Encoding (chống smuggling).
+        """
         line = self._read_http_line()
         if not line: return None, None
         try:
@@ -686,16 +692,20 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                 continue
             if ':' in s:
                 k, v = s.split(':', 1)
-                headers[k.strip().lower()] = v.strip()
+                headers.setdefault(k.strip().lower(), []).append(v.strip())
         return req_line, headers
+
+    def _hdr_get(self, headers, name, default=''):
+        vals = headers.get(name)
+        if not vals: return default
+        return vals[-1]
 
     # ---------- main entry ----------
     def handle(self):
         cip, cport = self.client_address[:2]
         cip = normalize_ip(cip)
         try:
-            # Chống slowloris: giới hạn thời gian client gửi xong handshake.
-            # Sau khi handshake xong, ta clear timeout để tunnel/UDP không bị cắt.
+            self._init_rbuf()
             try:
                 self.connection.settimeout(HANDSHAKE_TIMEOUT)
             except OSError:
@@ -710,13 +720,9 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             if is_auth_blocked(cip):
                 logging.warning(f"IP {cip} đang bị chặn do auth fail"); return
 
-            try:
-                peek = self.connection.recv(1, socket.MSG_PEEK)
-            except socket.timeout:
-                logging.debug(f"Handshake timeout từ {cip}:{cport}")
+            if not self._rbuf_fill(1):
                 return
-            if not peek: return
-            fb = peek[0]
+            fb = self._rbuf[0]
             if fb == SOCKS5_VER:
                 self.handle_socks5()
             elif fb in HTTP_FIRST_BYTES:
@@ -754,7 +760,6 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                     logging.warning(f"SOCKS5 từ chối user '{username}': {reason}")
                     self._reply(0x02); return
 
-            # header yêu cầu SOCKS5: 4 byte (VER CMD RSV ATYP)
             req = self._recv_exact(4)
             ver, cmd, _, atyp = req[0], req[1], req[2], req[3]
             if ver != 5: return
@@ -765,7 +770,6 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                 target = f"{host}:{port}"
                 logging.info(f"{GREEN}SOCKS5 TCP → {cip}:{cport} → {target}{RESET}")
 
-                # Handshake xong → bỏ timeout
                 self.connection.settimeout(None)
 
                 remote = self._connect_target(host, port)
@@ -776,7 +780,10 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                                     target, rate_bps, username, self.connection)
                 with active_lock: active_conns[ci.id] = ci
                 with stats_lock: stats["socks5_tcp"] += 1
-                self._tunnel(self.connection, remote, ci)
+
+                # Chuyển tiếp byte client gửi sớm (đã nằm trong buffer) trước khi tunnel.
+                initial = bytes(self._rbuf); self._rbuf.clear()
+                self._tunnel(self.connection, remote, ci, initial)
             elif cmd == SOCKS5_CMD_UDP:
                 if not self.server.enable_udp: self._reply(0x07); return
                 self._handle_udp_associate(cip, cport, username, rate_bps, atyp)
@@ -796,7 +803,6 @@ class ProxyHandler(socketserver.StreamRequestHandler):
         target = f"UDP:{host}:{port}" if host else "UDP:any"
         logging.info(f"{PURPLE}UDP Associate → {cip}:{cport} → {target}{RESET}")
 
-        # Xác định family từ chính TCP socket (đúng cho cả IPv4-mapped IPv6).
         try:
             tcp_family = self.connection.family
         except Exception:
@@ -831,11 +837,16 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             stats["udp_assocs"] += 1
             stats["socks5_udp"] += 1
 
-        # Báo client IP:port relay. Dùng chính IP client đã kết nối TCP tới proxy.
-        self._reply(0x00, cip, relay_port)
-        logging.info(f"{PURPLE}UDP reply sent → client dùng {cip}:{relay_port}{RESET}")
+        # FIX v6.3.6: BND.ADDR phải là IP của PROXY (self.connection.getsockname()[0]),
+        # KHÔNG phải IP của client. Trước đây reply trả IP client → client gửi UDP về
+        # chính nó → relay không nhận được gì.
+        try:
+            proxy_ip = self.connection.getsockname()[0]
+        except Exception:
+            proxy_ip = cip
+        self._reply(0x00, proxy_ip, relay_port)
+        logging.info(f"{PURPLE}UDP reply sent → client dùng {normalize_ip(proxy_ip)}:{relay_port}{RESET}")
 
-        # Sau khi reply xong, clear timeout (TCP control có thể im lặng cả phút).
         self.connection.settimeout(None)
 
         client_udp = None
@@ -856,7 +867,6 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                 for s in r:
                     if s is self.connection:
                         try:
-                            # Chỉ cần biết client có đóng TCP control không.
                             d = self.connection.recv(1024)
                         except (OSError, socket.timeout):
                             return
@@ -1004,7 +1014,6 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             elif atyp == 3:
                 ln = self._recv_one_byte()
                 if ln == 0: return None, 0
-                # Domain SOCKS5 là ASCII theo spec; dùng ascii để chắc chắn.
                 try:
                     h = self._recv_exact(ln).decode('ascii')
                 except UnicodeDecodeError:
@@ -1034,15 +1043,35 @@ class ProxyHandler(socketserver.StreamRequestHandler):
         cip, cport = self.client_address[:2]; cip = normalize_ip(cip)
         remote = None; ci = None
         try:
-            # QUAN TRỌNG: đọc trực tiếp từ raw socket, KHÔNG dùng self.rfile.
-            # Nếu dùng self.rfile (BufferedReader), nó có thể đọc trước hàng KB
-            # → byte thừa (vd TLS ClientHello sau CONNECT) bị kẹt trong buffer
-            # và biến mất khi ta vào tunnel đọc thẳng self.connection.
             req_line, headers = self._read_http_headers()
             if not req_line: return
             parts = req_line.split()
             if len(parts) < 2: return
             method, url = parts[0].upper(), parts[1]
+
+            # === FIX v6.3.6: từ chối request smuggling ===
+            cl_vals = headers.get('content-length', [])
+            te_vals = headers.get('transfer-encoding', [])
+            if cl_vals and te_vals:
+                logging.warning(f"{RED}HTTP: từ chối request có cả Content-Length và Transfer-Encoding ({cip}:{cport}){RESET}")
+                try: self.connection.sendall(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+                except OSError: pass
+                return
+            if len(cl_vals) > 1:
+                try:
+                    uniq = {int(v.strip()) for v in cl_vals}
+                except ValueError:
+                    uniq = None
+                if uniq is None or len(uniq) != 1:
+                    logging.warning(f"{RED}HTTP: Content-Length xung đột ({cip}:{cport}){RESET}")
+                    try: self.connection.sendall(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+                    except OSError: pass
+                    return
+            if len(te_vals) > 1 or (te_vals and te_vals[-1].strip().lower() != 'chunked'):
+                logging.warning(f"{RED}HTTP: Transfer-Encoding không hợp lệ ({cip}:{cport}){RESET}")
+                try: self.connection.sendall(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+                except OSError: pass
+                return
 
             username = ''; rate_bps = 0
             if proxy_auth_required(self.server):
@@ -1051,7 +1080,7 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                     try:
                         self.connection.sendall(
                             b"HTTP/1.1 407 Proxy Authentication Required\r\n"
-                            b"Proxy-Authenticate: Basic realm=\"Proxy\"\r\n\r\n")
+                            b"Proxy-Authenticate: Basic realm=\"Proxy\"\r\nConnection: close\r\n\r\n")
                     except OSError:
                         pass
                     with stats_lock: stats["auth_fail"] += 1
@@ -1062,29 +1091,36 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                 if not allowed:
                     try:
                         self.connection.sendall(
-                            f"HTTP/1.1 429 Too Many Requests\r\n\r\n{reason}".encode())
+                            f"HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n{reason}".encode())
                     except OSError:
                         pass
                     return
 
+            # === FIX v6.3.6: parse CONNECT hỗ trợ [v6]:port ===
             if method == "CONNECT":
-                hp = url.split(':', 1)
-                host = hp[0]; port = int(hp[1]) if len(hp) > 1 else 443
+                host, port = self._parse_connect_authority(url)
+                if host is None:
+                    try: self.connection.sendall(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+                    except OSError: pass
+                    return
             else:
                 parsed = urlparse(url if url.startswith(('http://','https://')) else 'http://'+url)
                 host = parsed.hostname
                 port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+                if not host:
+                    try: self.connection.sendall(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+                    except OSError: pass
+                    return
             target = f"{host}:{port}"
             logging.info(f"{GREEN}HTTP {method} → {cip}:{cport} → {target}{RESET}")
             ci = ConnectionInfo(next_conn_id(), cip, cport, "HTTP", target, rate_bps, username, self.connection)
             with active_lock: active_conns[ci.id] = ci
 
-            # Handshake đọc xong → clear timeout trước khi connect/tunnel.
             self.connection.settimeout(None)
 
             remote = self._connect_target(host, port)
             if not remote:
-                try: self.connection.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                try: self.connection.sendall(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
                 except OSError: pass
                 return
             if method == "CONNECT":
@@ -1092,7 +1128,8 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                     self.connection.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 except OSError:
                     return
-                self._tunnel(self.connection, remote, ci)
+                initial = bytes(self._rbuf); self._rbuf.clear()
+                self._tunnel(self.connection, remote, ci, initial)
             else:
                 self._forward_http(method, url, headers, remote, ci)
                 self._forward_response(remote, self.connection, ci)
@@ -1107,8 +1144,35 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             if ci:
                 with active_lock: active_conns.pop(ci.id, None)
 
+    @staticmethod
+    def _parse_connect_authority(url):
+        """Parse 'host:port' hoặc '[v6]:port' cho CONNECT. Trả (host, port) hoặc (None, 0)."""
+        if not url: return None, 0
+        if url.startswith('['):
+            end = url.find(']')
+            if end < 0: return None, 0
+            host = url[1:end]
+            rest = url[end+1:]
+            if not rest.startswith(':'): return None, 0
+            try:
+                port = int(rest[1:])
+            except ValueError:
+                return None, 0
+        else:
+            if ':' in url:
+                host, port_s = url.rsplit(':', 1)
+                try:
+                    port = int(port_s)
+                except ValueError:
+                    return None, 0
+            else:
+                host, port = url, 443
+        if not host or not (1 <= port <= 65535):
+            return None, 0
+        return host, port
+
     def _http_auth(self, headers):
-        a = headers.get('proxy-authorization', '')
+        a = self._hdr_get(headers, 'proxy-authorization', '')
         if not a.lower().startswith('basic '): return False, 0, ''
         try:
             cred = base64.b64decode(a[6:]).decode('utf-8', errors='ignore')
@@ -1122,27 +1186,31 @@ class ProxyHandler(socketserver.StreamRequestHandler):
         if parsed.query: path += '?' + parsed.query
         req = f"{method} {path} HTTP/1.1\r\n"
         if 'host' not in headers: req += f"Host: {parsed.hostname}\r\n"
-        for k, v in headers.items():
-            if k not in ('proxy-authorization','proxy-connection','connection'): req += f"{k.title()}: {v}\r\n"
+        for k, vals in headers.items():
+            if k in ('proxy-authorization','proxy-connection','connection'): continue
+            for v in vals:
+                req += f"{k.title()}: {v}\r\n"
         req += "Connection: close\r\n\r\n"
-        # latin-1 + replace để không crash khi header value chứa ký tự ngoài ASCII.
         req_b = req.encode('latin-1', errors='replace')
         remote.sendall(req_b)
         if ci:
             ci.add_up(len(req_b)); usage_add(ci.username, len(req_b))
 
-        cl = headers.get('content-length')
-        te = headers.get('transfer-encoding', '').lower()
-        if cl:
-            rem = int(cl)
+        cl_vals = headers.get('content-length')
+        te_vals = headers.get('transfer-encoding')
+        if cl_vals:
+            try:
+                rem = int(cl_vals[-1].strip())
+            except ValueError:
+                return
             while rem > 0:
                 want = min(rem, BUFFER_SIZE)
-                ch = self._recv_exact(want)  # CRITICAL: dùng _recv_exact
+                ch = self._recv_exact(want)
                 remote.sendall(ch)
                 if ci:
                     ci.add_up(len(ch)); usage_add(ci.username, len(ch)); _throttle(ci, len(ch))
                 rem -= len(ch)
-        elif te == 'chunked':
+        elif te_vals and te_vals[-1].strip().lower() == 'chunked':
             while True:
                 line = self._read_http_line()
                 if line is None: break
@@ -1151,16 +1219,14 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                 except Exception:
                     break
                 if sz == 0:
-                    # trailer
                     while True:
                         t = self._read_http_line()
                         if t is None or t == b'': break
                     break
-                if sz > 64 * 1024 * 1024:   # sanity: 64MiB/chunk
+                if sz > 64 * 1024 * 1024:
                     logging.warning("Chunk quá lớn, dừng")
                     break
-                d = self._recv_exact(sz)     # CRITICAL: dùng _recv_exact
-                # CRLF sau chunk
+                d = self._recv_exact(sz)
                 crlf = self._recv_exact(2)
                 if crlf != b'\r\n':
                     logging.warning("Chunked: thiếu CRLF sau chunk")
@@ -1228,7 +1294,20 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                 time.sleep(min(0.5 * (i + 1), 4.0))
         return None
 
-    def _tunnel(self, client, remote, ci):
+    def _tunnel(self, client, remote, ci, initial=b''):
+        # Byte client gửi sớm phải được chuyển tiếp TRƯỚC khi vào vòng select.
+        if initial:
+            try:
+                remote.sendall(initial)
+                with stats_lock: stats["bytes_up"] += len(initial)
+                if ci:
+                    ci.add_up(len(initial)); usage_add(ci.username, len(initial))
+            except Exception:
+                try: remote.close()
+                except: pass
+                try: client.close()
+                except: pass
+                return
         socks = [client, remote]
         try:
             while True:
@@ -1257,7 +1336,8 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                 try: s.close()
                 except: pass
 
-# ====================== DASHBOARD HTML (giữ nguyên) ======================
+
+# ====================== DASHBOARD HTML ======================
 DASH_HTML = r"""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Proxy Dashboard</title>
 <style>
@@ -1305,7 +1385,7 @@ tr:hover td{background:var(--box-bg)}
 #trafficChart{width:100%;height:200px}
 </style></head><body>
 <div class="container">
-<div class="header-bar"><h1>⚡ Proxy Pro <span>v6.3 (Py)</span></h1>
+<div class="header-bar"><h1>⚡ Proxy Pro <span>v6.3.6 (Py)</span></h1>
 <div class="header-actions">
 <button class="btn" id="themeToggleBtn" onclick="toggleTheme()">🌙 Theme</button>
 <button class="btn" onclick="openPwModal()">🔒 Change Password</button>
@@ -1740,7 +1820,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
         cl = int(self.headers.get('Content-Length', '0') or 0)
         if cl > limit: return None
         if cl <= 0: return b''
-        # self.rfile is a BufferedReader, read(cl) reads exactly cl bytes (blocks until full).
         return self.rfile.read(cl)
 
     def _json_body(self, limit=65536):
@@ -1854,7 +1933,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header('Content-Type', 'text/event-stream')
             self.send_header('Cache-Control', 'no-cache')
-            self.send_header('Connection', 'close')          # SSE không dùng keepalive HTTP/1.1
+            self.send_header('Connection', 'close')
             self.send_header('X-Content-Type-Options', 'nosniff')
             self.send_header('X-Accel-Buffering', 'no')
             self.end_headers()
@@ -2247,7 +2326,7 @@ def hup_handler(signum, frame):
 def main():
     global config_path, usage_path, dashboard_user, dashboard_hash
     global allowed_cidrs, denied_cidrs, upstream_proxies
-    ap = argparse.ArgumentParser(description="Universal Proxy Pro v6.3.5 (Python, fixed)")
+    ap = argparse.ArgumentParser(description="Universal Proxy Pro v6.3.6 (Python, fixed)")
     ap.add_argument("-l", "--listen", default="0.0.0.0")
     ap.add_argument("-p", "--port", type=int, default=1080)
     ap.add_argument("-u", "--username", default="")
@@ -2330,7 +2409,7 @@ def main():
     except Exception as e:
         logging.error(f"Dashboard failed to start: {e}")
 
-    logging.info(f"{GREEN}Proxy v6.3.5 (Py, fixed) STARTED → {args.listen}:{args.port}"
+    logging.info(f"{GREEN}Proxy v6.3.6 (Py, fixed) STARTED → {args.listen}:{args.port}"
                  + (f" (auth: {args.username})" if args.username else "") + RESET)
     logging.info(f"{CYAN}Dashboard: http://{args.dashboard_bind}:{args.dashboard_port} | "
                  f"Users: {len(cfg.users)} | Upstream: {len(upstream_proxies)} | "
