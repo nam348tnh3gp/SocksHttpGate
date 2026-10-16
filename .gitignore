@@ -4,4 +4,13 @@ proxy.js
 proxy_config.json
 proxy
 __pycache__
-
+main
+CcodeBeta/proxy_usage.json
+CcodeBeta/proxy_config.json
+GocodeBeta/proxy_usage.json
+GocodeBeta/proxy_config.json
+JScodeBeta/proxy_usage.json
+JScodeBeta/proxy_config.json
+RubycodeBeta/proxy_usage.json
+RubycodeBeta/proxy_config.json
+proxy_usage.json

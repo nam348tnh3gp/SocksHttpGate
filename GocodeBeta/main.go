@@ -1,1245 +1,919 @@
-// main.go
+// main.go — Web Proxy full-navigation + WebSocket + auto-resize UI
+// URL proxy dạng: /p/https%3A%2F%2Fexample.com/foo (encode "://" tránh mất "/")
 package main
 
 import (
-	"bufio"
-	"bytes"
-	"encoding/base64"
-	"encoding/binary"
-	"encoding/json"
+	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
-// ======================== CẤU HÌNH ========================
-const (
-	MAX_CONNECTIONS    = 4000
-	CONNECTION_TIMEOUT = 25 * time.Second
-	IDLE_TIMEOUT       = 180 * time.Second
-	UDP_IDLE_TIMEOUT   = 120 * time.Second
-	BUFFER_SIZE        = 65536
-	UDP_BUFFER_SIZE    = 65535
-)
-
 var (
-	listenAddr    string
-	port          int
-	username, pwd string
-	forceKill     bool
-	noUDP         bool
-	upstreamStr   string
-	certFile      string
-	keyFile       string
-	dashboardPort int
+	listenAddr string
+	port       int
+	blockLocal bool
 )
 
-// ======================== COUNTING WRITER ========================
-type countingWriter struct {
-	w io.Writer
-	n *int64
-}
-
-func (cw *countingWriter) Write(p []byte) (int, error) {
-	n, err := cw.w.Write(p)
-	if n > 0 {
-		*cw.n += int64(n)
-	}
-	return n, err
-}
-
-func copyWithCount(dst io.Writer, src io.Reader, counter *int64) (int64, error) {
-	w := &countingWriter{w: dst, n: counter}
-	return io.Copy(w, src)
-}
-
-// ======================== DỮ LIỆU TOÀN CỤC ========================
-type ConnectionInfo struct {
-	IP        string
-	Port      int
-	Type      string
-	Target    string
-	StartTime time.Time
-	BytesUp   int64
-	BytesDown int64
-}
-
-type Stats struct {
-	StartTime    time.Time
-	Total        int64
-	Current      int64
-	Socks5TCP    int64
-	Socks5UDP    int64
-	HTTP         int64
-	AuthFail     int64
-	BytesUp      int64
-	BytesDown    int64
-	UDPUp        int64
-	UDPDown      int64
-	mu           sync.Mutex
-}
-
-var stats = Stats{
-	StartTime: time.Now(),
-}
-
-var (
-	activeConns   = make(map[*ConnectionInfo]bool)
-	activeConnsMu sync.Mutex
-
-	udpAssocs   = make(map[string]*UDPAssociation)
-	udpAssocsMu sync.Mutex
-
-	upstreamProxies []string // "host:port"
-	upstreamIndex   int
-	upstreamMu      sync.Mutex
-)
-
-// ======================== UDP ASSOCIATION ========================
-type UDPAssociation struct {
-	ClientAddr   *net.UDPAddr
-	RelayConn    *net.UDPConn
-	DestMap      map[string]time.Time // "host:port" -> last activity
-	LastActivity time.Time
-	Active       bool
-	mu           sync.Mutex
-}
-
-func (u *UDPAssociation) isExpired() bool {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	return time.Since(u.LastActivity) > UDP_IDLE_TIMEOUT
-}
-
-func (u *UDPAssociation) close() {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	if u.Active {
-		u.Active = false
-		if u.RelayConn != nil {
-			u.RelayConn.Close()
-		}
-		u.DestMap = nil
-	}
-}
-
-// ======================== PROXY SERVER ========================
-type ProxyServer struct {
-	listener    net.Listener
-	upstreams   []string
-	authEnabled bool
-	username    string
-	password    string
-	enableUDP   bool
-	cert        string
-	key         string
-}
-
-func NewProxyServer(addr string, username, password string, enableUDP bool, upstreams []string, cert, key string) (*ProxyServer, error) {
-	l, err := net.Listen("tcp", addr)
-	if err != nil {
-		return nil, err
-	}
-	return &ProxyServer{
-		listener:    l,
-		upstreams:   upstreams,
-		authEnabled: username != "" && password != "",
-		username:    username,
-		password:    password,
-		enableUDP:   enableUDP,
-		cert:        cert,
-		key:         key,
-	}, nil
-}
-
-func (s *ProxyServer) Run() {
-	log.Printf("[INFO] Proxy started on %s", s.listener.Addr())
-	go s.dashboardServer()
-	go s.statsReporter()
-	for {
-		conn, err := s.listener.Accept()
-		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Temporary() {
-				continue
-			}
-			log.Printf("[ERROR] Accept: %v", err)
-			return
-		}
-		// Giới hạn số kết nối đồng thời
-		stats.mu.Lock()
-		if stats.Current >= MAX_CONNECTIONS {
-			stats.mu.Unlock()
-			conn.Close()
-			continue
-		}
-		stats.Current++
-		stats.mu.Unlock()
-
-		go s.handleConn(conn)
-	}
-}
-
-func (s *ProxyServer) handleConn(conn net.Conn) {
-	defer func() {
-		conn.Close()
-		stats.mu.Lock()
-		stats.Current--
-		stats.mu.Unlock()
-	}()
-
-	// Peek byte đầu tiên để phân biệt SOCKS5 hay HTTP
-	buf := make([]byte, 1)
-	if _, err := conn.Read(buf); err != nil {
-		return
-	}
-	firstByte := buf[0]
-
-	reader := io.MultiReader(bytes.NewReader(buf), conn)
-
-	switch firstByte {
-	case 0x05: // SOCKS5
-		s.handleSOCKS5(conn, reader)
-	default:
-		// HTTP proxy: kiểm tra nếu firstByte nằm trong các chữ cái của HTTP methods
-		if firstByte == 'C' || firstByte == 'G' || firstByte == 'P' || firstByte == 'D' ||
-			firstByte == 'H' || firstByte == 'O' || firstByte == 'T' || firstByte == 'P' {
-			s.handleHTTP(conn, reader)
-		} else {
-			log.Printf("[WARN] Unknown protocol from %s", conn.RemoteAddr())
-		}
-	}
-}
-
-// ======================== SOCKS5 HANDLER ========================
-func (s *ProxyServer) handleSOCKS5(conn net.Conn, r io.Reader) {
-	// Đọc handshake
-	buf := make([]byte, 2)
-	if _, err := io.ReadFull(r, buf); err != nil {
-		return
-	}
-	ver, nmethods := buf[0], buf[1]
-	if ver != 0x05 {
-		return
-	}
-	methods := make([]byte, nmethods)
-	if _, err := io.ReadFull(r, methods); err != nil {
-		return
-	}
-
-	// Chọn method
-	authMethod := byte(0x00)
-	if s.authEnabled {
-		authMethod = 0x02
-	}
-	found := false
-	for _, m := range methods {
-		if m == authMethod {
-			found = true
-			break
-		}
-	}
-	if !found {
-		conn.Write([]byte{0x05, 0xFF})
-		return
-	}
-	conn.Write([]byte{0x05, authMethod})
-
-	// Xác thực nếu cần
-	if s.authEnabled {
-		if !s.doAuth(conn, r) {
-			return
-		}
-	}
-
-	// Đọc yêu cầu
-	req := make([]byte, 4)
-	if _, err := io.ReadFull(r, req); err != nil {
-		return
-	}
-	ver, cmd, _, atyp := req[0], req[1], req[2], req[3]
-	if ver != 0x05 {
-		return
-	}
-
-	var host string
-	var port uint16
-	switch cmd {
-	case 0x01: // CONNECT
-		host, port = s.readAddr(atyp, r)
-		if host == "" {
-			s.sendSOCKS5Reply(conn, 0x04, nil, 0)
-			return
-		}
-		target := fmt.Sprintf("%s:%d", host, port)
-		log.Printf("[SOCKS5 TCP] %s -> %s", conn.RemoteAddr(), target)
-		remote, err := s.connectTarget(host, int(port))
-		if err != nil {
-			s.sendSOCKS5Reply(conn, 0x05, nil, 0)
-			return
-		}
-		defer remote.Close()
-		localAddr := remote.LocalAddr().(*net.TCPAddr)
-		s.sendSOCKS5Reply(conn, 0x00, localAddr.IP, uint16(localAddr.Port))
-
-		ci := &ConnectionInfo{
-			IP:        conn.RemoteAddr().(*net.TCPAddr).IP.String(),
-			Port:      conn.RemoteAddr().(*net.TCPAddr).Port,
-			Type:      "SOCKS5_TCP",
-			Target:    target,
-			StartTime: time.Now(),
-		}
-		activeConnsMu.Lock()
-		activeConns[ci] = true
-		activeConnsMu.Unlock()
-		stats.mu.Lock()
-		stats.Socks5TCP++
-		stats.mu.Unlock()
-
-		s.tunnel(conn, remote, ci)
-
-		activeConnsMu.Lock()
-		delete(activeConns, ci)
-		activeConnsMu.Unlock()
-
-	case 0x03: // UDP ASSOCIATE
-		if !s.enableUDP {
-			s.sendSOCKS5Reply(conn, 0x07, nil, 0)
-			return
-		}
-		host, port = s.readAddr(atyp, r)
-		target := fmt.Sprintf("UDP:%s:%d", host, port)
-		if host == "" {
-			target = "UDP:any"
-		}
-		log.Printf("[SOCKS5 UDP] %s -> %s", conn.RemoteAddr(), target)
-
-		udpConn, err := net.ListenUDP("udp", nil)
-		if err != nil {
-			s.sendSOCKS5Reply(conn, 0x01, nil, 0)
-			return
-		}
-		localAddr := udpConn.LocalAddr().(*net.UDPAddr)
-		tcpAddr := conn.RemoteAddr().(*net.TCPAddr)
-		assoc := &UDPAssociation{
-			ClientAddr:   &net.UDPAddr{IP: tcpAddr.IP, Port: tcpAddr.Port},
-			RelayConn:    udpConn,
-			DestMap:      make(map[string]time.Time),
-			LastActivity: time.Now(),
-			Active:       true,
-		}
-		key := fmt.Sprintf("%s:%d", tcpAddr.IP.String(), tcpAddr.Port)
-		udpAssocsMu.Lock()
-		udpAssocs[key] = assoc
-		udpAssocsMu.Unlock()
-
-		ci := &ConnectionInfo{
-			IP:        tcpAddr.IP.String(),
-			Port:      tcpAddr.Port,
-			Type:      "SOCKS5_UDP",
-			Target:    target,
-			StartTime: time.Now(),
-		}
-		activeConnsMu.Lock()
-		activeConns[ci] = true
-		activeConnsMu.Unlock()
-		stats.mu.Lock()
-		stats.Socks5UDP++
-		stats.mu.Unlock()
-
-		s.sendSOCKS5Reply(conn, 0x00, localAddr.IP, uint16(localAddr.Port))
-
-		go s.udpRelay(assoc)
-		s.keepUDPAssoc(conn, assoc, ci)
-
-		udpAssocsMu.Lock()
-		delete(udpAssocs, key)
-		udpAssocsMu.Unlock()
-		assoc.close()
-		activeConnsMu.Lock()
-		delete(activeConns, ci)
-		activeConnsMu.Unlock()
-
-	default:
-		s.sendSOCKS5Reply(conn, 0x07, nil, 0)
-	}
-}
-
-func (s *ProxyServer) doAuth(conn net.Conn, r io.Reader) bool {
-	buf := make([]byte, 1)
-	if _, err := io.ReadFull(r, buf); err != nil {
-		return false
-	}
-	ver := buf[0]
-	if ver != 0x01 {
-		conn.Write([]byte{0x01, 0xFF})
-		return false
-	}
-	if _, err := io.ReadFull(r, buf); err != nil {
-		return false
-	}
-	ulen := int(buf[0])
-	user := make([]byte, ulen)
-	if _, err := io.ReadFull(r, user); err != nil {
-		return false
-	}
-	if _, err := io.ReadFull(r, buf); err != nil {
-		return false
-	}
-	plen := int(buf[0])
-	pass := make([]byte, plen)
-	if _, err := io.ReadFull(r, pass); err != nil {
-		return false
-	}
-	if string(user) == s.username && string(pass) == s.password {
-		conn.Write([]byte{0x01, 0x00})
-		return true
-	}
-	conn.Write([]byte{0x01, 0xFF})
-	log.Printf("[WARN] SOCKS5 auth fail from %s", conn.RemoteAddr())
-	stats.mu.Lock()
-	stats.AuthFail++
-	stats.mu.Unlock()
-	return false
-}
-
-func (s *ProxyServer) readAddr(atyp byte, r io.Reader) (string, uint16) {
-	switch atyp {
-	case 0x01: // IPv4
-		ip := make([]byte, 4)
-		if _, err := io.ReadFull(r, ip); err != nil {
-			return "", 0
-		}
-		port := make([]byte, 2)
-		if _, err := io.ReadFull(r, port); err != nil {
-			return "", 0
-		}
-		return net.IP(ip).String(), binary.BigEndian.Uint16(port)
-	case 0x03: // Domain
-		lenBuf := make([]byte, 1)
-		if _, err := io.ReadFull(r, lenBuf); err != nil {
-			return "", 0
-		}
-		length := int(lenBuf[0])
-		host := make([]byte, length)
-		if _, err := io.ReadFull(r, host); err != nil {
-			return "", 0
-		}
-		port := make([]byte, 2)
-		if _, err := io.ReadFull(r, port); err != nil {
-			return "", 0
-		}
-		return string(host), binary.BigEndian.Uint16(port)
-	case 0x04: // IPv6
-		ip := make([]byte, 16)
-		if _, err := io.ReadFull(r, ip); err != nil {
-			return "", 0
-		}
-		port := make([]byte, 2)
-		if _, err := io.ReadFull(r, port); err != nil {
-			return "", 0
-		}
-		return net.IP(ip).String(), binary.BigEndian.Uint16(port)
-	default:
-		return "", 0
-	}
-}
-
-func (s *ProxyServer) sendSOCKS5Reply(conn net.Conn, rep byte, bindIP net.IP, bindPort uint16) {
-	var atyp byte
-	var ipBytes []byte
-	if bindIP == nil {
-		bindIP = net.IPv4(0, 0, 0, 0)
-	}
-	if bindIP.To4() != nil {
-		atyp = 0x01
-		ipBytes = bindIP.To4()
-	} else {
-		atyp = 0x04
-		ipBytes = bindIP.To16()
-	}
-	port := make([]byte, 2)
-	binary.BigEndian.PutUint16(port, bindPort)
-	reply := append([]byte{0x05, rep, 0x00, atyp}, ipBytes...)
-	reply = append(reply, port...)
-	conn.Write(reply)
-}
-
-// ======================== UDP RELAY ========================
-func (s *ProxyServer) udpRelay(assoc *UDPAssociation) {
-	defer assoc.close()
-	buf := make([]byte, UDP_BUFFER_SIZE)
-	for {
-		assoc.mu.Lock()
-		if !assoc.Active {
-			assoc.mu.Unlock()
-			return
-		}
-		conn := assoc.RelayConn
-		assoc.mu.Unlock()
-		if conn == nil {
-			return
-		}
-		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		n, _, err := conn.ReadFromUDP(buf) // sửa: bỏ biến addr
-		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
-			}
-			return
-		}
-		assoc.mu.Lock()
-		assoc.LastActivity = time.Now()
-		assoc.mu.Unlock()
-
-		if n < 4 {
-			continue
-		}
-		frag := buf[2]
-		if frag != 0 {
-			continue
-		}
-		atyp := buf[3]
-		pos := 4
-		var host string
-		var port uint16
-		switch atyp {
-		case 0x01:
-			if pos+4+2 > n {
-				continue
-			}
-			host = net.IP(buf[pos : pos+4]).String()
-			pos += 4
-			port = binary.BigEndian.Uint16(buf[pos : pos+2])
-			pos += 2
-		case 0x03:
-			if pos+1 > n {
-				continue
-			}
-			length := int(buf[pos])
-			pos++
-			if pos+length+2 > n {
-				continue
-			}
-			host = string(buf[pos : pos+length])
-			pos += length
-			port = binary.BigEndian.Uint16(buf[pos : pos+2])
-			pos += 2
-		case 0x04:
-			if pos+16+2 > n {
-				continue
-			}
-			host = net.IP(buf[pos : pos+16]).String()
-			pos += 16
-			port = binary.BigEndian.Uint16(buf[pos : pos+2])
-			pos += 2
-		default:
-			continue
-		}
-		payload := buf[pos:n]
-
-		targetAddr := fmt.Sprintf("%s:%d", host, port)
-		dest, err := net.ResolveUDPAddr("udp", targetAddr)
-		if err != nil {
-			continue
-		}
-		assoc.mu.Lock()
-		assoc.DestMap[targetAddr] = time.Now()
-		assoc.mu.Unlock()
-
-		assoc.mu.Lock()
-		conn = assoc.RelayConn
-		assoc.mu.Unlock()
-		if conn == nil {
-			return
-		}
-		conn.WriteToUDP(payload, dest)
-
-		stats.mu.Lock()
-		stats.UDPUp += int64(len(payload))
-		stats.mu.Unlock()
-
-		go func() {
-			replyBuf := make([]byte, UDP_BUFFER_SIZE)
-			conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-			n2, from, err := conn.ReadFromUDP(replyBuf)
-			if err != nil {
-				return
-			}
-			header := make([]byte, 0, 4+len(from.IP)+2)
-			header = append(header, 0, 0, 0)
-			if from.IP.To4() != nil {
-				header = append(header, 0x01)
-				header = append(header, from.IP.To4()...)
-			} else {
-				header = append(header, 0x04)
-				header = append(header, from.IP.To16()...)
-			}
-			portBuf := make([]byte, 2)
-			binary.BigEndian.PutUint16(portBuf, uint16(from.Port))
-			header = append(header, portBuf...)
-			assoc.mu.Lock()
-			client := assoc.ClientAddr
-			if client == nil {
-				assoc.mu.Unlock()
-				return
-			}
-			conn.WriteToUDP(append(header, replyBuf[:n2]...), client)
-			assoc.mu.Unlock()
-			stats.mu.Lock()
-			stats.UDPDown += int64(n2)
-			stats.mu.Unlock()
-		}()
-	}
-}
-
-func (s *ProxyServer) keepUDPAssoc(conn net.Conn, assoc *UDPAssociation, ci *ConnectionInfo) {
-	defer func() {
-		assoc.close()
-	}()
-	for {
-		buf := make([]byte, 1)
-		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-		_, err := conn.Read(buf)
-		if err != nil {
-			return
-		}
-	}
-}
-
-// ======================== HTTP HANDLER ========================
-func (s *ProxyServer) handleHTTP(conn net.Conn, r io.Reader) {
-	reader := bufio.NewReader(r)
-	reqLine, err := reader.ReadString('\n')
-	if err != nil {
-		return
-	}
-	reqLine = strings.TrimSpace(reqLine)
-	parts := strings.Split(reqLine, " ")
-	if len(parts) < 2 {
-		return
-	}
-	method, rawURL := parts[0], parts[1]
-	headers := make(map[string]string)
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			return
-		}
-		line = strings.TrimSpace(line)
-		if line == "" {
-			break
-		}
-		idx := strings.Index(line, ":")
-		if idx > 0 {
-			key := strings.ToLower(strings.TrimSpace(line[:idx]))
-			val := strings.TrimSpace(line[idx+1:])
-			headers[key] = val
-		}
-	}
-	if s.authEnabled {
-		auth := headers["proxy-authorization"]
-		if !s.checkHTTPAuth(auth) {
-			conn.Write([]byte("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"Proxy\"\r\n\r\n"))
-			stats.mu.Lock()
-			stats.AuthFail++
-			stats.mu.Unlock()
-			return
-		}
-	}
-
-	var host string
-	var port int
-	if method == "CONNECT" {
-		hostPort := strings.Split(rawURL, ":")
-		if len(hostPort) != 2 {
-			conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
-			return
-		}
-		host = hostPort[0]
-		port, _ = strconv.Atoi(hostPort[1])
-	} else {
-		parsed, err := url.Parse(rawURL)
-		if err != nil {
-			parsed, _ = url.Parse("http://" + rawURL)
-		}
-		host = parsed.Hostname()
-		if parsed.Port() != "" {
-			port, _ = strconv.Atoi(parsed.Port())
-		} else {
-			if parsed.Scheme == "https" {
-				port = 443
-			} else {
-				port = 80
-			}
-		}
-	}
-	target := fmt.Sprintf("%s:%d", host, port)
-	log.Printf("[HTTP %s] %s -> %s", method, conn.RemoteAddr(), target)
-
-	ci := &ConnectionInfo{
-		IP:        conn.RemoteAddr().(*net.TCPAddr).IP.String(),
-		Port:      conn.RemoteAddr().(*net.TCPAddr).Port,
-		Type:      "HTTP",
-		Target:    target,
-		StartTime: time.Now(),
-	}
-	activeConnsMu.Lock()
-	activeConns[ci] = true
-	activeConnsMu.Unlock()
-	stats.mu.Lock()
-	stats.HTTP++
-	stats.mu.Unlock()
-
-	defer func() {
-		activeConnsMu.Lock()
-		delete(activeConns, ci)
-		activeConnsMu.Unlock()
-	}()
-
-	remote, err := s.connectTarget(host, port)
-	if err != nil {
-		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
-		return
-	}
-	defer remote.Close()
-
-	if method == "CONNECT" {
-		conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-		s.tunnel(conn, remote, ci)
-	} else {
-		s.forwardHTTP(reader, method, rawURL, headers, remote, conn, ci)
-	}
-}
-
-func (s *ProxyServer) checkHTTPAuth(auth string) bool {
-	if !strings.HasPrefix(strings.ToLower(auth), "basic ") {
-		return false
-	}
-	encoded := auth[6:]
-	decoded, err := base64.StdEncoding.DecodeString(encoded)
-	if err != nil {
-		return false
-	}
-	parts := strings.SplitN(string(decoded), ":", 2)
-	if len(parts) != 2 {
-		return false
-	}
-	return parts[0] == s.username && parts[1] == s.password
-}
-
-func (s *ProxyServer) forwardHTTP(reader *bufio.Reader, method, rawURL string, headers map[string]string, remote net.Conn, client net.Conn, ci *ConnectionInfo) {
-	parsed, _ := url.Parse(rawURL)
-	if parsed.Host == "" {
-		parsed, _ = url.Parse("http://" + rawURL)
-	}
-	path := parsed.Path
-	if path == "" {
-		path = "/"
-	}
-	if parsed.RawQuery != "" {
-		path += "?" + parsed.RawQuery
-	}
-	req := fmt.Sprintf("%s %s HTTP/1.1\r\n", method, path)
-	if _, ok := headers["host"]; !ok {
-		req += fmt.Sprintf("Host: %s\r\n", parsed.Host)
-	}
-	for k, v := range headers {
-		if k != "proxy-authorization" && k != "proxy-connection" && k != "connection" {
-			req += fmt.Sprintf("%s: %s\r\n", k, v)
-		}
-	}
-	req += "Connection: close\r\n\r\n"
-
-	// Ghi request với đếm bytes_up
-	upWriter := &countingWriter{w: remote, n: &ci.BytesUp}
-	upWriter.Write([]byte(req))
-
-	if cl, ok := headers["content-length"]; ok {
-		length, _ := strconv.Atoi(cl)
-		body := make([]byte, length)
-		io.ReadFull(reader, body)
-		upWriter.Write(body)
-	} else if strings.Contains(headers["transfer-encoding"], "chunked") {
-		for {
-			line, err := reader.ReadString('\n')
-			if err != nil {
-				break
-			}
-			upWriter.Write([]byte(line))
-			line = strings.TrimSpace(line)
-			chunkSize, _ := strconv.ParseInt(line, 16, 64)
-			if chunkSize == 0 {
-				break
-			}
-			chunk := make([]byte, chunkSize)
-			io.ReadFull(reader, chunk)
-			upWriter.Write(chunk)
-			reader.ReadString('\n')
-		}
-	}
-
-	// Copy response từ remote về client, đếm bytes_down
-	copyWithCount(client, remote, &ci.BytesDown)
-
-	// Cập nhật stats tổng
-	stats.mu.Lock()
-	stats.BytesUp += ci.BytesUp
-	stats.BytesDown += ci.BytesDown
-	stats.mu.Unlock()
-}
-
-// ======================== TUNNEL ========================
-func (s *ProxyServer) tunnel(client net.Conn, remote net.Conn, ci *ConnectionInfo) {
-	upCounter := int64(0)
-	downCounter := int64(0)
-	done := make(chan struct{})
-
-	go func() {
-		defer close(done)
-		copyWithCount(remote, client, &upCounter)
-		remote.Close()
-	}()
-
-	copyWithCount(client, remote, &downCounter)
-	client.Close()
-	<-done
-
-	ci.BytesUp = upCounter
-	ci.BytesDown = downCounter
-	stats.mu.Lock()
-	stats.BytesUp += upCounter
-	stats.BytesDown += downCounter
-	stats.mu.Unlock()
-}
-
-// ======================== KẾT NỐI ĐÍCH / UPSTREAM ========================
-func (s *ProxyServer) connectTarget(host string, port int) (net.Conn, error) {
-	if len(s.upstreams) > 0 {
-		upstreamMu.Lock()
-		defer upstreamMu.Unlock()
-		for i := 0; i < len(s.upstreams); i++ {
-			idx := (upstreamIndex + i) % len(s.upstreams)
-			upstream := s.upstreams[idx]
-			upstreamIndex = (idx + 1) % len(s.upstreams)
-			conn, err := net.DialTimeout("tcp", upstream, CONNECTION_TIMEOUT)
-			if err == nil {
-				return conn, nil
-			}
-		}
-	}
-	return net.DialTimeout("tcp", fmt.Sprintf("%s:%d", host, port), CONNECTION_TIMEOUT)
-}
-
-// ======================== DASHBOARD HTML (raw string) ========================
-const dashboardHTML = `<!DOCTYPE html>
-<html>
+// ==================== UI ====================
+const pageHTML = `<!DOCTYPE html>
+<html lang="vi">
 <head>
 <meta charset="UTF-8">
-<title>Proxy Dashboard</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Web Proxy</title>
 <style>
-* { margin:0; padding:0; box-sizing:border-box; }
-body {
-	background: #0f0f1a;
-	color: #e0e0e0;
-	font-family: 'Segoe UI', 'Roboto', monospace;
-	padding: 30px 20px;
-}
-.container {
-	max-width: 1400px;
-	margin: 0 auto;
-}
-h1 {
-	font-size: 2.2rem;
-	font-weight: 300;
-	letter-spacing: 1px;
-	margin-bottom: 10px;
-	color: #f0c27a;
-	text-shadow: 0 0 20px rgba(240,194,122,0.15);
-	border-bottom: 2px solid #2a2a3a;
-	padding-bottom: 15px;
-	display: flex;
-	align-items: center;
-	gap: 10px;
-}
-h1 span { background: #2a2a3a; padding: 0 12px; border-radius: 30px; font-size: 0.8rem; color: #8f8fbf; }
-.stats-grid {
-	display: grid;
-	grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-	gap: 15px;
-	margin: 20px 0;
-}
-.stat-box {
-	background: #1a1a2e;
-	padding: 14px 16px;
-	border-radius: 12px;
-	border-left: 4px solid #6c6c9a;
-	transition: 0.2s;
-}
-.stat-box:hover { background: #22223b; }
-.stat-label {
-	font-size: 0.8rem;
-	text-transform: uppercase;
-	letter-spacing: 0.5px;
-	color: #9999bb;
-}
-.stat-value {
-	font-size: 1.7rem;
-	font-weight: 600;
-	margin-top: 4px;
-}
-.stat-value.cyan { color: #7dd3fc; }
-.stat-value.green { color: #86efac; }
-.stat-value.yellow { color: #fde047; }
-.stat-value.pink { color: #f9a8d4; }
-.stat-value.orange { color: #fdba74; }
-.stat-value.purple { color: #c4b5fd; }
-.stat-value.red { color: #fca5a5; }
-.section {
-	margin-top: 30px;
-	background: #14141f;
-	border-radius: 14px;
-	padding: 20px 20px 10px 20px;
-	border: 1px solid #2a2a3a;
-}
-.section-title {
-	font-size: 1.2rem;
-	font-weight: 400;
-	margin-bottom: 15px;
-	color: #b4b4d4;
-	letter-spacing: 0.3px;
-}
-table {
-	width: 100%;
-	border-collapse: collapse;
-	font-size: 0.9rem;
-}
-th {
-	text-align: left;
-	padding: 10px 8px;
-	background: #1e1e32;
-	color: #a0a0c0;
-	font-weight: 500;
-}
-td {
-	padding: 8px 8px;
-	border-bottom: 1px solid #28283a;
-}
-tr:hover td { background: #1a1a2e; }
-.badge {
-	display: inline-block;
-	padding: 2px 12px;
-	border-radius: 20px;
-	font-size: 0.7rem;
-	font-weight: 600;
-	background: #2a2a4a;
-	color: #c0c0e0;
-}
-.badge.socks5-tcp { background: #1e3a5f; color: #7dd3fc; }
-.badge.socks5-udp { background: #3b1f4a; color: #d8b4fe; }
-.badge.http { background: #2d4a2d; color: #86efac; }
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%;width:100%;font-family:system-ui,'Segoe UI',Roboto,sans-serif;background:#0f0f1a;color:#e0e0e0;overflow:hidden;position:fixed;inset:0;-webkit-text-size-adjust:100%}
+#app{display:flex;flex-direction:column;height:100vh;height:100dvh;width:100vw}
+.toolbar{flex:0 0 auto;display:flex;gap:6px;align-items:center;padding:8px 10px;background:#14141f;border-bottom:1px solid #2a2a3a;padding-top:max(8px,env(safe-area-inset-top));padding-left:max(10px,env(safe-area-inset-left));padding-right:max(10px,env(safe-area-inset-right))}
+input[type=text]{flex:1 1 auto;min-width:0;background:#1a1a2e;border:1px solid #2a2a3a;border-radius:8px;padding:8px 12px;color:#e0e0e0;font-size:.9rem;outline:none;font-family:inherit}
+input[type=text]:focus{border-color:#f0c27a}
+button{flex:0 0 auto;background:#2a2a3a;color:#e0e0e0;border:1px solid #3a3a52;border-radius:8px;padding:8px 10px;font-size:.9rem;cursor:pointer;font-family:inherit;line-height:1;transition:.15s;user-select:none;-webkit-tap-highlight-color:transparent}
+button:hover{background:#33334a;border-color:#f0c27a}
+button:active{transform:scale(.96)}
+button.go{background:#f0c27a;color:#1a1a2e;font-weight:600;border-color:#f0c27a}
+button.go:hover{filter:brightness(1.1)}
+button.nav{padding:8px 10px;font-size:1rem;min-width:36px}
+.status{flex:0 0 auto;font-size:.72rem;color:#9999bb;white-space:nowrap;min-width:50px;text-align:right;overflow:hidden;text-overflow:ellipsis}
+.frame-wrap{flex:1 1 auto;position:relative;background:#fff;overflow:hidden;min-height:0}
+iframe{display:block;width:100%;height:100%;border:0;background:#fff}
+@media (max-width:520px){.status{display:none}button.nav{padding:8px 8px}input[type=text]{font-size:.85rem;padding:8px 10px}}
 </style>
 </head>
 <body>
-<div class="container">
-	<h1>⚡ Proxy Pro <span>v6.3</span></h1>
-	<div id="statsGrid" class="stats-grid">Loading stats...</div>
-	<div id="connectionsSection" class="section">
-		<div class="section-title">🔗 Active Connections</div>
-		<div id="connectionsTable">Loading...</div>
+<div id="app">
+	<div class="toolbar">
+		<button class="nav" onclick="nav('back')" title="Back">←</button>
+		<button class="nav" onclick="nav('forward')" title="Forward">→</button>
+		<button class="nav" onclick="nav('reload')" title="Reload">⟳</button>
+		<input type="text" id="u" placeholder="https://example.com — nhập URL rồi Enter" autofocus autocomplete="off" spellcheck="false" autocapitalize="off">
+		<button class="go" onclick="go()">Go</button>
+		<div class="status" id="s"></div>
 	</div>
-	<div id="upstreamSection" class="section">
-		<div class="section-title">🌐 Upstream Proxies</div>
-		<div id="upstreamInfo">Loading...</div>
+	<div class="frame-wrap">
+		<iframe id="f" referrerpolicy="no-referrer-when-downgrade" allow="clipboard-read; clipboard-write; fullscreen; geolocation; camera; microphone"></iframe>
 	</div>
 </div>
 <script>
-async function fetchAll() {
-	try {
-		const res = await fetch('/api/all');
-		if (!res.ok) throw new Error('HTTP '+res.status);
-		const data = await res.json();
-		renderStats(data);
-		renderConnections(data.active_connections || []);
-		renderUpstream(data.upstream || {});
-	} catch(e) {
-		console.error('Fetch error:', e);
-		document.getElementById('statsGrid').innerHTML = '<div style="color:#f87171;">⚠️ Failed to load data. Retrying...</div>';
+(function(){
+	var inp=document.getElementById('u'), frm=document.getElementById('f'), st=document.getElementById('s');
+
+	function enc(u){ return u.replace('://','%3A%2F%2F'); }
+	function dec(s){
+		var i=s.toLowerCase().indexOf('%3a%2f%2f');
+		if(i>=0) return s.slice(0,i)+'://'+s.slice(i+9);
+		return s;
 	}
-}
-function renderStats(data) {
-	const boxes = [
-		{ label: 'Total Connections', value: data.total, cls: 'cyan' },
-		{ label: 'Active', value: data.active, cls: 'green' },
-		{ label: 'SOCKS5 TCP', value: data.socks5_tcp, cls: 'cyan' },
-		{ label: 'SOCKS5 UDP', value: data.socks5_udp, cls: 'purple' },
-		{ label: 'HTTP Requests', value: data.http, cls: 'green' },
-		{ label: 'UDP Associations', value: data.udp_assocs || 0, cls: 'yellow' },
-		{ label: 'Bytes Up (TCP)', value: formatBytes(data.bytes_up), cls: 'orange' },
-		{ label: 'Bytes Down (TCP)', value: formatBytes(data.bytes_down), cls: 'pink' },
-		{ label: 'UDP Up', value: formatBytes(data.udp_up), cls: 'yellow' },
-		{ label: 'UDP Down', value: formatBytes(data.udp_down), cls: 'purple' },
-		{ label: 'Uptime', value: formatUptime(data.uptime), cls: 'cyan' },
-	];
-	let html = '';
-	boxes.forEach(b => {
-		html += '<div class="stat-box"><div class="stat-label">'+b.label+'</div><div class="stat-value '+b.cls+'">'+b.value+'</div></div>';
+
+	inp.addEventListener('keydown', e=>{
+		if(e.key==='Enter'){ e.preventDefault(); go(); }
 	});
-	document.getElementById('statsGrid').innerHTML = html;
-}
-function renderConnections(conns) {
-	if (!conns || conns.length === 0) {
-		document.getElementById('connectionsTable').innerHTML = '<div style="padding:15px;color:#8888aa;">No active connections</div>';
-		return;
+
+	function go(){
+		var raw=inp.value.trim();
+		if(!raw) return;
+		if(raw.slice(0,3)==='/p/') raw=dec(raw.slice(3));
+		var u;
+		try{ u=new URL(raw); }
+		catch(e){
+			try{ u=new URL('https://'+raw); }
+			catch(e2){ st.textContent='URL sai'; return; }
+		}
+		if(u.protocol!=='http:'&&u.protocol!=='https:'){ st.textContent='scheme sai'; return; }
+		inp.value=u.href;
+		st.textContent='đang tải...';
+		frm.src='/p/'+enc(u.href);
 	}
-	let html = '<table><thead><tr><th>IP</th><th>Port</th><th>Type</th><th>Target</th><th>Duration</th><th>Bytes Up</th><th>Bytes Down</th></tr></thead><tbody>';
-	conns.forEach(c => {
-		let badge = '<span class="badge">'+c.type+'</span>';
-		if (c.type === 'SOCKS5_TCP') badge = '<span class="badge socks5-tcp">SOCKS5 TCP</span>';
-		else if (c.type === 'SOCKS5_UDP') badge = '<span class="badge socks5-udp">SOCKS5 UDP</span>';
-		else if (c.type === 'HTTP') badge = '<span class="badge http">HTTP</span>';
-		html += '<tr><td>'+c.ip+'</td><td>'+c.port+'</td><td>'+badge+'</td><td>'+(c.target||'N/A')+'</td><td>'+formatUptime(c.duration)+'</td><td>'+formatBytes(c.bytes_up)+'</td><td>'+formatBytes(c.bytes_down)+'</td></tr>';
+	window.go=go;
+
+	function nav(a){
+		try{
+			var w=frm.contentWindow;
+			if(a==='back') w.history.back();
+			else if(a==='forward') w.history.forward();
+			else if(a==='reload'){ try{ w.location.reload(); }catch(e){ frm.src=frm.src; } }
+		}catch(e){ if(a==='reload') frm.src=frm.src; }
+	}
+	window.nav=nav;
+
+	setInterval(function(){
+		try{
+			var w=frm.contentWindow;
+			var p=w.location.pathname, s=w.location.search;
+			if(p.indexOf('/p/')===0){
+				var orig=dec(p.slice(3))+s;
+				if(document.activeElement!==inp && inp.value!==orig){
+					inp.value=orig;
+					st.textContent='';
+				}
+			}
+		}catch(e){}
+	},400);
+
+	window.addEventListener('message', function(e){
+		if(!e.data || typeof e.data!=='object') return;
+		if(e.data.__proxyNav && typeof e.data.url==='string'){
+			if(document.activeElement!==inp) inp.value=e.data.url;
+			st.textContent='';
+		}
 	});
-	html += '</tbody></table>';
-	document.getElementById('connectionsTable').innerHTML = html;
-}
-function renderUpstream(up) {
-	const proxies = up.proxies || [];
-	let html = '<div style="padding:8px 0;color:#b0b0d0;">';
-	if (proxies.length) {
-		html += '<strong>Proxies:</strong> '+proxies.join(', ')+' &nbsp;|&nbsp; <strong>Index:</strong> '+up.current_index;
-	} else {
-		html += '<span style="color:#8888aa;">No upstream proxies configured.</span>';
+
+	function resize(){
+		document.documentElement.style.setProperty('--vh',(window.innerHeight*0.01)+'px');
 	}
-	html += '</div>';
-	document.getElementById('upstreamInfo').innerHTML = html;
-}
-function formatBytes(b) {
-	if (b === undefined || b === null) return '0 B';
-	const units=['B','KiB','MiB','GiB','TiB'];
-	let u=0;
-	while(b>=1024 && u<units.length-1){ b/=1024; u++; }
-	return b.toFixed(1)+' '+units[u];
-}
-function formatUptime(sec) {
-	if (!sec) return '00:00:00';
-	const h=Math.floor(sec/3600), m=Math.floor((sec%3600)/60), s=Math.floor(sec%60);
-	return String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');
-}
-fetchAll();
-setInterval(fetchAll, 5000);
+	window.addEventListener('resize', resize);
+	window.addEventListener('orientationchange', function(){ setTimeout(resize,120); });
+	resize();
+	window.addEventListener('load', function(){ inp.focus(); });
+})();
 </script>
-</body></html>`
+</body>
+</html>`
 
-// ======================== DASHBOARD SERVER ========================
-func (s *ProxyServer) dashboardServer() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", s.dashboardIndex)
-	mux.HandleFunc("/stats", s.dashboardStats)
-	mux.HandleFunc("/api/all", s.dashboardAll)
-	addr := fmt.Sprintf(":%d", dashboardPort)
-	log.Printf("[INFO] Dashboard available at http://0.0.0.0%s", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Printf("[WARN] Dashboard error: %v", err)
+// ==================== SSRF GUARD ====================
+var blockedNets = func() []*net.IPNet {
+	var nets []*net.IPNet
+	for _, c := range []string{
+		"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+		"169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16",
+		"198.18.0.0/15", "224.0.0.0/4", "240.0.0.0/4",
+		"::1/128", "fc00::/7", "fe80::/10", "ff00::/8",
+	} {
+		if _, n, err := net.ParseCIDR(c); err == nil {
+			nets = append(nets, n)
+		}
+	}
+	return nets
+}()
+
+func isBlockedIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
+		return true
+	}
+	for _, n := range blockedNets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	if v4 := ip.To4(); v4 != nil {
+		if v4.IsLoopback() || v4.IsPrivate() || v4.IsLinkLocalUnicast() || v4.IsUnspecified() {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveAndCheck(host string) ([]net.IP, error) {
+	if ip := net.ParseIP(host); ip != nil {
+		if isBlockedIP(ip) {
+			return nil, fmt.Errorf("IP nội bộ: %s", ip)
+		}
+		return []net.IP{ip}, nil
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return nil, err
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("không phân giải được: %s", host)
+	}
+	for _, ip := range ips {
+		if isBlockedIP(ip) {
+			return nil, fmt.Errorf("host %s → IP nội bộ (%s)", host, ip)
+		}
+	}
+	return ips, nil
+}
+
+// ==================== ENCODE / DECODE TARGET URL ====================
+const schemeSep = "%3A%2F%2F"
+
+func encodeTargetURL(s string) string {
+	if i := strings.Index(s, "://"); i >= 0 {
+		return s[:i] + schemeSep + s[i+3:]
+	}
+	return s
+}
+
+func decodeTargetURL(s string) string {
+	lower := strings.ToLower(s)
+	needle := "%3a%2f%2f"
+	if i := strings.Index(lower, needle); i >= 0 {
+		return s[:i] + "://" + s[i+len(needle):]
+	}
+	return s
+}
+
+// ==================== HTTP CLIENT ====================
+var proxyClient *http.Client
+
+func init() {
+	jar, _ := cookiejar.New(nil)
+	proxyClient = &http.Client{
+		Timeout: 60 * time.Second,
+		Jar:     jar,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				host, portStr, err := net.SplitHostPort(addr)
+				if err != nil {
+					return nil, err
+				}
+				p, _ := strconv.Atoi(portStr)
+				if blockLocal {
+					ips, err := resolveAndCheck(host)
+					if err != nil {
+						return nil, err
+					}
+					d := &net.Dialer{Timeout: 25 * time.Second}
+					var lastErr error
+					for _, ip := range ips {
+						c, derr := d.DialContext(ctx, "tcp", net.JoinHostPort(ip.String(), strconv.Itoa(p)))
+						if derr == nil {
+							return c, nil
+						}
+						lastErr = derr
+					}
+					return nil, lastErr
+				}
+				d := &net.Dialer{Timeout: 25 * time.Second}
+				return d.DialContext(ctx, "tcp", addr)
+			},
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
+			IdleConnTimeout:       90 * time.Second,
+			ForceAttemptHTTP2:     false,
+			// KHÔNG set DisableCompression — để Go tự dùng gzip và tự giải nén.
+		},
 	}
 }
 
-func (s *ProxyServer) dashboardIndex(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
+// ==================== REWRITE HELPERS ====================
+func toProxy(raw string, base *url.URL) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return raw
+	}
+	low := strings.ToLower(raw)
+	if strings.HasPrefix(low, "data:") ||
+		strings.HasPrefix(low, "javascript:") ||
+		strings.HasPrefix(low, "mailto:") ||
+		strings.HasPrefix(low, "tel:") ||
+		strings.HasPrefix(low, "blob:") ||
+		strings.HasPrefix(low, "about:") ||
+		strings.HasPrefix(raw, "#") ||
+		strings.HasPrefix(raw, "/p/") {
+		return raw
+	}
+	// ws://, wss:// (WebSocket)
+	if strings.HasPrefix(low, "ws://") || strings.HasPrefix(low, "wss://") {
+		if abs, err := url.Parse(raw); err == nil && abs.Host != "" {
+			return "/p/" + encodeTargetURL(abs.String())
+		}
+		return raw
+	}
+	var abs *url.URL
+	if strings.HasPrefix(raw, "//") {
+		abs, _ = url.Parse(base.Scheme + ":" + raw)
+	} else {
+		ref, err := url.Parse(raw)
+		if err != nil {
+			return raw
+		}
+		abs = base.ResolveReference(ref)
+	}
+	if abs == nil || (abs.Scheme != "http" && abs.Scheme != "https") {
+		return raw
+	}
+	return "/p/" + encodeTargetURL(abs.String())
+}
+
+var (
+	attrRe         = regexp.MustCompile(`(?i)\b(href|src|action|poster|data-src|data-href|formaction)\s*=\s*["']([^"']*)["']`)
+	srcsetRe       = regexp.MustCompile(`(?i)\bsrcset\s*=\s*["']([^"']*)["']`)
+	styleAttrRe    = regexp.MustCompile(`(?i)\bstyle\s*=\s*["']([^"']*)["']`)
+	styleTagRe     = regexp.MustCompile(`(?is)<style[^>]*>(.*?)</style>`)
+	baseTagRe      = regexp.MustCompile(`(?is)<base\s+([^>]*)>`)
+	baseHrefRe     = regexp.MustCompile(`(?i)href\s*=\s*["']([^"']+)["']`)
+	cssURLRe       = regexp.MustCompile(`(?i)url\(\s*['"]?([^'")]+?)['"]?\s*\)`)
+	metaRefreshRe  = regexp.MustCompile(`(?i)<meta\s+[^>]*http-equiv\s*=\s*["']?refresh["']?[^>]*>`)
+	metaContentRe  = regexp.MustCompile(`(?i)content\s*=\s*["']([^"']*)["']`)
+	urlInRefreshRe = regexp.MustCompile(`(?i)(url\s*=\s*)([^\s;]+)`)
+)
+
+func rewriteCSS(css []byte, base *url.URL) []byte {
+	return cssURLRe.ReplaceAllFunc(css, func(m []byte) []byte {
+		sub := cssURLRe.FindSubmatch(m)
+		if len(sub) < 2 {
+			return m
+		}
+		return []byte("url(" + toProxy(string(sub[1]), base) + ")")
+	})
+}
+
+func rewriteMetaRefresh(body []byte, base *url.URL) []byte {
+	return metaRefreshRe.ReplaceAllFunc(body, func(m []byte) []byte {
+		cm := metaContentRe.FindSubmatch(m)
+		if len(cm) < 2 {
+			return m
+		}
+		newContent := urlInRefreshRe.ReplaceAllFunc(cm[1], func(u []byte) []byte {
+			sm := urlInRefreshRe.FindSubmatch(u)
+			if len(sm) < 3 {
+				return u
+			}
+			return []byte(string(sm[1]) + toProxy(string(sm[2]), base))
+		})
+		return []byte(`<meta http-equiv="refresh" content="` + string(newContent) + `">`)
+	})
+}
+
+func rewriteHTML(body []byte, base *url.URL) []byte {
+	if m := baseTagRe.FindSubmatch(body); m != nil {
+		if hm := baseHrefRe.FindSubmatch(m[1]); hm != nil {
+			if b, err := url.Parse(string(hm[1])); err == nil {
+				base = base.ResolveReference(b)
+			}
+		}
+		body = baseTagRe.ReplaceAll(body, []byte(""))
+		newBase := []byte(`<base href="/p/` + encodeTargetURL(base.String()) + `">`)
+		lower := strings.ToLower(string(body))
+		if idx := strings.Index(lower, "<head>"); idx >= 0 {
+			at := idx + len("<head>")
+			out := make([]byte, 0, len(body)+len(newBase))
+			out = append(out, body[:at]...)
+			out = append(out, newBase...)
+			out = append(out, body[at:]...)
+			body = out
+		} else {
+			body = append(newBase, body...)
+		}
+	}
+
+	body = attrRe.ReplaceAllFunc(body, func(m []byte) []byte {
+		sub := attrRe.FindSubmatch(m)
+		if len(sub) < 3 {
+			return m
+		}
+		return []byte(string(sub[1]) + `="` + toProxy(string(sub[2]), base) + `"`)
+	})
+	body = srcsetRe.ReplaceAllFunc(body, func(m []byte) []byte {
+		sub := srcsetRe.FindSubmatch(m)
+		if len(sub) < 2 {
+			return m
+		}
+		parts := strings.Split(string(sub[1]), ",")
+		for i, p := range parts {
+			fields := strings.Fields(strings.TrimSpace(p))
+			if len(fields) >= 1 {
+				fields[0] = toProxy(fields[0], base)
+			}
+			parts[i] = strings.Join(fields, " ")
+		}
+		return []byte(`srcset="` + strings.Join(parts, ", ") + `"`)
+	})
+	body = styleAttrRe.ReplaceAllFunc(body, func(m []byte) []byte {
+		sub := styleAttrRe.FindSubmatch(m)
+		if len(sub) < 2 {
+			return m
+		}
+		return []byte(`style="` + string(rewriteCSS(sub[1], base)) + `"`)
+	})
+	body = styleTagRe.ReplaceAllFunc(body, func(m []byte) []byte {
+		sub := styleTagRe.FindSubmatch(m)
+		if len(sub) < 2 {
+			return m
+		}
+		return []byte(`<style>` + string(rewriteCSS(sub[1], base)) + `</style>`)
+	})
+
+	body = rewriteMetaRefresh(body, base)
+
+	shim := []byte(`<script>` + jsShim + `</script>`)
+	lower := strings.ToLower(string(body))
+	if idx := strings.Index(lower, "<head>"); idx >= 0 {
+		at := idx + len("<head>")
+		out := make([]byte, 0, len(body)+len(shim))
+		out = append(out, body[:at]...)
+		out = append(out, shim...)
+		out = append(out, body[at:]...)
+		body = out
+	} else {
+		body = append(shim, body...)
+	}
+	return body
+}
+
+// jsShim: patch toàn bộ API điều hướng động trong trang con.
+const jsShim = `(function(){
+	var PREFIX='/p/';
+	function enc(u){ return u.replace('://','%3A%2F%2F'); }
+	function dec(s){
+		var i=s.toLowerCase().indexOf('%3a%2f%2f');
+		if(i>=0) return s.slice(0,i)+'://'+s.slice(i+9);
+		return s;
+	}
+	var ORIG=(function(){
+		var p=location.pathname;
+		if(p.indexOf(PREFIX)===0) return dec(p.slice(3))+location.search+location.hash;
+		return location.href;
+	})();
+	function px(u){
+		if(typeof u!=='string'||!u) return u;
+		if(u.indexOf(PREFIX)===0) return u;
+		if(/^(data|blob|javascript|mailto|tel|about):/i.test(u)) return u;
+		if(u.charAt(0)==='#') return u;
+		var abs;
+		if(u.indexOf('//')===0){ abs=location.protocol+u; }
+		else if(/^https?:\/\//i.test(u)){ abs=u; }
+		else if(/^wss?:\/\//i.test(u)){ abs=u; }
+		else if(u.charAt(0)==='/'){ try{abs=new URL(ORIG).origin+u;}catch(e){return u;} }
+		else { return u; }
+		return PREFIX+enc(abs);
+	}
+	window.__proxify=px;
+
+	// fetch
+	var _fetch=window.fetch;
+	if(_fetch) window.fetch=function(input,init){
+		try{
+			if(typeof input==='string') input=px(input);
+			else if(input && input.url) input=new Request(px(input.url),input);
+		}catch(e){}
+		return _fetch.call(this,input,init);
+	};
+
+	// XMLHttpRequest
+	var _open=XMLHttpRequest.prototype.open;
+	XMLHttpRequest.prototype.open=function(m,u){
+		var a=Array.prototype.slice.call(arguments);
+		if(typeof u==='string') a[1]=px(u);
+		return _open.apply(this,a);
+	};
+
+	// window.open
+	var _winOpen=window.open;
+	window.open=function(u,n,f){
+		if(typeof u==='string') u=px(u);
+		return _winOpen.call(window,u,n,f);
+	};
+
+	// history
+	try{
+		var _push=history.pushState.bind(history);
+		var _repl=history.replaceState.bind(history);
+		history.pushState=function(s,t,u){ if(u) u=px(u); return _push(s,t,u); };
+		history.replaceState=function(s,t,u){ if(u) u=px(u); return _repl(s,t,u); };
+	}catch(e){}
+
+	// location assign/replace
+	try{
+		if(location.assign){
+			var _a=location.assign.bind(location);
+			location.assign=function(u){ return _a(px(u)); };
+		}
+		if(location.replace){
+			var _r=location.replace.bind(location);
+			location.replace=function(u){ return _r(px(u)); };
+		}
+	}catch(e){}
+
+	// Worker / SharedWorker — rewrite script URL
+	try{
+		var _Worker=window.Worker;
+		if(_Worker) window.Worker=function(u,o){
+			if(typeof u==='string') u=px(u);
+			return o===undefined ? new _Worker(u) : new _Worker(u,o);
+		};
+	}catch(e){}
+	try{
+		var _SharedWorker=window.SharedWorker;
+		if(_SharedWorker) window.SharedWorker=function(u,o){
+			if(typeof u==='string') u=px(u);
+			return o===undefined ? new _SharedWorker(u) : new _SharedWorker(u,o);
+		};
+	}catch(e){}
+
+	// EventSource
+	try{
+		var _ES=window.EventSource;
+		if(_ES) window.EventSource=function(u,o){
+			if(typeof u==='string') u=px(u);
+			return o===undefined ? new _ES(u) : new _ES(u,o);
+		};
+	}catch(e){}
+
+	// WebSocket — chuyển ws:// hoặc wss:// thành ws(s)://proxy/p/<encoded>
+	try{
+		var _WS=window.WebSocket;
+		if(_WS){
+			var pxyWS=function(u,p){
+				if(typeof u==='string'){
+					var enc=u.replace('://','%3A%2F%2F');
+					var proto=(location.protocol==='https:')?'wss://':'ws://';
+					u=proto+location.host+PREFIX+enc;
+				}
+				if(p===undefined) return new _WS(u);
+				return new _WS(u,p);
+			};
+			pxyWS.CONNECTING=0; pxyWS.OPEN=1; pxyWS.CLOSING=2; pxyWS.CLOSED=3;
+			pxyWS.prototype=_WS.prototype;
+			window.WebSocket=pxyWS;
+		}
+	}catch(e){}
+
+	// Service Worker — vô hiệu hoá (proxy không hỗ trợ SW scope)
+	try{
+		if(navigator.serviceWorker && navigator.serviceWorker.register){
+			var _swReg=navigator.serviceWorker.register.bind(navigator.serviceWorker);
+			navigator.serviceWorker.register=function(){
+				console.log('[proxy] ServiceWorker disabled');
+				return Promise.reject(new Error('ServiceWorker disabled by proxy'));
+			};
+			try{ navigator.serviceWorker.getRegistrations().then(function(rs){rs.forEach(function(r){r.unregister()})}); }catch(e){}
+		}
+	}catch(e){}
+
+	function sync(){
+		try{ parent.postMessage({__proxyNav:true,url:ORIG},'*'); }catch(e){}
+	}
+	if(document.readyState==='loading'){
+		document.addEventListener('DOMContentLoaded',sync);
+	} else { sync(); }
+})();`
+
+// ==================== HANDLERS ====================
+func extractTarget(r *http.Request) (string, bool) {
+	var p string
+	if r.RequestURI != "" {
+		p = r.RequestURI
+	} else {
+		p = r.URL.EscapedPath()
+		if r.URL.RawQuery != "" {
+			p += "?" + r.URL.RawQuery
+		}
+	}
+	if !strings.HasPrefix(p, "/p/") {
+		return "", false
+	}
+	p = p[3:]
+	p = decodeTargetURL(p)
+	return p, true
+}
+
+func refererTarget(r *http.Request) (*url.URL, bool) {
+	ref := r.Header.Get("Referer")
+	if ref == "" {
+		return nil, false
+	}
+	ru, err := url.Parse(ref)
+	if err != nil {
+		return nil, false
+	}
+	rp := ru.EscapedPath()
+	if !strings.HasPrefix(rp, "/p/") {
+		return nil, false
+	}
+	baseRaw := decodeTargetURL(rp[3:])
+	if ru.RawQuery != "" {
+		baseRaw += "?" + ru.RawQuery
+	}
+	base, err := url.Parse(baseRaw)
+	if err != nil || base.Host == "" {
+		return nil, false
+	}
+	if base.Scheme != "http" && base.Scheme != "https" && base.Scheme != "ws" && base.Scheme != "wss" {
+		return nil, false
+	}
+	return base, true
+}
+
+func rootHandler(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/" {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Write([]byte(pageHTML))
 		return
 	}
-	w.Header().Set("Content-Type", "text/html")
-	w.Write([]byte(dashboardHTML))
+	if strings.HasPrefix(r.RequestURI, "/p/") || strings.HasPrefix(r.URL.Path, "/p/") {
+		proxyHandler(w, r)
+		return
+	}
+	if base, ok := refererTarget(r); ok {
+		newU := *base
+		newU.Path = r.URL.Path
+		newU.RawQuery = r.URL.RawQuery
+		http.Redirect(w, r, "/p/"+encodeTargetURL(newU.String()), http.StatusFound)
+		return
+	}
+	http.NotFound(w, r)
 }
 
-func (s *ProxyServer) dashboardStats(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	json.NewEncoder(w).Encode(s.getStats())
+const chromeUA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+func isWebSocketUpgrade(r *http.Request) bool {
+	if !strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade") {
+		return false
+	}
+	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
 }
 
-func (s *ProxyServer) dashboardAll(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	data := s.getAllStats()
-	json.NewEncoder(w).Encode(data)
-}
-
-func (s *ProxyServer) getStats() map[string]interface{} {
-	stats.mu.Lock()
-	defer stats.mu.Unlock()
-	activeConnsMu.Lock()
-	activeCount := len(activeConns)
-	activeConnsMu.Unlock()
-	udpAssocsMu.Lock()
-	udpCount := len(udpAssocs)
-	udpAssocsMu.Unlock()
-	return map[string]interface{}{
-		"total":        stats.Total,
-		"current":      stats.Current,
-		"active":       activeCount,
-		"socks5_tcp":   stats.Socks5TCP,
-		"socks5_udp":   stats.Socks5UDP,
-		"http":         stats.HTTP,
-		"bytes_up":     stats.BytesUp,
-		"bytes_down":   stats.BytesDown,
-		"udp_up":       stats.UDPUp,
-		"udp_down":     stats.UDPDown,
-		"udp_assocs":   udpCount,
-		"uptime":       time.Since(stats.StartTime).Seconds(),
-	}
-}
-
-func (s *ProxyServer) getAllStats() map[string]interface{} {
-	data := s.getStats()
-	var conns []map[string]interface{}
-	activeConnsMu.Lock()
-	for ci := range activeConns {
-		conns = append(conns, map[string]interface{}{
-			"ip":          ci.IP,
-			"port":        ci.Port,
-			"type":        ci.Type,
-			"target":      ci.Target,
-			"start_time":  ci.StartTime.Unix(),
-			"bytes_up":    ci.BytesUp,
-			"bytes_down":  ci.BytesDown,
-			"duration":    time.Since(ci.StartTime).Seconds(),
-		})
-	}
-	activeConnsMu.Unlock()
-	data["active_connections"] = conns
-
-	upstreamMu.Lock()
-	proxies := make([]string, len(upstreamProxies))
-	copy(proxies, upstreamProxies)
-	idx := upstreamIndex
-	upstreamMu.Unlock()
-	data["upstream"] = map[string]interface{}{
-		"proxies":       proxies,
-		"current_index": idx,
-	}
-
-	data["system"] = map[string]interface{}{
-		"cpu_percent":    0.0,
-		"memory_percent": 0.0,
-		"fd_limit":       10000,
-	}
-
-	udpAssocsMu.Lock()
-	udpInfo := make(map[string]interface{})
-	for key, assoc := range udpAssocs {
-		assoc.mu.Lock()
-		udpInfo[key] = map[string]interface{}{
-			"client_addr":   assoc.ClientAddr.String(),
-			"relay_port":    assoc.RelayConn.LocalAddr().(*net.UDPAddr).Port,
-			"active":        assoc.Active,
-			"last_activity": assoc.LastActivity.Unix(),
-			"dest_count":    len(assoc.DestMap),
+func proxyWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL) {
+	// Đích là ws:// → plain TCP; wss:// → TLS
+	useTLS := target.Scheme == "wss"
+	host := target.Host
+	if !strings.Contains(host, ":") {
+		if useTLS {
+			host += ":443"
+		} else {
+			host += ":80"
 		}
-		assoc.mu.Unlock()
 	}
-	udpAssocsMu.Unlock()
-	data["udp_associations"] = udpInfo
 
-	return data
+	// SSRF check
+	if blockLocal {
+		h, _, _ := net.SplitHostPort(host)
+		if _, err := resolveAndCheck(h); err != nil {
+			http.Error(w, "WebSocket target bị chặn: "+err.Error(), http.StatusForbidden)
+			return
+		}
+	}
+
+	// Dial đích
+	var serverConn net.Conn
+	var err error
+	d := &net.Dialer{Timeout: 15 * time.Second}
+	if useTLS {
+		serverConn, err = tls.DialWithDialer(d, "tcp", host, &tls.Config{
+			ServerName: target.Hostname(),
+		})
+	} else {
+		serverConn, err = d.Dial("tcp", host)
+	}
+	if err != nil {
+		http.Error(w, "WS dial: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer serverConn.Close()
+
+	// Hijack connection từ client
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "Hijack unsupported", http.StatusInternalServerError)
+		return
+	}
+	clientConn, clientBuf, err := hj.Hijack()
+	if err != nil {
+		return
+	}
+	defer clientConn.Close()
+
+	// Gửi lại request upgrade tới đích (đã rewrite Host, path)
+	r2 := r.Clone(r.Context())
+	r2.URL.Scheme = ""
+	r2.URL.Host = ""
+	r2.Host = target.Host
+	r2.Header.Del("Proxy-Connection")
+	if err := r2.Write(serverConn); err != nil {
+		return
+	}
+
+	// Nếu có buffer dữ liệu client đã gửi trước khi hijack → flush
+	if clientBuf.Reader.Buffered() > 0 {
+		if _, err := io.CopyN(serverConn, clientBuf, int64(clientBuf.Reader.Buffered())); err != nil {
+			return
+		}
+	}
+
+	// Copy 2 chiều
+	done := make(chan struct{}, 2)
+	go func() {
+		io.Copy(serverConn, clientConn)
+		serverConn.Close()
+		done <- struct{}{}
+	}()
+	go func() {
+		io.Copy(clientConn, serverConn)
+		clientConn.Close()
+		done <- struct{}{}
+	}()
+	<-done
 }
 
-// ======================== STATS REPORTER ========================
-func (s *ProxyServer) statsReporter() {
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-	for range ticker.C {
-		stats.mu.Lock()
-		uptime := time.Since(stats.StartTime)
-		cur := stats.Current
-		up := stats.BytesUp
-		down := stats.BytesDown
-		udpUp := stats.UDPUp
-		udpDown := stats.UDPDown
-		stats.mu.Unlock()
-		activeConnsMu.Lock()
-		s5TCP := 0
-		s5UDP := 0
-		httpCount := 0
-		for ci := range activeConns {
-			switch ci.Type {
-			case "SOCKS5_TCP":
-				s5TCP++
-			case "SOCKS5_UDP":
-				s5UDP++
-			case "HTTP":
-				httpCount++
+func proxyHandler(w http.ResponseWriter, r *http.Request) {
+	rawTarget, ok := extractTarget(r)
+	if !ok || rawTarget == "" {
+		http.Error(w, "Thiếu URL", http.StatusBadRequest)
+		return
+	}
+	target, err := url.Parse(rawTarget)
+	if err != nil || target.Host == "" {
+		http.Error(w, "URL không hợp lệ", http.StatusBadRequest)
+		return
+	}
+	scheme := strings.ToLower(target.Scheme)
+	switch scheme {
+	case "http", "https":
+	case "ws", "wss":
+		if isWebSocketUpgrade(r) {
+			proxyWebSocket(w, r, target)
+			return
+		}
+		http.Error(w, "WS scheme nhưng không có Upgrade header", http.StatusBadRequest)
+		return
+	default:
+		http.Error(w, "Scheme không hỗ trợ: "+scheme, http.StatusBadRequest)
+		return
+	}
+
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, target.String(), r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	for k, vs := range r.Header {
+		lk := strings.ToLower(k)
+		switch lk {
+		case "host", "connection", "keep-alive", "proxy-connection",
+			"transfer-encoding", "upgrade", "te", "trailer",
+			"content-length",
+			"accept-encoding",
+			"cookie", "referer", "origin":
+			continue
+		}
+		for _, v := range vs {
+			req.Header.Add(k, v)
+		}
+	}
+
+	if ref := r.Header.Get("Referer"); ref != "" {
+		if ru, err := url.Parse(ref); err == nil {
+			rp := ru.EscapedPath()
+			if strings.HasPrefix(rp, "/p/") {
+				orig := decodeTargetURL(rp[3:])
+				if ru.RawQuery != "" {
+					orig += "?" + ru.RawQuery
+				}
+				req.Header.Set("Referer", orig)
 			}
 		}
-		activeConnsMu.Unlock()
-		udpAssocsMu.Lock()
-		udpAssoc := len(udpAssocs)
-		udpAssocsMu.Unlock()
-		log.Printf("[STATS] Active:%d TCP:%d UDP:%d HTTP:%d | UDP Assoc:%d | Up:%s Down:%s UDP Up:%s Down:%s | Uptime:%v",
-			cur, s5TCP, s5UDP, httpCount, udpAssoc,
-			formatBytes(up), formatBytes(down), formatBytes(udpUp), formatBytes(udpDown),
-			uptime.Round(time.Second))
 	}
+	if o := r.Header.Get("Origin"); o != "" {
+		if ou, err := url.Parse(o); err == nil && ou.Host == r.Host {
+			req.Header.Set("Origin", target.Scheme+"://"+target.Host)
+		}
+	}
+
+	if ua := req.Header.Get("User-Agent"); ua == "" || !strings.Contains(ua, "Chrome/") {
+		req.Header.Set("User-Agent", chromeUA)
+	}
+	if req.Header.Get("Sec-Ch-Ua") == "" {
+		req.Header.Set("Sec-Ch-Ua", `"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"`)
+		req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
+		req.Header.Set("Sec-Ch-Ua-Platform", `"Linux"`)
+	}
+	if req.Header.Get("Sec-Fetch-Site") == "" {
+		req.Header.Set("Sec-Fetch-Site", "same-origin")
+		req.Header.Set("Sec-Fetch-Mode", "navigate")
+		req.Header.Set("Sec-Fetch-Dest", "document")
+		req.Header.Set("Sec-Fetch-User", "?1")
+	}
+	if req.Header.Get("Upgrade-Insecure-Requests") == "" {
+		req.Header.Set("Upgrade-Insecure-Requests", "1")
+	}
+	if req.Header.Get("Accept-Language") == "" {
+		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	}
+
+	resp, err := proxyClient.Do(req)
+	if err != nil {
+		http.Error(w, "Không kết nối được: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Redirect: rewrite Location
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		loc := resp.Header.Get("Location")
+		if loc != "" {
+			abs := loc
+			if lu, err := url.Parse(loc); err == nil {
+				abs = target.ResolveReference(lu).String()
+			}
+			w.Header().Set("Location", "/p/"+encodeTargetURL(abs))
+		}
+		w.WriteHeader(resp.StatusCode)
+		return
+	}
+
+	// Rewrite Refresh header
+	if ref := resp.Header.Get("Refresh"); ref != "" {
+		newRef := urlInRefreshRe.ReplaceAllStringFunc(ref, func(u string) string {
+			sm := urlInRefreshRe.FindStringSubmatch(u)
+			if len(sm) < 3 {
+				return u
+			}
+			return sm[1] + toProxy(sm[2], target)
+		})
+		resp.Header.Set("Refresh", newRef)
+	}
+
+	for k, vs := range resp.Header {
+		lk := strings.ToLower(k)
+		switch lk {
+		case "content-security-policy", "content-security-policy-report-only",
+			"x-frame-options",
+			"content-encoding",
+			"content-length",
+			"transfer-encoding", "connection", "keep-alive",
+			"public-key-pins", "strict-transport-security",
+			"cross-origin-opener-policy", "cross-origin-embedder-policy",
+			"cross-origin-resource-policy", "content-type",
+			"set-cookie", "location":
+			continue
+		}
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	isHTML := strings.Contains(ct, "text/html") || strings.Contains(ct, "application/xhtml")
+	isCSS := strings.Contains(ct, "text/css")
+	isJS := strings.Contains(ct, "javascript") || strings.Contains(ct, "ecmascript")
+
+	if isHTML {
+		body, rerr := io.ReadAll(io.LimitReader(resp.Body, 20*1024*1024))
+		if rerr != nil {
+			http.Error(w, rerr.Error(), http.StatusBadGateway)
+			return
+		}
+		body = rewriteHTML(body, target)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(resp.StatusCode)
+		w.Write(body)
+		return
+	}
+	if isCSS {
+		body, rerr := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
+		if rerr != nil {
+			http.Error(w, rerr.Error(), http.StatusBadGateway)
+			return
+		}
+		body = rewriteCSS(body, target)
+		w.Header().Set("Content-Type", "text/css; charset=utf-8")
+		w.WriteHeader(resp.StatusCode)
+		w.Write(body)
+		return
+	}
+	// JS: không rewrite (không thể parse an toàn) — để JS shim + Referer fallback lo.
+	_ = isJS
+
+	if ct == "" {
+		w.Header().Set("Content-Type", "application/octet-stream")
+	} else {
+		w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+	}
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
 }
 
-func formatBytes(b int64) string {
-	const unit = 1024
-	if b < unit {
-		return fmt.Sprintf("%d B", b)
-	}
-	div, exp := int64(unit), 0
-	for n := b / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
-}
-
-// ======================== MAIN ========================
+// ==================== MAIN ====================
 func main() {
 	flag.StringVar(&listenAddr, "l", "0.0.0.0", "Bind address")
-	flag.IntVar(&port, "p", 1080, "Port to listen on")
-	flag.StringVar(&username, "u", "", "Username for auth")
-	flag.StringVar(&pwd, "P", "", "Password for auth")
-	flag.BoolVar(&forceKill, "force-kill", false, "Kill port before start")
-	flag.BoolVar(&noUDP, "no-udp", false, "Disable UDP ASSOCIATE")
-	flag.StringVar(&upstreamStr, "upstream", "", "Comma-separated upstream proxies (host:port)")
-	flag.StringVar(&certFile, "cert", "", "TLS certificate file")
-	flag.StringVar(&keyFile, "key", "", "TLS private key file")
-	flag.IntVar(&dashboardPort, "dashboard-port", 8081, "Dashboard port")
+	flag.IntVar(&port, "p", 8080, "Port")
+	flag.BoolVar(&blockLocal, "block-local", true, "Chặn fetch vào IP nội bộ (SSRF guard)")
 	flag.Parse()
 
-	if forceKill {
-		// (optional) kill process using port on Linux
-	}
+	addr := net.JoinHostPort(listenAddr, strconv.Itoa(port))
+	log.Printf("[INFO] Web Proxy: http://%s", addr)
 
-	if upstreamStr != "" {
-		for _, item := range strings.Split(upstreamStr, ",") {
-			item = strings.TrimSpace(item)
-			if item != "" {
-				upstreamProxies = append(upstreamProxies, item)
-			}
-		}
+	// KHÔNG dùng http.ServeMux — nó gọi path.Clean() gộp "//" → hỏng URL đích.
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           http.HandlerFunc(rootHandler),
+		ReadHeaderTimeout: 10 * time.Second,
 	}
-
-	addr := fmt.Sprintf("%s:%d", listenAddr, port)
-	server, err := NewProxyServer(addr, username, pwd, !noUDP, upstreamProxies, certFile, keyFile)
-	if err != nil {
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatalf("[FATAL] %v", err)
 	}
-	if certFile != "" && keyFile != "" {
-		log.Println("[WARN] TLS support not fully implemented in this version")
-	}
-
-	log.Printf("[INFO] Proxy started on %s", addr)
-	log.Printf("[INFO] Upstreams: %v", upstreamProxies)
-	server.Run()
 }
