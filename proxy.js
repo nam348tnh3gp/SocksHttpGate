@@ -1,16 +1,29 @@
 #!/usr/bin/env node
 'use strict';
+// =============================================================================
+//  PROXY PRO — merged master + worker (Node cluster, 1 file)
+//  - Master:  dashboard, config/usage file I/O, aggregation, IPC hub.
+//  - Worker:  SOCKS5/HTTP proxy, share port via cluster handle.
+//  - Chạy:    node cluster.js -p 1080 -dashboard-port 8081
+//             WORKERS=4 node cluster.js ...   (mặc định = CPU-1, tối thiểu 2)
+// =============================================================================
 
-const net = require('net');
-const tls = require('tls');
-const dgram = require('dgram');
-const http = require('http');
-const fs = require('fs');
-const crypto = require('crypto');
-const dns = require('dns');
+const cluster = require('cluster');
+const os      = require('os');
+const net     = require('net');
+const tls     = require('tls');
+const dgram   = require('dgram');
+const http    = require('http');
+const fs      = require('fs');
+const crypto  = require('crypto');
+const dns     = require('dns');
 const { URL } = require('url');
 
-// ======================== CẤU HÌNH ========================
+const ROLE      = cluster.isPrimary ? 'MASTER' : 'WORKER';
+const IS_MASTER = cluster.isPrimary;
+const IS_WORKER = cluster.isWorker;
+
+// ======================== CẤU HÌNH CHUNG ========================
 const MAX_CONNECTIONS = 4000;
 const CONNECTION_TIMEOUT = 25_000;
 const IDLE_TIMEOUT = 180_000;
@@ -33,6 +46,7 @@ const PW_CACHE_TTL = 5 * 60 * 1000;
 const UPSTREAM_HEALTH_CHECK_INTERVAL_MS = 15_000;
 const UPSTREAM_HEALTH_CHECK_TIMEOUT_MS = 3_000;
 const STATS_INTERVAL_MS = 2000;
+const USAGE_BROADCAST_INTERVAL_MS = 5000;
 
 // ======================== CLI ========================
 const argv = process.argv.slice(2);
@@ -73,9 +87,10 @@ const cfgFlags = {
 // ======================== LOG ========================
 const _err = console.error.bind(console);
 function log(...a) {
-  const line = `[${new Date().toISOString()}] ` + a.map(x => typeof x === 'string' ? x : (x instanceof Error ? x.message : String(x))).join(' ') + '\n';
+  const line = `[${new Date().toISOString()}] [${ROLE}] ` + a.map(x => typeof x === 'string' ? x : (x instanceof Error ? x.message : String(x))).join(' ') + '\n';
   try { process.stdout.write(line); } catch {}
-  if (logRotator) { try { logRotator.write(Buffer.from(line)); } catch {} }
+  // Chỉ master ghi ra log file để tránh race rotate giữa các worker.
+  if (IS_MASTER && logRotator) { try { logRotator.write(Buffer.from(line)); } catch {} }
 }
 
 class RotatingWriter {
@@ -103,7 +118,7 @@ class RotatingWriter {
 
 let logRotator = null;
 function setupLogFile() {
-  if (!cfgFlags.logFilePath) return;
+  if (!IS_MASTER || !cfgFlags.logFilePath) return;
   try {
     logRotator = new RotatingWriter(cfgFlags.logFilePath, cfgFlags.logMaxSizeMB, cfgFlags.logMaxBackups);
     log(`[INFO] Logging ra file ${cfgFlags.logFilePath} (max ${cfgFlags.logMaxSizeMB}MB, giữ ${cfgFlags.logMaxBackups} bản cũ)`);
@@ -119,10 +134,10 @@ class BufReader {
     this.err = null;
     this.pending = [];
     this._onData = (c) => { this.buf = Buffer.concat([this.buf, c]); this._pump(); };
-    this._onEnd = () => { this.eof = true; this._pump(); };
-    this._onErr = (e) => { this.err = e; this._pump(); };
+    this._onEnd  = () => { this.eof = true; this._pump(); };
+    this._onErr  = (e) => { this.err = e; this._pump(); };
     socket.on('data', this._onData);
-    socket.on('end', this._onEnd);
+    socket.on('end',  this._onEnd);
     socket.on('error', this._onErr);
   }
   readN(n) {
@@ -142,7 +157,6 @@ class BufReader {
       this._pump();
     });
   }
-  // ★ Đặt lại byte vừa đọc trở về đầu buffer (giống io.MultiReader trong Go).
   unread(chunk) {
     if (!chunk || !chunk.length) return;
     this.buf = Buffer.concat([chunk, this.buf]);
@@ -236,16 +250,8 @@ function subtleCompare(a, b) {
   if (ba.length !== bb.length) return false;
   try { return crypto.timingSafeEqual(ba, bb); } catch { return false; }
 }
-function checkAPIToken(token) {
-  if (!token) return [null, false];
-  const h = hashAPIToken(token);
-  for (const t of (appConfig.APITokens || [])) {
-    if (subtleCompare(t.token_hash || '', h)) return [t.name, true];
-  }
-  return [null, false];
-}
 
-// ======================== SSRF ========================
+// ======================== SSRF / CIDR ========================
 function ipv4ToInt(ip) {
   const p = ip.split('.').map(Number);
   if (p.length !== 4 || p.some(x => isNaN(x) || x < 0 || x > 255)) return null;
@@ -323,36 +329,84 @@ async function dialChecked(host, portNum) {
   }
   throw lastErr || new Error('dial failed');
 }
+function parseCIDRSliceValidated(items) {
+  const valid = [], invalid = [];
+  for (let item of (items || [])) {
+    item = String(item || '').trim();
+    if (!item) continue;
+    const orig = item;
+    if (!item.includes('/')) item += item.includes(':') ? '/128' : '/32';
+    const obj = cidrToObj(item);
+    if (!obj) { log(`[WARN] CIDR không hợp lệ, bỏ qua: ${orig}`); invalid.push(orig); continue; }
+    valid.push(obj);
+  }
+  return [valid, invalid];
+}
+function parseCIDRSlice(items) { return parseCIDRSliceValidated(items)[0]; }
 
-// ======================== GLOBAL STATE ========================
+// ======================== FORMAT ========================
+function formatBytes(b) {
+  if (b === undefined || b === null) return '0 B';
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let u = 0;
+  while (b >= 1024 && u < units.length - 1) { b /= 1024; u++; }
+  return b.toFixed(1) + ' ' + units[u];
+}
+function currentPeriod() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+
+// =============================================================================
+//  STATE CHUNG (được khởi tạo ở cả 2 role, nhưng chỉ dùng ở role tương ứng)
+// =============================================================================
+let appConfig = {
+  DashboardUser: '', DashboardPasswordHash: '',
+  Users: [], AllowList: [], DenyList: [], UpstreamProxies: [],
+  APITokens: [], RequireProxyAuth: false,
+};
+
+// ---------------------------------------------------------------------------
+//  STATE WORKER-ONLY
+// ---------------------------------------------------------------------------
 const activeConns = new Map();
 const udpAssocs = new Map();
 let upstreamProxies = [];
 let upstreamIndex = 0;
-let dashboardUser = 'admin';
-let dashboardPassHash = '';
-let appConfig = { DashboardUser: '', DashboardPasswordHash: '', Users: [], AllowList: [], DenyList: [], UpstreamProxies: [], APITokens: [], RequireProxyAuth: false };
+const upstreamHealth = new Map();
 let allowedCIDRs = [];
 let deniedCIDRs = [];
-let shuttingDown = false;
-
 const stats = {
   StartTime: Date.now(),
   Total: 0, Current: 0, Socks5TCP: 0, Socks5UDP: 0, HTTP: 0, AuthFail: 0,
   BytesUp: 0, BytesDown: 0, UDPUp: 0, UDPDown: 0,
 };
-
 const failCounts = new Map(), failLastFail = new Map(), blockedUntil = new Map();
-const usage = new Map();
-const statHistory = [];
-const sseClients = new Set();
+const localUsageDeltas = new Map();         // username -> bytes từ lần push cuối
+let usageSnapshot = new Map();              // bản sao usage từ master
+let connIdCounter = 0;
+function nextConnID() { return 'w' + process.pid + '_c' + (++connIdCounter); }
+
+// ---------------------------------------------------------------------------
+//  STATE MASTER-ONLY
+// ---------------------------------------------------------------------------
+let dashboardUser = 'admin';
+let dashboardPassHash = '';
+const workerStatsMap = new Map();           // workerId -> stats payload
+const connIdToWorker = new Map();           // connId   -> workerId
+const usage = new Map();                    // username -> {Period, BytesUsed}
 const auditLog = [];
 const reloadHistory = [];
+const statHistory = [];
+const sseClients = new Set();
+const masterStartTime = Date.now();
+let shuttingDown = false;
+let dashboardServer = null;
+let initDashPassGenerated = '';
 
-let connIdCounter = 0;
-function nextConnID() { return 'c' + (++connIdCounter); }
-
-// ======================== AUTH FAIL / IP LISTS ========================
+// =============================================================================
+//  WORKER: AUTH FAIL / IP ALLOW-DENY / QUOTA / BANDWIDTH
+// =============================================================================
 function recordAuthFail(ip, threshold) {
   const now = Date.now();
   const last = failLastFail.get(ip);
@@ -380,22 +434,7 @@ function isIPAllowed(ip) {
   for (const a of allowedCIDRs) if (ipInCidr(ip, a)) return true;
   return false;
 }
-function parseCIDRSliceValidated(items) {
-  const valid = [], invalid = [];
-  for (let item of (items || [])) {
-    item = String(item || '').trim();
-    if (!item) continue;
-    const orig = item;
-    if (!item.includes('/')) item += item.includes(':') ? '/128' : '/32';
-    const obj = cidrToObj(item);
-    if (!obj) { log(`[WARN] CIDR không hợp lệ, bỏ qua: ${orig}`); invalid.push(orig); continue; }
-    valid.push(obj);
-  }
-  return [valid, invalid];
-}
-function parseCIDRSlice(items) { return parseCIDRSliceValidated(items)[0]; }
 
-// ======================== USER CONFIG / QUOTA ========================
 function getUserConfig(username) {
   if (!username) return null;
   for (const u of (appConfig.Users || [])) if (u.username === username) return u;
@@ -407,39 +446,14 @@ function countActiveConnsForUser(username) {
   for (const ci of activeConns.values()) if (ci.Username === username) n++;
   return n;
 }
-function currentPeriod() {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-}
-function loadUsage(path) {
-  try {
-    const data = JSON.parse(fs.readFileSync(path, 'utf8'));
-    if (data && typeof data === 'object') for (const k of Object.keys(data)) usage.set(k, data[k]);
-  } catch {}
-}
-function saveUsage(path) {
-  if (!path) return;
-  const obj = {};
-  for (const [k, v] of usage) obj[k] = v;
-  const tmp = path + '.tmp';
-  try { fs.writeFileSync(tmp, JSON.stringify(obj, null, 2)); fs.renameSync(tmp, path); }
-  catch (e) { log(`[WARN] Không lưu được usage file ${path}: ${e.message}`); try { fs.unlinkSync(tmp); } catch {} }
-}
-function addUsage(username, bytes) {
-  if (!username || bytes <= 0) return;
-  const period = currentPeriod();
-  let rec = usage.get(username);
-  if (!rec || rec.Period !== period) { rec = { Period: period, BytesUsed: 0 }; usage.set(username, rec); }
-  rec.BytesUsed += bytes;
-}
-function getUsage(username) {
-  const rec = usage.get(username);
+function getUsageLocal(username) {
+  const rec = usageSnapshot.get(username);
   if (!rec || rec.Period !== currentPeriod()) return 0;
   return rec.BytesUsed;
 }
 function isOverQuota(username, quotaBytes) {
   if (!quotaBytes || quotaBytes <= 0) return false;
-  return getUsage(username) >= quotaBytes;
+  return getUsageLocal(username) >= quotaBytes;
 }
 function checkUserLimits(username) {
   if (!username) return [true, ''];
@@ -451,8 +465,10 @@ function checkUserLimits(username) {
   if (isOverQuota(username, cfg.quota_bytes_per_month)) return [false, 'đã vượt quota dung lượng tháng này'];
   return [true, ''];
 }
-
-// ======================== BANDWIDTH RAMP ========================
+function addUsageLocal(username, bytes) {
+  if (!username || bytes <= 0) return;
+  localUsageDeltas.set(username, (localUsageDeltas.get(username) || 0) + bytes);
+}
 function applyLiveBandwidthLimit(username, newLimitBps) {
   if (!username) return;
   const targets = [];
@@ -473,86 +489,21 @@ function rampBandwidthLimit(ci, from, to) {
     }
   })();
 }
-
-// ======================== CONFIG FILE ========================
-function loadOrInitConfig(path, fbUser, fbPass) {
-  let data;
-  try { data = fs.readFileSync(path, 'utf8'); }
-  catch (e) {
-    if (e.code !== 'ENOENT') throw e;
-    const hash = hashPassword(fbPass);
-    const cfg = { DashboardUser: fbUser, DashboardPasswordHash: hash };
-    try { saveConfig(path, cfg); log(`[INFO] Đã tạo config file mới tại ${path}`); }
-    catch (werr) { log(`[WARN] Không ghi được config file ${path}: ${werr.message}`); }
-    return [cfg, true];
+function enforceQuotaOnActiveConns() {
+  const seen = new Set();
+  for (const ci of activeConns.values()) if (ci.Username) seen.add(ci.Username);
+  const toKick = [];
+  for (const username of seen) {
+    const cfg = getUserConfig(username);
+    if (!cfg || !cfg.quota_bytes_per_month) continue;
+    if (!isOverQuota(username, cfg.quota_bytes_per_month)) continue;
+    for (const ci of activeConns.values()) if (ci.Username === username) toKick.push(ci);
   }
-  let cfg;
-  try { cfg = JSON.parse(data); }
-  catch (e) { throw new Error(`config file ${path} bị lỗi định dạng JSON: ${e.message}`); }
-  if (!cfg.DashboardUser || !cfg.DashboardPasswordHash) throw new Error(`config file ${path} thiếu dashboard_user/dashboard_password_hash`);
-  return [cfg, false];
-}
-function saveConfig(path, cfg) {
-  const data = JSON.stringify(cfg, null, 2);
-  const tmp = path + '.tmp';
-  fs.writeFileSync(tmp, data, { mode: 0o600 });
-  fs.renameSync(tmp, path);
+  for (const ci of toKick) { if (ci.Conn) try { ci.Conn.destroy(); } catch {} }
+  if (toKick.length) log(`[WARN] Đã ngắt ${toKick.length} connection do user vượt quota dung lượng tháng`);
 }
 
-// ======================== AUDIT / RELOAD ========================
-function recordAudit(actor, action, details) {
-  auditLog.push({ t: Math.floor(Date.now() / 1000), actor, action, details: details || '' });
-  while (auditLog.length > AUDIT_LOG_MAX) auditLog.shift();
-}
-function actorFromRequest(req) { return req.headers['x-actor'] || 'unknown'; }
-function recordReloadEvent(ev) {
-  reloadHistory.push(ev);
-  while (reloadHistory.length > RELOAD_HISTORY_MAX) reloadHistory.shift();
-}
-
-function reloadConfig(source) {
-  let data;
-  try { data = fs.readFileSync(cfgFlags.configPath, 'utf8'); }
-  catch (e) {
-    const ev = { t: Math.floor(Date.now() / 1000), source, success: false, error: `không đọc được config file: ${e.message}` };
-    recordReloadEvent(ev); return new Error(ev.error);
-  }
-  let cfg;
-  try { cfg = JSON.parse(data); }
-  catch (e) {
-    const ev = { t: Math.floor(Date.now() / 1000), source, success: false, error: `config file lỗi định dạng JSON: ${e.message}` };
-    recordReloadEvent(ev); return new Error(ev.error);
-  }
-  if (!cfg.DashboardUser || !cfg.DashboardPasswordHash) {
-    const ev = { t: Math.floor(Date.now() / 1000), source, success: false, error: 'config file thiếu dashboard_user/dashboard_password_hash' };
-    recordReloadEvent(ev); return new Error(ev.error);
-  }
-  const [newAllow, invalidAllow] = parseCIDRSliceValidated(cfg.AllowList);
-  const [newDeny, invalidDeny] = parseCIDRSliceValidated(cfg.DenyList);
-  const invalidCIDRs = [...invalidAllow, ...invalidDeny];
-
-  allowedCIDRs = newAllow;
-  deniedCIDRs = newDeny;
-  upstreamProxies = (cfg.UpstreamProxies || []).slice();
-  if (upstreamProxies.length === 0 || upstreamIndex >= upstreamProxies.length) upstreamIndex = 0;
-  dashboardUser = cfg.DashboardUser;
-  dashboardPassHash = cfg.DashboardPasswordHash;
-  appConfig = cfg;
-
-  for (const u of (cfg.Users || [])) applyLiveBandwidthLimit(u.username, u.max_bandwidth_bps);
-
-  log(`[INFO] Đã reload config (nguồn: ${source}): ${newAllow.length} IP whitelist, ${newDeny.length} IP blacklist, ${upstreamProxies.length} upstream, ${(cfg.Users || []).length} proxy user${invalidCIDRs.length ? ` (CẢNH BÁO: ${invalidCIDRs.length} CIDR không hợp lệ bị bỏ qua)` : ''}`);
-  recordReloadEvent({
-    t: Math.floor(Date.now() / 1000), source, success: true,
-    allow_count: newAllow.length, deny_count: newDeny.length,
-    upstream_count: upstreamProxies.length, user_count: (cfg.Users || []).length,
-    invalid_cidrs: invalidCIDRs,
-  });
-  return null;
-}
-
-// ======================== UPSTREAM HEALTH ========================
-const upstreamHealth = new Map();
+// ======================== UPSTREAM HEALTH (worker) ========================
 function isUpstreamAlive(addr) { const v = upstreamHealth.get(addr); return v === undefined ? true : v; }
 function setUpstreamHealth(addr, alive) {
   const prev = upstreamHealth.get(addr);
@@ -569,13 +520,11 @@ function upstreamHealthChecker() {
       const [h, p] = addr.split(':');
       const s = net.createConnection({ host: h, port: parseInt(p, 10), timeout: UPSTREAM_HEALTH_CHECK_TIMEOUT_MS });
       s.once('connect', () => { s.destroy(); setUpstreamHealth(addr, true); });
-      s.once('error', () => { s.destroy(); setUpstreamHealth(addr, false); });
+      s.once('error',   () => { s.destroy(); setUpstreamHealth(addr, false); });
       s.once('timeout', () => { s.destroy(); setUpstreamHealth(addr, false); });
     }
   }, UPSTREAM_HEALTH_CHECK_INTERVAL_MS);
 }
-
-// ======================== CONNECT TARGET ========================
 async function connectTarget(host, portNum) {
   const ups = upstreamProxies.slice();
   if (ups.length > 0) {
@@ -599,7 +548,7 @@ async function connectTarget(host, portNum) {
   return dialChecked(host, portNum);
 }
 
-// ======================== AUTH ========================
+// ======================== AUTH (worker) ========================
 function authenticateProxyUser(user, pass) {
   if (cfgFlags.username && user === cfgFlags.username && pass === cfgFlags.password) return [true, 0, user];
   for (const u of (appConfig.Users || [])) {
@@ -670,7 +619,6 @@ async function readSOCKSAddr(atyp, reader) {
   } catch {}
   return [null, 0];
 }
-
 async function handleSOCKS5(socket, reader, remoteIP) {
   let buf;
   try { buf = await reader.readN(2); } catch { return socket.destroy(); }
@@ -718,7 +666,6 @@ async function handleSOCKS5(socket, reader, remoteIP) {
       return socket.destroy();
     }
   }
-
   let req;
   try { req = await reader.readN(4); } catch { return socket.destroy(); }
   if (req[0] !== 0x05) return socket.destroy();
@@ -796,8 +743,6 @@ async function handleSOCKS5(socket, reader, remoteIP) {
     reader.detach();
     udpRelay(assoc);
 
-    // Giữ handleSOCKS5 cho tới khi TCP control connection đóng. Nếu return sớm,
-    // khối finally trong handleConn sẽ destroy socket và giết association.
     await new Promise((resolve) => {
       let finished = false;
       const finish = () => {
@@ -879,7 +824,7 @@ function udpClientToRemote(assoc, pkt) {
     assoc.DestMap.set(`${ip}:${portNum}`, Date.now());
     try { assoc.RelayConn.send(payload, portNum, ip); } catch { return; }
     stats.UDPUp += payload.length;
-    addUsage(assoc.Username, payload.length);
+    addUsageLocal(assoc.Username, payload.length);
   })();
 }
 function udpRemoteToClient(assoc, from, data) {
@@ -894,7 +839,7 @@ function udpRemoteToClient(assoc, from, data) {
   const full = Buffer.concat([header, data]);
   try { assoc.RelayConn.send(full, assoc.ClientAddr.port, assoc.ClientAddr.ip); } catch { return; }
   stats.UDPDown += data.length;
-  addUsage(assoc.Username, data.length);
+  addUsageLocal(assoc.Username, data.length);
 }
 
 // ======================== HTTP PROXY ========================
@@ -940,7 +885,6 @@ async function handleHTTP(socket, reader, remoteIP) {
       return socket.destroy();
     }
   }
-
   const badRequest = () => { try { socket.write('HTTP/1.1 400 Bad Request\r\n\r\n'); } catch {} socket.destroy(); };
 
   let host = '', portNum = 0, parsedURL = null;
@@ -1037,7 +981,7 @@ async function forwardHTTP(reader, method, parsedURL, headers, remote, client, c
         client.once('drain', () => remote.resume());
       }
     });
-    remote.on('end', () => { try { client.end(); } catch {} resolve(); });
+    remote.on('end',   () => { try { client.end(); } catch {} resolve(); });
     remote.on('error', () => { try { client.destroy(); } catch {} resolve(); });
     client.on('error', () => { remote.destroy(); resolve(); });
   });
@@ -1109,7 +1053,7 @@ async function tunnel(client, remote, ci, initialBuf) {
           dst.once('drain', () => src.resume());
         }
       });
-      src.once('end', () => { try { dst.end(); } catch {} onEnd(); });
+      src.once('end',   () => { try { dst.end(); } catch {} onEnd(); });
       src.once('error', () => { try { dst.destroy(); } catch {} onEnd(); });
       src.once('close', () => { try { dst.destroy(); } catch {} });
       dst.once('error', () => { try { src.destroy(); } catch {} onEnd(); });
@@ -1119,8 +1063,6 @@ async function tunnel(client, remote, ci, initialBuf) {
     setup(remote, client, 'BytesDown', finish);
   });
 }
-
-// ======================== FLUSH CONN STATS ========================
 function flushConnStats(ci) {
   const up = ci.BytesUp, down = ci.BytesDown;
   const dUp = up - (ci.flushedUp || 0);
@@ -1129,62 +1071,429 @@ function flushConnStats(ci) {
   if (dUp <= 0 && dDown <= 0) return;
   stats.BytesUp += dUp;
   stats.BytesDown += dDown;
-  addUsage(ci.Username, dUp + dDown);
+  addUsageLocal(ci.Username, dUp + dDown);
 }
 
-// ======================== STATS REPORTER / SSE ========================
-function broadcastSample(sample) {
-  for (const ch of sseClients) ch.push(sample);
+// ======================== WORKER PROXY LISTENER ========================
+let proxyListener = null;
+async function handleConn(socket) {
+  socket.on('error', () => {});
+  stats.Current++;
+  stats.Total++;
+  if (stats.Current > MAX_CONNECTIONS) { socket.destroy(); stats.Current--; return; }
+  const remoteIP = (socket.remoteAddress || '').replace(/^::ffff:/, '');
+
+  if (remoteIP && !isIPAllowed(remoteIP)) {
+    log(`[WARN] IP ${remoteIP} bị từ chối bởi whitelist/blacklist`);
+    socket.destroy(); stats.Current--; return;
+  }
+  if (remoteIP && isAuthBlocked(remoteIP)) {
+    log(`[WARN] IP ${remoteIP} đang bị chặn do auth fail quá nhiều lần`);
+    socket.destroy(); stats.Current--; return;
+  }
+  socket.setTimeout(HANDSHAKE_TIMEOUT, () => { try { socket.destroy(); } catch {} });
+  const reader = new BufReader(socket);
+  let first;
+  try { first = await reader.readN(1); } catch { socket.destroy(); stats.Current--; return; }
+  const b = first[0];
+  reader.unread(first);
+
+  try {
+    if (b === 0x05) await handleSOCKS5(socket, reader, remoteIP);
+    else if ('CGPDHOT'.includes(String.fromCharCode(b))) await handleHTTP(socket, reader, remoteIP);
+    else { log(`[WARN] Unknown protocol from ${socket.remoteAddress} (first byte 0x${b.toString(16)})`); socket.destroy(); }
+  } catch (e) {
+    log(`[ERROR] handleConn: ${e.message}`);
+    try { socket.destroy(); } catch {}
+  } finally {
+    stats.Current--;
+    try { socket.destroy(); } catch {}
+  }
 }
-let statsReporterRunning = false;
-function statsReporter() {
-  if (statsReporterRunning) return;
-  statsReporterRunning = true;
-  let lastUp = 0, lastDown = 0, first = true, tick = 0;
+async function runProxyServer() {
+  let tlsOpts = null;
+  if (cfgFlags.certFile && cfgFlags.keyFile) {
+    try {
+      tlsOpts = { cert: fs.readFileSync(cfgFlags.certFile), key: fs.readFileSync(cfgFlags.keyFile), minVersion: 'TLSv1.2' };
+    } catch (e) { throw new Error(`không load được TLS cert/key: ${e.message}`); }
+  }
+  proxyListener = tlsOpts
+    ? tls.createServer(tlsOpts, (s) => handleConn(s))
+    : net.createServer((s) => handleConn(s));
+
+  // Trong cluster worker, Node tự động share handle giữa master & các worker khác.
+  await new Promise((resolve, reject) => {
+    proxyListener.once('error', reject);
+    proxyListener.listen(cfgFlags.port, cfgFlags.listenAddr, () => {
+      proxyListener.removeListener('error', reject);
+      resolve();
+    });
+  });
+  if (tlsOpts) log('[INFO] TLS đã bật cho listener chính');
+  log(`[INFO] Proxy started on ${cfgFlags.listenAddr}:${cfgFlags.port} (pid=${process.pid}, cluster-shared)`);
+  proxyListener.on('error', (e) => log(`[ERROR] Listener: ${e.message}`));
+}
+
+// ======================== WORKER: REPORTER ========================
+function workerStatsReporter() {
+  let tick = 0;
   setInterval(() => {
     tick++;
     for (const ci of activeConns.values()) flushConnStats(ci);
-    let s5TCP = 0, s5UDP = 0, httpCount = 0;
+
+    const conns = [];
     for (const ci of activeConns.values()) {
-      if (ci.Type === 'SOCKS5_TCP') s5TCP++;
-      else if (ci.Type === 'SOCKS5_UDP') s5UDP++;
-      else if (ci.Type === 'HTTP') httpCount++;
+      conns.push({
+        id: ci.ID, ip: ci.IP, port: ci.Port, type: ci.Type, target: ci.Target,
+        start_time: Math.floor(ci.StartTime / 1000),
+        bytes_up: ci.BytesUp, bytes_down: ci.BytesDown,
+        duration: (Date.now() - ci.StartTime) / 1000,
+      });
     }
-    const udpAssoc = udpAssocs.size;
-    const up = stats.BytesUp, down = stats.BytesDown;
-    log(`[STATS] Active:${stats.Current} TCP:${s5TCP} UDP:${s5UDP} HTTP:${httpCount} | UDP Assoc:${udpAssoc} | Up:${formatBytes(up)} Down:${formatBytes(down)} | Uptime:${((Date.now() - stats.StartTime) / 1000).toFixed(0)}s`);
+    const udpInfo = {};
+    for (const [k, a] of udpAssocs) {
+      try {
+        udpInfo[k] = {
+          client_addr: `${a.ClientAddr.ip}:${a.ClientAddr.port}`,
+          relay_port: a.RelayConn.address().port,
+          active: a.Active,
+          last_activity: Math.floor(a.LastActivity / 1000),
+          dest_count: a.DestMap.size,
+        };
+      } catch {}
+    }
+    const upstreamStatus = [];
+    for (const p of upstreamProxies) upstreamStatus.push({ addr: p, alive: isUpstreamAlive(p) });
+
+    if (process.send) {
+      try {
+        process.send({
+          type: 'stats',
+          payload: {
+            total: stats.Total, current: stats.Current,
+            s5tcp: stats.Socks5TCP, s5udp: stats.Socks5UDP, http: stats.HTTP,
+            authFail: stats.AuthFail,
+            bytesUp: stats.BytesUp, bytesDown: stats.BytesDown,
+            udpUp: stats.UDPUp, udpDown: stats.UDPDown,
+            udpAssocs: udpAssocs.size,
+            activeConns: conns,
+            udpAssocsDetail: udpInfo,
+            upstreamStatus,
+            uptimeSec: (Date.now() - stats.StartTime) / 1000,
+          },
+        });
+      } catch {}
+    }
+    // Đẩy usage delta
+    if (localUsageDeltas.size && process.send) {
+      try {
+        process.send({ type: 'usage_delta', deltas: Object.fromEntries(localUsageDeltas) });
+        localUsageDeltas.clear();
+      } catch {}
+    }
+
+    if (tick % 5 === 0) enforceQuotaOnActiveConns();
+  }, STATS_INTERVAL_MS);
+}
+
+// =============================================================================
+//  MASTER: CONFIG / USAGE FILE I/O
+// =============================================================================
+function loadOrInitConfig(path, fbUser, fbPass) {
+  let data;
+  try { data = fs.readFileSync(path, 'utf8'); }
+  catch (e) {
+    if (e.code !== 'ENOENT') throw e;
+    const hash = hashPassword(fbPass);
+    const cfg = { DashboardUser: fbUser, DashboardPasswordHash: hash };
+    try { saveConfig(path, cfg); log(`[INFO] Đã tạo config file mới tại ${path}`); }
+    catch (werr) { log(`[WARN] Không ghi được config file ${path}: ${werr.message}`); }
+    return [cfg, true];
+  }
+  let cfg;
+  try { cfg = JSON.parse(data); }
+  catch (e) { throw new Error(`config file ${path} bị lỗi định dạng JSON: ${e.message}`); }
+  if (!cfg.DashboardUser || !cfg.DashboardPasswordHash) throw new Error(`config file ${path} thiếu DashboardUser/DashboardPasswordHash`);
+  return [cfg, false];
+}
+function saveConfig(path, cfg) {
+  const data = JSON.stringify(cfg, null, 2);
+  const tmp = path + '.tmp';
+  fs.writeFileSync(tmp, data, { mode: 0o600 });
+  fs.renameSync(tmp, path);
+}
+function loadUsage(path) {
+  try {
+    const data = JSON.parse(fs.readFileSync(path, 'utf8'));
+    if (data && typeof data === 'object') for (const k of Object.keys(data)) usage.set(k, data[k]);
+  } catch {}
+}
+function saveUsage(path) {
+  if (!path) return;
+  const obj = {};
+  for (const [k, v] of usage) obj[k] = v;
+  const tmp = path + '.tmp';
+  try { fs.writeFileSync(tmp, JSON.stringify(obj, null, 2)); fs.renameSync(tmp, path); }
+  catch (e) { log(`[WARN] Không lưu được usage file ${path}: ${e.message}`); try { fs.unlinkSync(tmp); } catch {} }
+}
+
+// =============================================================================
+//  MASTER: AUDIT / RELOAD
+// =============================================================================
+function recordAudit(actor, action, details) {
+  auditLog.push({ t: Math.floor(Date.now() / 1000), actor, action, details: details || '' });
+  while (auditLog.length > AUDIT_LOG_MAX) auditLog.shift();
+}
+function actorFromRequest(req) { return req.headers['x-actor'] || 'unknown'; }
+function recordReloadEvent(ev) {
+  reloadHistory.push(ev);
+  while (reloadHistory.length > RELOAD_HISTORY_MAX) reloadHistory.shift();
+}
+
+/**
+ * Master đọc config từ disk, validate, cập nhật state của chính nó,
+ * rồi broadcast xuống tất cả workers.
+ */
+function reloadConfigMaster(source) {
+  let data;
+  try { data = fs.readFileSync(cfgFlags.configPath, 'utf8'); }
+  catch (e) {
+    const ev = { t: Math.floor(Date.now() / 1000), source, success: false, error: `không đọc được config file: ${e.message}` };
+    recordReloadEvent(ev); return new Error(ev.error);
+  }
+  let cfg;
+  try { cfg = JSON.parse(data); }
+  catch (e) {
+    const ev = { t: Math.floor(Date.now() / 1000), source, success: false, error: `config file lỗi định dạng JSON: ${e.message}` };
+    recordReloadEvent(ev); return new Error(ev.error);
+  }
+  if (!cfg.DashboardUser || !cfg.DashboardPasswordHash) {
+    const ev = { t: Math.floor(Date.now() / 1000), source, success: false, error: 'config file thiếu DashboardUser/DashboardPasswordHash' };
+    recordReloadEvent(ev); return new Error(ev.error);
+  }
+  const [newAllow, invalidAllow] = parseCIDRSliceValidated(cfg.AllowList);
+  const [newDeny, invalidDeny]   = parseCIDRSliceValidated(cfg.DenyList);
+  const invalidCIDRs = [...invalidAllow, ...invalidDeny];
+
+  appConfig = cfg;
+  dashboardUser = cfg.DashboardUser;
+  dashboardPassHash = cfg.DashboardPasswordHash;
+
+  broadcastConfig();
+  broadcastUsageSnapshot();
+
+  log(`[INFO] Đã reload config (nguồn: ${source}): ${newAllow.length} whitelist, ${newDeny.length} blacklist, ${(cfg.UpstreamProxies || []).length} upstream, ${(cfg.Users || []).length} proxy user${invalidCIDRs.length ? ` (CẢNH BÁO: ${invalidCIDRs.length} CIDR không hợp lệ bị bỏ qua)` : ''}`);
+  recordReloadEvent({
+    t: Math.floor(Date.now() / 1000), source, success: true,
+    allow_count: newAllow.length, deny_count: newDeny.length,
+    upstream_count: (cfg.UpstreamProxies || []).length, user_count: (cfg.Users || []).length,
+    invalid_cidrs: invalidCIDRs,
+  });
+  return null;
+}
+
+// =============================================================================
+//  MASTER: IPC
+// =============================================================================
+const workersPendingInit = new Set();
+
+function broadcastConfig() {
+  for (const id of Object.keys(cluster.workers)) {
+    const w = cluster.workers[id];
+    if (w && w.isConnected()) {
+      try { w.send({ type: 'config', config: appConfig }); } catch {}
+    }
+  }
+}
+function broadcastUsageSnapshot() {
+  const snap = {};
+  for (const [k, v] of usage) snap[k] = v;
+  for (const id of Object.keys(cluster.workers)) {
+    const w = cluster.workers[id];
+    if (w && w.isConnected()) {
+      try { w.send({ type: 'usage_snapshot', usage: snap }); } catch {}
+    }
+  }
+}
+function broadcastCommand(cmd) {
+  for (const id of Object.keys(cluster.workers)) {
+    const w = cluster.workers[id];
+    if (w && w.isConnected()) {
+      try { w.send(cmd); } catch {}
+    }
+  }
+}
+
+function sendWorkerInit(worker) {
+  try {
+    worker.send({
+      type: 'init',
+      config: appConfig,
+      listenAddr: cfgFlags.listenAddr,
+      port: cfgFlags.port,
+      noUDP: cfgFlags.noUDP,
+      certFile: cfgFlags.certFile,
+      keyFile: cfgFlags.keyFile,
+      cliUser: cfgFlags.username,
+      cliPass: cfgFlags.password,
+      usageSnapshot: Object.fromEntries(usage),
+    });
+  } catch (e) {
+    log(`[WARN] Gửi init cho worker ${worker.id} thất bại: ${e.message}`);
+  }
+}
+
+function onWorkerMessage(worker, msg) {
+  if (!msg || typeof msg !== 'object') return;
+  switch (msg.type) {
+    case 'ready': {
+      workersPendingInit.delete(worker.id);
+      log(`[INFO] Worker ${worker.id} (pid=${worker.process.pid}) đã sẵn sàng`);
+      sendWorkerInit(worker);
+      break;
+    }
+    case 'stats': {
+      const prev = workerStatsMap.get(worker.id);
+      if (prev && prev.activeConns) {
+        for (const c of prev.activeConns) connIdToWorker.delete(c.id);
+      }
+      workerStatsMap.set(worker.id, msg.payload);
+      for (const c of (msg.payload.activeConns || [])) connIdToWorker.set(c.id, worker.id);
+      break;
+    }
+    case 'usage_delta': {
+      const period = currentPeriod();
+      for (const [user, bytes] of Object.entries(msg.deltas || {})) {
+        if (!user || !bytes) continue;
+        let rec = usage.get(user);
+        if (!rec || rec.Period !== period) rec = { Period: period, BytesUsed: 0 };
+        rec.BytesUsed += bytes;
+        usage.set(user, rec);
+      }
+      break;
+    }
+    case 'audit': {
+      recordAudit(msg.actor || 'unknown', msg.action || '', msg.details || '');
+      break;
+    }
+    case 'log': {
+      const level = msg.level || 'INFO';
+      const text = msg.text || '';
+      log(`[${level}] ${text}`);
+      break;
+    }
+  }
+}
+
+function onWorkerExit(worker, code, signal) {
+  workerStatsMap.delete(worker.id);
+  // Clear conn-id map cho worker này
+  for (const [cid, wid] of connIdToWorker) if (wid === worker.id) connIdToWorker.delete(cid);
+  if (shuttingDown) return;
+  if (!worker.exitedAfterDisconnect && code !== 0) {
+    log(`[WARN] Worker ${worker.id} died (code=${code} signal=${signal}), respawning`);
+    const w = cluster.fork();
+    workersPendingInit.add(w.id);
+  }
+}
+
+// =============================================================================
+//  MASTER: AGGREGATED STATS + SSE
+// =============================================================================
+function aggregateStats() {
+  let total = 0, current = 0, s5tcp = 0, s5udp = 0, httpCount = 0, authFail = 0;
+  let bytesUp = 0, bytesDown = 0, udpUp = 0, udpDown = 0, udpAssocs = 0;
+  const conns = [];
+  const udpInfo = {};
+  const upstreamStatusByAddr = new Map();
+
+  for (const [wid, s] of workerStatsMap) {
+    total     += s.total || 0;
+    current   += s.current || 0;
+    s5tcp     += s.s5tcp || 0;
+    s5udp     += s.s5udp || 0;
+    httpCount += s.http || 0;
+    authFail  += s.authFail || 0;
+    bytesUp   += s.bytesUp || 0;
+    bytesDown += s.bytesDown || 0;
+    udpUp     += s.udpUp || 0;
+    udpDown   += s.udpDown || 0;
+    udpAssocs += s.udpAssocs || 0;
+    for (const c of (s.activeConns || [])) conns.push(c);
+    for (const [k, v] of Object.entries(s.udpAssocsDetail || {})) udpInfo[`w${wid}:${k}`] = v;
+    for (const st of (s.upstreamStatus || [])) {
+      const prev = upstreamStatusByAddr.get(st.addr);
+      upstreamStatusByAddr.set(st.addr, prev === undefined ? st.alive : (prev || st.alive));
+    }
+  }
+  const proxies = (appConfig.UpstreamProxies || []).slice();
+  const status = proxies.map(p => ({ addr: p, alive: upstreamStatusByAddr.get(p) !== false }));
+
+  return {
+    total, current, active: current,
+    socks5_tcp: s5tcp, socks5_udp: s5udp, http: httpCount,
+    bytes_up: bytesUp, bytes_down: bytesDown,
+    udp_up: udpUp, udp_down: udpDown,
+    udp_assocs: udpAssocs,
+    auth_fail: authFail,
+    uptime: (Date.now() - masterStartTime) / 1000,
+    active_connections: conns,
+    upstream: { proxies, current_index: -1, status },
+    system: { cpu_percent: 0.0, memory_percent: 0.0, fd_limit: 10000 },
+    udp_associations: udpInfo,
+  };
+}
+function getStats() {
+  const agg = aggregateStats();
+  return {
+    total: agg.total, current: agg.current, active: agg.active,
+    socks5_tcp: agg.socks5_tcp, socks5_udp: agg.socks5_udp, http: agg.http,
+    bytes_up: agg.bytes_up, bytes_down: agg.bytes_down,
+    udp_up: agg.udp_up, udp_down: agg.udp_down,
+    udp_assocs: agg.udp_assocs,
+    uptime: agg.uptime,
+  };
+}
+function broadcastSample(sample) {
+  for (const ch of sseClients) ch.push(sample);
+}
+let masterStatsReporterRunning = false;
+function masterStatsReporter() {
+  if (masterStatsReporterRunning) return;
+  masterStatsReporterRunning = true;
+  let lastUp = 0, lastDown = 0, first = true, tick = 0;
+  setInterval(() => {
+    tick++;
+    const agg = aggregateStats();
+    log(`[STATS] Workers:${cluster.workers ? Object.keys(cluster.workers).length : 0} | Active:${agg.current} TCP:${agg.socks5_tcp} UDP:${agg.socks5_udp} HTTP:${agg.http} | UDP Assoc:${agg.udp_assocs} | Up:${formatBytes(agg.bytes_up)} Down:${formatBytes(agg.bytes_down)} | Uptime:${(agg.uptime).toFixed(0)}s`);
 
     let upBps = 0, downBps = 0;
     if (!first) {
-      upBps = Math.floor((up - lastUp) / (STATS_INTERVAL_MS / 1000));
-      downBps = Math.floor((down - lastDown) / (STATS_INTERVAL_MS / 1000));
+      upBps   = Math.floor((agg.bytes_up   - lastUp)   / (STATS_INTERVAL_MS / 1000));
+      downBps = Math.floor((agg.bytes_down - lastDown) / (STATS_INTERVAL_MS / 1000));
     }
-    lastUp = up; lastDown = down; first = false;
+    lastUp = agg.bytes_up; lastDown = agg.bytes_down; first = false;
 
-    const sample = { t: Math.floor(Date.now() / 1000), up_bps: upBps, down_bps: downBps, active: stats.Current, udp_assocs: udpAssoc };
+    const sample = {
+      t: Math.floor(Date.now() / 1000),
+      up_bps: upBps, down_bps: downBps,
+      active: agg.current, udp_assocs: agg.udp_assocs,
+    };
     statHistory.push(sample);
     while (statHistory.length > HISTORY_MAX_SAMPLES) statHistory.shift();
     broadcastSample(sample);
 
-    if (tick % 5 === 0) enforceQuotaOnActiveConns();
+    // Broadcast usage snapshot định kỳ để worker enforce quota
+    if (tick % Math.max(1, Math.round(USAGE_BROADCAST_INTERVAL_MS / STATS_INTERVAL_MS)) === 0) {
+      broadcastUsageSnapshot();
+    }
     if (tick % 15 === 0 && cfgFlags.usagePath) saveUsage(cfgFlags.usagePath);
   }, STATS_INTERVAL_MS);
 }
-function enforceQuotaOnActiveConns() {
-  const seen = new Set();
-  for (const ci of activeConns.values()) if (ci.Username) seen.add(ci.Username);
-  const toKick = [];
-  for (const username of seen) {
-    const cfg = getUserConfig(username);
-    if (!cfg || !cfg.quota_bytes_per_month) continue;
-    if (!isOverQuota(username, cfg.quota_bytes_per_month)) continue;
-    for (const ci of activeConns.values()) if (ci.Username === username) toKick.push(ci);
-  }
-  for (const ci of toKick) { if (ci.Conn) try { ci.Conn.destroy(); } catch {} }
-  if (toKick.length) log(`[WARN] Đã ngắt ${toKick.length} connection do user vượt quota dung lượng tháng`);
-}
 
-// ======================== DASHBOARD ========================
+// =============================================================================
+//  MASTER: DASHBOARD
+// =============================================================================
 function csrfOK(req) {
   if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return true;
   const site = req.headers['sec-fetch-site'];
@@ -1195,6 +1504,14 @@ function csrfOK(req) {
     catch { return false; }
   }
   return (req.headers['content-type'] || '').toLowerCase().startsWith('application/json');
+}
+function checkAPIToken(token) {
+  if (!token) return [null, false];
+  const h = hashAPIToken(token);
+  for (const t of (appConfig.APITokens || [])) {
+    if (subtleCompare(t.token_hash || '', h)) return [t.name, true];
+  }
+  return [null, false];
 }
 function dashboardAuth(handler) {
   return async (req, res) => {
@@ -1270,52 +1587,53 @@ function healthCheck(req, res) {
   res.end('{"status":"ok"}');
 }
 function metricsHandler(req, res) {
-  const activeCount = activeConns.size;
-  const udpCount = udpAssocs.size;
-  const uptime = (Date.now() - stats.StartTime) / 1000;
+  const agg = aggregateStats();
+  const uptime = agg.uptime;
   const m = (name, help, typ, val) => `# HELP proxy_${name} ${help}\n# TYPE proxy_${name} ${typ}\nproxy_${name} ${val}\n`;
   let out = '';
-  out += m('connections_total', 'Tổng số kết nối đã nhận từ khi khởi động', 'counter', stats.Total);
-  out += m('connections_current', 'Số kết nối đang mở', 'gauge', stats.Current);
-  out += m('connections_active', 'Số kết nối đang active', 'gauge', activeCount);
-  out += m('socks5_tcp_total', 'Tổng số kết nối SOCKS5 TCP', 'counter', stats.Socks5TCP);
-  out += m('socks5_udp_total', 'Tổng số kết nối SOCKS5 UDP', 'counter', stats.Socks5UDP);
-  out += m('http_requests_total', 'Tổng số request HTTP proxy', 'counter', stats.HTTP);
-  out += m('bytes_up_total', 'Tổng bytes gửi lên', 'counter', stats.BytesUp);
-  out += m('bytes_down_total', 'Tổng bytes tải về', 'counter', stats.BytesDown);
-  out += m('udp_bytes_up_total', 'Tổng bytes UDP gửi lên', 'counter', stats.UDPUp);
-  out += m('udp_bytes_down_total', 'Tổng bytes UDP tải về', 'counter', stats.UDPDown);
-  out += m('udp_associations', 'Số UDP association đang mở', 'gauge', udpCount);
-  out += m('auth_fail_total', 'Tổng số lần xác thực thất bại', 'counter', stats.AuthFail);
+  out += m('connections_total', 'Tổng số kết nối đã nhận từ khi khởi động', 'counter', agg.total);
+  out += m('connections_current', 'Số kết nối đang mở', 'gauge', agg.current);
+  out += m('connections_active', 'Số kết nối đang active', 'gauge', agg.active);
+  out += m('socks5_tcp_total', 'Tổng số kết nối SOCKS5 TCP', 'counter', agg.socks5_tcp);
+  out += m('socks5_udp_total', 'Tổng số kết nối SOCKS5 UDP', 'counter', agg.socks5_udp);
+  out += m('http_requests_total', 'Tổng số request HTTP proxy', 'counter', agg.http);
+  out += m('bytes_up_total', 'Tổng bytes gửi lên', 'counter', agg.bytes_up);
+  out += m('bytes_down_total', 'Tổng bytes tải về', 'counter', agg.bytes_down);
+  out += m('udp_bytes_up_total', 'Tổng bytes UDP gửi lên', 'counter', agg.udp_up);
+  out += m('udp_bytes_down_total', 'Tổng bytes UDP tải về', 'counter', agg.udp_down);
+  out += m('udp_associations', 'Số UDP association đang mở', 'gauge', agg.udp_assocs);
+  out += m('auth_fail_total', 'Tổng số lần xác thực thất bại', 'counter', agg.auth_fail);
   out += m('uptime_seconds', 'Thời gian server đã chạy (giây)', 'gauge', uptime);
+  out += m('workers', 'Số worker đang chạy', 'gauge', cluster.workers ? Object.keys(cluster.workers).length : 0);
   res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' });
   res.end(out);
 }
-async function dashboardAll(req, res) { sendJSON(res, 200, getAllStats()); }
+async function dashboardAll(req, res) { sendJSON(res, 200, aggregateStats()); }
 async function dashboardKick(req, res) {
   if (req.method !== 'POST') return sendJSON(res, 405, { error: 'Only POST is supported' });
   let body;
   try { body = JSON.parse((await readBody(req, 2048)).toString('utf8')); }
   catch { return sendJSON(res, 400, { error: "Missing or invalid 'id'" }); }
   if (!body || !body.id) return sendJSON(res, 400, { error: "Missing or invalid 'id'" });
-  const target = activeConns.get(body.id);
-  if (!target) return sendJSON(res, 404, { error: 'Connection not found (already closed?)' });
-  if (target.Conn) try { target.Conn.destroy(); } catch {}
-  log(`[INFO] Dashboard kicked connection ${target.ID} (${target.IP} -> ${target.Target})`);
-  recordAudit(actorFromRequest(req), 'kick_connection', `id=${target.ID} ip=${target.IP} target=${target.Target} user=${target.Username}`);
-  sendJSON(res, 200, { success: true, id: target.ID });
+
+  const wid = connIdToWorker.get(body.id);
+  if (!wid) return sendJSON(res, 404, { error: 'Connection not found (already closed?)' });
+  const w = cluster.workers[wid];
+  if (!w || !w.isConnected()) return sendJSON(res, 404, { error: 'Worker owning connection is gone' });
+  try { w.send({ type: 'kick', id: body.id }); }
+  catch (e) { return sendJSON(res, 500, { error: 'Failed to forward kick: ' + e.message }); }
+  log(`[INFO] Dashboard kicked connection ${body.id} on worker ${wid}`);
+  recordAudit(actorFromRequest(req), 'kick_connection', `id=${body.id} worker=${wid}`);
+  sendJSON(res, 200, { success: true, id: body.id, worker: wid });
 }
 async function dashboardExport(req, res) {
   const u = new URL(req.url, 'http://x');
   const format = u.searchParams.get('format') || 'json';
-  const rows = [];
-  for (const ci of activeConns.values()) {
-    rows.push({
-      id: ci.ID, ip: ci.IP, port: ci.Port, type: ci.Type, target: ci.Target,
-      bytes_up: ci.BytesUp, bytes_down: ci.BytesDown,
-      duration_seconds: (Date.now() - ci.StartTime) / 1000,
-    });
-  }
+  const rows = aggregateStats().active_connections.map(ci => ({
+    id: ci.id, ip: ci.ip, port: ci.port, type: ci.type, target: ci.target,
+    bytes_up: ci.bytes_up, bytes_down: ci.bytes_down,
+    duration_seconds: ci.duration,
+  }));
   if (format === 'csv') {
     res.writeHead(200, { 'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename=connections.csv' });
     let out = 'id,ip,port,type,target,bytes_up,bytes_down,duration_seconds\n';
@@ -1350,11 +1668,15 @@ async function dashboardChangePassword(req, res) {
 }
 async function dashboardUsers(req, res) {
   if (req.method === 'GET') {
-    const out = (appConfig.Users || []).map(u => ({
-      username: u.username, max_bandwidth_bps: u.max_bandwidth_bps,
-      max_connections: u.max_connections, quota_bytes_per_month: u.quota_bytes_per_month,
-      usage_bytes_this_month: getUsage(u.username),
-    }));
+    const out = (appConfig.Users || []).map(u => {
+      const rec = usage.get(u.username);
+      const bytesUsed = (rec && rec.Period === currentPeriod()) ? rec.BytesUsed : 0;
+      return {
+        username: u.username, max_bandwidth_bps: u.max_bandwidth_bps,
+        max_connections: u.max_connections, quota_bytes_per_month: u.quota_bytes_per_month,
+        usage_bytes_this_month: bytesUsed,
+      };
+    });
     return sendJSON(res, 200, { users: out });
   }
   if (req.method !== 'POST') return sendJSON(res, 405, { error: 'Only GET/POST is supported' });
@@ -1390,7 +1712,9 @@ async function dashboardUsers(req, res) {
   }
   try { saveConfig(cfgFlags.configPath, appConfig); }
   catch (e) { return sendJSON(res, 500, { error: 'Saved in memory but failed to write config file: ' + e.message }); }
-  applyLiveBandwidthLimit(uname, body.max_bandwidth_bps);
+
+  broadcastConfig();
+  broadcastCommand({ type: 'apply_bw', username: uname, bps: body.max_bandwidth_bps });
   log(`[INFO] Dashboard: đã thêm/cập nhật proxy user '${uname}'`);
   recordAudit(actorFromRequest(req), 'upsert_user', `username=${uname}`);
   sendJSON(res, 200, { success: true });
@@ -1406,6 +1730,7 @@ async function dashboardDeleteUser(req, res) {
   if (appConfig.Users.length === before) return sendJSON(res, 404, { error: 'User not found' });
   try { saveConfig(cfgFlags.configPath, appConfig); }
   catch (e) { return sendJSON(res, 500, { error: 'Removed in memory but failed to write config file: ' + e.message }); }
+  broadcastConfig();
   log(`[INFO] Dashboard: đã xoá proxy user '${body.username}'`);
   recordAudit(actorFromRequest(req), 'delete_user', 'username=' + body.username);
   sendJSON(res, 200, { success: true });
@@ -1465,11 +1790,11 @@ async function dashboardConfigImport(req, res) {
   let cfg;
   try { cfg = JSON.parse(data.toString('utf8')); }
   catch (e) { return sendJSON(res, 400, { error: 'Invalid JSON: ' + e.message }); }
-  if (!cfg.DashboardUser || !cfg.DashboardPasswordHash) return sendJSON(res, 400, { error: 'File thiếu dashboard_user/dashboard_password_hash — không phải file backup hợp lệ' });
+  if (!cfg.DashboardUser || !cfg.DashboardPasswordHash) return sendJSON(res, 400, { error: 'File thiếu DashboardUser/DashboardPasswordHash — không phải file backup hợp lệ' });
   try { saveConfig(cfgFlags.configPath, cfg); }
   catch (e) { return sendJSON(res, 500, { error: 'Failed to write config file: ' + e.message }); }
   const actor = actorFromRequest(req);
-  const err = reloadConfig(actor);
+  const err = reloadConfigMaster(actor);
   if (err) { recordAudit(actor, 'import_config_backup', 'failed: ' + err.message); return sendJSON(res, 500, { error: 'Đã ghi file nhưng reload thất bại: ' + err.message }); }
   recordAudit(actor, 'import_config_backup', `${(cfg.Users || []).length} users, ${(cfg.APITokens || []).length} tokens`);
   log('[INFO] Dashboard: đã restore config từ file backup upload');
@@ -1478,7 +1803,7 @@ async function dashboardConfigImport(req, res) {
 async function dashboardReload(req, res) {
   if (req.method !== 'POST') return sendJSON(res, 405, { error: 'Only POST is supported' });
   const actor = actorFromRequest(req);
-  const err = reloadConfig(actor);
+  const err = reloadConfigMaster(actor);
   if (err) { recordAudit(actor, 'reload_config', 'failed: ' + err.message); return sendJSON(res, 400, { error: err.message }); }
   recordAudit(actor, 'reload_config', 'success (manual)');
   sendJSON(res, 200, { success: true });
@@ -1501,7 +1826,7 @@ async function dashboardNetworkConfig(req, res) {
   try { saveConfig(cfgFlags.configPath, appConfig); }
   catch (e) { return sendJSON(res, 500, { error: 'Saved in memory but failed to write config file: ' + e.message }); }
   const actor = actorFromRequest(req);
-  const err = reloadConfig(actor);
+  const err = reloadConfigMaster(actor);
   if (err) { recordAudit(actor, 'update_network_config', 'failed: ' + err.message); return sendJSON(res, 500, { error: 'Đã lưu file nhưng reload thất bại: ' + err.message }); }
   recordAudit(actor, 'update_network_config', `${(body.allow_list || []).length} allow, ${(body.deny_list || []).length} deny, ${(body.upstream_proxies || []).length} upstream`);
   sendJSON(res, 200, { success: true });
@@ -1534,123 +1859,6 @@ function dashboardStream(req, res) {
   req.on('close', () => { closed = true; clearInterval(ka); sseClients.delete(ch); });
 }
 
-// ======================== STATS DATA ========================
-function getStats() {
-  return {
-    total: stats.Total, current: stats.Current, active: activeConns.size,
-    socks5_tcp: stats.Socks5TCP, socks5_udp: stats.Socks5UDP, http: stats.HTTP,
-    bytes_up: stats.BytesUp, bytes_down: stats.BytesDown,
-    udp_up: stats.UDPUp, udp_down: stats.UDPDown,
-    udp_assocs: udpAssocs.size,
-    uptime: (Date.now() - stats.StartTime) / 1000,
-  };
-}
-function getAllStats() {
-  const data = getStats();
-  const conns = [];
-  for (const ci of activeConns.values()) {
-    conns.push({
-      id: ci.ID, ip: ci.IP, port: ci.Port, type: ci.Type, target: ci.Target,
-      start_time: Math.floor(ci.StartTime / 1000),
-      bytes_up: ci.BytesUp, bytes_down: ci.BytesDown,
-      duration: (Date.now() - ci.StartTime) / 1000,
-    });
-  }
-  data.active_connections = conns;
-  const proxies = upstreamProxies.slice();
-  data.upstream = {
-    proxies,
-    current_index: upstreamIndex,
-    status: proxies.map(p => ({ addr: p, alive: isUpstreamAlive(p) })),
-  };
-  data.system = { cpu_percent: 0.0, memory_percent: 0.0, fd_limit: 10000 };
-  const udpInfo = {};
-  for (const [k, a] of udpAssocs) {
-    try {
-      udpInfo[k] = {
-        client_addr: `${a.ClientAddr.ip}:${a.ClientAddr.port}`,
-        relay_port: a.RelayConn.address().port,
-        active: a.Active,
-        last_activity: Math.floor(a.LastActivity / 1000),
-        dest_count: a.DestMap.size,
-      };
-    } catch {}
-  }
-  data.udp_associations = udpInfo;
-  return data;
-}
-
-// ======================== FORMAT ========================
-function formatBytes(b) {
-  if (b === undefined || b === null) return '0 B';
-  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
-  let u = 0;
-  while (b >= 1024 && u < units.length - 1) { b /= 1024; u++; }
-  return b.toFixed(1) + ' ' + units[u];
-}
-
-// ======================== PROXY LISTENER ========================
-let proxyListener = null;
-async function handleConn(socket) {
-  socket.on('error', () => {});
-  stats.Current++;
-  stats.Total++;
-  if (stats.Current > MAX_CONNECTIONS) { socket.destroy(); stats.Current--; return; }
-  const remoteIP = (socket.remoteAddress || '').replace(/^::ffff:/, '');
-
-  if (remoteIP && !isIPAllowed(remoteIP)) {
-    log(`[WARN] IP ${remoteIP} bị từ chối bởi whitelist/blacklist`);
-    socket.destroy(); stats.Current--; return;
-  }
-  if (remoteIP && isAuthBlocked(remoteIP)) {
-    log(`[WARN] IP ${remoteIP} đang bị chặn do auth fail quá nhiều lần`);
-    socket.destroy(); stats.Current--; return;
-  }
-
-  socket.setTimeout(HANDSHAKE_TIMEOUT, () => { try { socket.destroy(); } catch {} });
-  const reader = new BufReader(socket);
-  let first;
-  try { first = await reader.readN(1); } catch { socket.destroy(); stats.Current--; return; }
-  const b = first[0];
-
-  // ★ TRẢ LẠI byte vừa peeked — thiếu dòng này là bug khiến mọi kết nối
-  // SOCKS5/HTTP bị chết ngay sau khi connect (giống io.MultiReader trong Go).
-  reader.unread(first);
-
-  try {
-    if (b === 0x05) await handleSOCKS5(socket, reader, remoteIP);
-    else if ('CGPDHOT'.includes(String.fromCharCode(b))) await handleHTTP(socket, reader, remoteIP);
-    else { log(`[WARN] Unknown protocol from ${socket.remoteAddress} (first byte 0x${b.toString(16)})`); socket.destroy(); }
-  } catch (e) {
-    log(`[ERROR] handleConn: ${e.message}`);
-    try { socket.destroy(); } catch {}
-  } finally {
-    stats.Current--;
-    try { socket.destroy(); } catch {}
-  }
-}
-async function runProxyServer() {
-  let tlsOpts = null;
-  if (cfgFlags.certFile && cfgFlags.keyFile) {
-    try {
-      tlsOpts = { cert: fs.readFileSync(cfgFlags.certFile), key: fs.readFileSync(cfgFlags.keyFile), minVersion: 'TLSv1.2' };
-    } catch (e) { throw new Error(`không load được TLS cert/key: ${e.message}`); }
-  }
-  proxyListener = tlsOpts
-    ? tls.createServer(tlsOpts, (s) => handleConn(s))
-    : net.createServer((s) => handleConn(s));
-
-  await new Promise((resolve, reject) => {
-    proxyListener.once('error', reject);
-    proxyListener.listen(cfgFlags.port, cfgFlags.listenAddr, () => { proxyListener.removeListener('error', reject); resolve(); });
-  });
-  if (tlsOpts) log('[INFO] TLS đã bật cho listener chính');
-  log(`[INFO] Proxy started on ${cfgFlags.listenAddr}:${cfgFlags.port}`);
-  proxyListener.on('error', (e) => log(`[ERROR] Listener: ${e.message}`));
-}
-
-// ======================== DASHBOARD SERVER ========================
-let dashboardServer = null;
 function startDashboardServer() {
   const routes = {
     '/': dashboardIndex,
@@ -1692,7 +1900,7 @@ function startDashboardServer() {
   dashboardServer.on('error', e => log(`[WARN] Dashboard error: ${e.message}`));
 }
 
-// ======================== DASHBOARD HTML ========================
+// ======================== DASHBOARD HTML (giữ nguyên, không thay đổi) ========================
 const dashboardHTML = `<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Proxy Dashboard</title>
 <style>
@@ -1752,7 +1960,7 @@ td{padding:8px 8px;border-bottom:1px solid var(--border2);}tr:hover td{backgroun
 </head><body>
 <div class="container">
   <div class="header-bar">
-    <h1>⚡ Proxy Pro <span>v6.3</span></h1>
+    <h1>⚡ Proxy Pro <span>v6.4-cluster</span></h1>
     <div class="header-actions">
       <button class="btn" id="themeToggleBtn" onclick="toggleTheme()">🌙 Theme</button>
       <button class="btn" onclick="openPwModal()">🔒 Change Password</button>
@@ -1760,7 +1968,7 @@ td{padding:8px 8px;border-bottom:1px solid var(--border2);}tr:hover td{backgroun
   </div>
   <div id="statsGrid" class="stats-grid">Loading stats...</div>
   <div id="chartSection" class="section"><div class="section-title-row"><div class="section-title">📈 Real-time Traffic <span id="streamStatus" style="font-size:.75rem;color:var(--muted);">(connecting...)</span></div></div><canvas id="trafficChart" height="80"></canvas></div>
-  <div id="connectionsSection" class="section"><div class="section-title-row"><div class="section-title">🔗 Active Connections</div><div class="toolbar"><input type="text" id="connFilter" placeholder="Filter..." oninput="renderConnections()"><button class="btn btn-sm" onclick="exportConns('csv')">⬇ CSV</button><button class="btn btn-sm" onclick="exportConns('json')">⬇ JSON</button></div></div><div id="connectionsTable">Loading...</div></div>
+  <div id="connectionsSection" class="section"><div class="section-title-row"><div class="section-title">🔗 Active Connections (all workers)</div><div class="toolbar"><input type="text" id="connFilter" placeholder="Filter..." oninput="renderConnections()"><button class="btn btn-sm" onclick="exportConns('csv')">⬇ CSV</button><button class="btn btn-sm" onclick="exportConns('json')">⬇ JSON</button></div></div><div id="connectionsTable">Loading...</div></div>
   <div id="upstreamSection" class="section"><div class="section-title">🌐 Upstream Proxies</div><div id="upstreamInfo">Loading...</div></div>
   <div id="usersSection" class="section"><div class="section-title-row"><div class="section-title">👤 Proxy Users</div><div class="toolbar"><button class="btn btn-sm" onclick="openUserModal()">+ Add / Update User</button></div></div><div id="usersTable">Loading...</div></div>
   <div id="networkSection" class="section"><div class="section-title-row"><div class="section-title">🌐 Network Rules</div><div class="toolbar"><button class="btn btn-sm" onclick="reloadFromDisk()">↻ Reload from disk</button></div></div>
@@ -1794,7 +2002,7 @@ function sortConns(k){if(sortKey===k)sortDir=sortDir==='asc'?'desc':'asc';else{s
 function renderConnections(){const f=(document.getElementById('connFilter').value||'').toLowerCase().trim();let c=lastConns.slice();if(f)c=c.filter(x=>(x.ip||'').toLowerCase().includes(f)||(x.target||'').toLowerCase().includes(f)||(x.type||'').toLowerCase().includes(f));c.sort((a,b)=>{let av=a[sortKey],bv=b[sortKey];if(typeof av==='string'){av=av.toLowerCase();bv=(bv||'').toLowerCase();}if(av<bv)return sortDir==='asc'?-1:1;if(av>bv)return sortDir==='asc'?1:-1;return 0;});if(!c.length){document.getElementById('connectionsTable').innerHTML='<div style="padding:15px;color:#999;">No active connections</div>';return;}const cols=[['ip','IP'],['port','Port'],['type','Type'],['target','Target'],['duration','Duration'],['bytes_up','Bytes Up'],['bytes_down','Bytes Down']];let th='<tr>';cols.forEach(x=>{let cl=sortKey===x[0]?(sortDir==='asc'?'':' style="color:var(--accent)"'):'';th+='<th'+cl+' onclick="sortConns(\\''+x[0]+'\\')">'+x[1]+'</th>';});th+='<th>Action</th></tr>';let h='<table><thead>'+th+'</thead><tbody>';c.forEach(x=>{let b='<span class="badge">'+esc(x.type)+'</span>';if(x.type==='SOCKS5_TCP')b='<span class="badge socks5-tcp">SOCKS5 TCP</span>';else if(x.type==='SOCKS5_UDP')b='<span class="badge socks5-udp">SOCKS5 UDP</span>';else if(x.type==='HTTP')b='<span class="badge http">HTTP</span>';h+='<tr><td>'+esc(x.ip)+'</td><td>'+x.port+'</td><td>'+b+'</td><td>'+esc(x.target||'N/A')+'</td><td>'+formatUptime(x.duration)+'</td><td>'+formatBytes(x.bytes_up)+'</td><td>'+formatBytes(x.bytes_down)+'</td><td><button class="btn btn-sm btn-danger" data-id="'+esc(x.id)+'" onclick="kickConn(this.dataset.id)">Kick</button></td></tr>';});h+='</tbody></table>';document.getElementById('connectionsTable').innerHTML=h;}
 async function kickConn(id){if(!id)return;try{const r=await fetch('/api/kick',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});if(r.ok)fetchAll();else{const d=await r.json().catch(()=>({}));alert('Kick failed: '+(d.error||r.status));}}catch(e){alert(e.message);}}
 function exportConns(f){window.location.href='/api/export?format='+encodeURIComponent(f);}
-function renderUpstream(up){const st=up.status||[];let h='<div style="padding:8px 0;">';if(st.length){h+=st.map(s=>esc(s.addr)+' '+(s.alive?'<span class="badge" style="background:var(--badge-http-bg);color:var(--badge-http-fg);">alive</span>':'<span class="badge" style="background:var(--danger-hover-bg);color:var(--danger-fg);">dead</span>')).join(' | ');h+='<br><span style="font-size:.78rem;color:#999;">Index: '+up.current_index+'</span>';}else h+='<span style="color:#999;">No upstream.</span>';h+='</div>';document.getElementById('upstreamInfo').innerHTML=h;}
+function renderUpstream(up){const st=up.status||[];let h='<div style="padding:8px 0;">';if(st.length){h+=st.map(s=>esc(s.addr)+' '+(s.alive?'<span class="badge" style="background:var(--badge-http-bg);color:var(--badge-http-fg);">alive</span>':'<span class="badge" style="background:var(--danger-hover-bg);color:var(--danger-fg);">dead</span>')).join(' | ');}else h+='<span style="color:#999;">No upstream.</span>';h+='</div>';document.getElementById('upstreamInfo').innerHTML=h;}
 async function fetchNetworkConfig(){try{const r=await fetch('/api/network-config');if(!r.ok)throw new Error(r.status);const d=await r.json();document.getElementById('netAllow').value=(d.allow_list||[]).join('\\n');document.getElementById('netDeny').value=(d.deny_list||[]).join('\\n');document.getElementById('netUpstream').value=(d.upstream_proxies||[]).join('\\n');}catch(e){}}
 function linesToList(t){return t.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);}
 async function saveNetworkConfig(){const m=document.getElementById('netMsg');m.textContent='Saving...';try{const r=await fetch('/api/network-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({allow_list:linesToList(document.getElementById('netAllow').value),deny_list:linesToList(document.getElementById('netDeny').value),upstream_proxies:linesToList(document.getElementById('netUpstream').value)})});const d=await r.json();if(!r.ok){m.textContent=d.error;m.className='modal-msg error';return;}m.textContent='Saved.';m.className='modal-msg success';fetchReloadHistory();}catch(e){m.textContent=e.message;m.className='modal-msg error';}}
@@ -1829,24 +2037,28 @@ async function loadChartJS(){const urls=['https://cdnjs.cloudflare.com/ajax/libs
 (async function(){try{const ok=await loadChartJS();if(!ok)throw new Error('no CDN');initChart();connectStream();}catch(err){const s=document.getElementById('streamStatus');if(s){s.textContent='(unavailable)';s.style.color='#fca5a5';}const c=document.getElementById('trafficChart');if(c)c.outerHTML='<div style="padding:20px;color:#fca5a5;">⚠️ Chart unavailable: '+err.message+'</div>';}})();
 </script></body></html>`;
 
-// ======================== MAIN ========================
-async function main() {
+// =============================================================================
+//  MASTER: MAIN
+// =============================================================================
+async function mainMaster() {
   setupLogFile();
-  if (cfgFlags.usagePath) loadUsage(cfgFlags.usagePath);
+  log(`[INFO] Master pid=${process.pid}, CPU=${os.cpus().length}, cluster mode`);
 
-  let generatedPass = '';
+  // Sinh password lần đầu
   if (!fs.existsSync(cfgFlags.configPath) && !cfgFlags.initDashPass) {
     cfgFlags.initDashPass = generateAPIToken().slice(0, 16);
-    generatedPass = cfgFlags.initDashPass;
+    initDashPassGenerated = cfgFlags.initDashPass;
   }
   let cfg, wasCreated;
   try { [cfg, wasCreated] = loadOrInitConfig(cfgFlags.configPath, cfgFlags.initDashUser, cfgFlags.initDashPass); }
   catch (e) { log(`[FATAL] Lỗi đọc config file: ${e.message}`); process.exit(1); }
 
-  if (wasCreated && generatedPass) log(`[WARN] Dashboard lần đầu — user: ${cfgFlags.initDashUser} | password: ${generatedPass} (chỉ hiện MỘT LẦN)`);
+  if (wasCreated && initDashPassGenerated) {
+    log(`[WARN] Dashboard lần đầu — user: ${cfgFlags.initDashUser} | password: ${initDashPassGenerated} (chỉ hiện MỘT LẦN)`);
+  }
   if (wasCreated) {
     for (const item of (cfgFlags.allowStr || '').split(',')) if (item.trim()) (cfg.AllowList = cfg.AllowList || []).push(item.trim());
-    for (const item of (cfgFlags.denyStr || '').split(',')) if (item.trim()) (cfg.DenyList = cfg.DenyList || []).push(item.trim());
+    for (const item of (cfgFlags.denyStr  || '').split(',')) if (item.trim()) (cfg.DenyList  = cfg.DenyList  || []).push(item.trim());
     for (const item of (cfgFlags.upstreamStr || '').split(',')) if (item.trim()) (cfg.UpstreamProxies = cfg.UpstreamProxies || []).push(item.trim());
     try { saveConfig(cfgFlags.configPath, cfg); }
     catch (e) { log(`[WARN] Không ghi được allow/deny/upstream: ${e.message}`); }
@@ -1854,46 +2066,153 @@ async function main() {
   appConfig = cfg;
   dashboardUser = cfg.DashboardUser;
   dashboardPassHash = cfg.DashboardPasswordHash;
-  allowedCIDRs = parseCIDRSlice(cfg.AllowList || []);
-  deniedCIDRs = parseCIDRSlice(cfg.DenyList || []);
-  upstreamProxies = (cfg.UpstreamProxies || []).slice();
+
+  if (cfgFlags.usagePath) loadUsage(cfgFlags.usagePath);
 
   if (dashboardUser === 'admin' && verifyPassword('admin', dashboardPassHash)) {
     log('[WARN] Dashboard đang dùng tài khoản mặc định admin/admin — hãy đổi ngay');
   }
 
-  try { await runProxyServer(); }
-  catch (e) { log(`[FATAL] ${e.message}`); process.exit(1); }
-
-  log(`[INFO] Upstreams: [${upstreamProxies.join(', ')}]`);
-  log(`[INFO] Whitelist: ${allowedCIDRs.length} entries | Blacklist: ${deniedCIDRs.length} entries (config: ${cfgFlags.configPath})`);
-  log(`[INFO] Gửi SIGHUP (kill -HUP ${process.pid}) để reload config không cần restart`);
-
+  // Khởi động dashboard (chỉ master)
   startDashboardServer();
-  statsReporter();
-  upstreamHealthChecker();
+
+  // Spawn workers
+  const workers = parseInt(process.env.WORKERS, 10) || Math.max(2, os.cpus().length - 1);
+  log(`[INFO] Spawning ${workers} workers`);
+  cluster.on('message', onWorkerMessage);
+  cluster.on('exit', onWorkerExit);
+  for (let i = 0; i < workers; i++) {
+    const w = cluster.fork();
+    workersPendingInit.add(w.id);
+  }
+
+  // Reporter tổng hợp + SSE
+  masterStatsReporter();
+
+  log(`[INFO] Upstreams: [${(cfg.UpstreamProxies || []).join(', ')}]`);
+  log(`[INFO] Whitelist: ${(cfg.AllowList || []).length} entries | Blacklist: ${(cfg.DenyList || []).length} entries (config: ${cfgFlags.configPath})`);
+  log(`[INFO] SIGHUP (kill -HUP ${process.pid}) → reload config và broadcast xuống workers`);
 
   process.on('SIGHUP', () => {
     log('[INFO] Nhận SIGHUP, đang reload config...');
-    const err = reloadConfig('SIGHUP');
+    const err = reloadConfigMaster('SIGHUP');
     if (err) log(`[WARN] Reload config thất bại: ${err.message}`);
   });
 
   const shutdown = () => {
     if (shuttingDown) return;
     shuttingDown = true;
-    log('[INFO] Graceful shutdown...');
-    try { proxyListener && proxyListener.close(); } catch {}
+    log('[INFO] Graceful shutdown (master)...');
     try { dashboardServer && dashboardServer.close(); } catch {}
-    const n = activeConns.size;
-    for (const ci of activeConns.values()) { if (ci.Conn) try { ci.Conn.destroy(); } catch {} }
-    for (const a of udpAssocs.values()) { a.Active = false; try { a.RelayConn.close(); } catch {} }
-    log(`[INFO] Đã đóng ${n} connection đang active. Thoát.`);
+    for (const id of Object.keys(cluster.workers)) {
+      try { cluster.workers[id].kill('SIGTERM'); } catch {}
+    }
     if (cfgFlags.usagePath) saveUsage(cfgFlags.usagePath);
-    process.exit(0);
+    setTimeout(() => process.exit(0), 1000);
   };
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  process.on('SIGINT',  () => shutdown());
+  process.on('SIGTERM', () => shutdown());
+
+  process.on('uncaughtException', (e) => { log(`[FATAL] master uncaughtException: ${e.stack || e.message}`); });
 }
 
-main().catch(e => { _err('[FATAL]', e); process.exit(1); });
+// =============================================================================
+//  WORKER: MAIN
+// =============================================================================
+async function mainWorker() {
+  // Worker không tự mở log file (tránh race với master); chỉ ghi stdout.
+  // Muốn bền log: dùng systemd/docker capture, hoặc redirect stdout.
+
+  let initDone = false;
+  let resolveInit;
+  const initPromise = new Promise(r => { resolveInit = r; });
+
+  process.on('message', (msg) => {
+    if (!msg || typeof msg !== 'object') return;
+    switch (msg.type) {
+      case 'init': {
+        appConfig = msg.config;
+        allowedCIDRs = parseCIDRSlice(msg.config.AllowList || []);
+        deniedCIDRs  = parseCIDRSlice(msg.config.DenyList  || []);
+        upstreamProxies = (msg.config.UpstreamProxies || []).slice();
+        upstreamIndex = 0;
+        usageSnapshot = new Map(Object.entries(msg.usageSnapshot || {}));
+        if (!initDone) { initDone = true; resolveInit(); }
+        log(`[INFO] Worker ${process.pid} đã nhận config: ${(msg.config.Users || []).length} users, ${(msg.config.UpstreamProxies || []).length} upstream`);
+        break;
+      }
+      case 'config': {
+        appConfig = msg.config;
+        allowedCIDRs = parseCIDRSlice(msg.config.AllowList || []);
+        deniedCIDRs  = parseCIDRSlice(msg.config.DenyList  || []);
+        upstreamProxies = (msg.config.UpstreamProxies || []).slice();
+        // pwCache dùng stored hash trong key nên tự invalidate khi hash đổi
+        log(`[INFO] Worker ${process.pid} áp dụng config mới`);
+        break;
+      }
+      case 'usage_snapshot': {
+        usageSnapshot = new Map(Object.entries(msg.usage || {}));
+        break;
+      }
+      case 'kick': {
+        const target = activeConns.get(msg.id);
+        if (target && target.Conn) {
+          try { target.Conn.destroy(); } catch {}
+          log(`[INFO] Đã kick connection ${msg.id} theo lệnh master`);
+        }
+        break;
+      }
+      case 'apply_bw': {
+        applyLiveBandwidthLimit(msg.username, msg.bps);
+        break;
+      }
+      case 'shutdown': {
+        shutdownWorker();
+        break;
+      }
+    }
+  });
+
+  // Đăng ký sẵn sàng — master sẽ gửi init
+  if (process.send) {
+    try { process.send({ type: 'ready' }); } catch {}
+  }
+
+  // Chờ init
+  await initPromise;
+  if (!initDone) {
+    log('[FATAL] Không nhận được init từ master'); process.exit(1);
+  }
+
+  // Chạy proxy listener
+  try { await runProxyServer(); }
+  catch (e) { log(`[FATAL] Worker không start được listener: ${e.message}`); process.exit(1); }
+
+  upstreamHealthChecker();
+  workerStatsReporter();
+
+  function shutdownWorker() {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    log('[INFO] Graceful shutdown (worker)...');
+    try { proxyListener && proxyListener.close(); } catch {}
+    for (const ci of activeConns.values()) { if (ci.Conn) try { ci.Conn.destroy(); } catch {} }
+    for (const a of udpAssocs.values()) { a.Active = false; try { a.RelayConn.close(); } catch {} }
+    process.exit(0);
+  }
+
+  process.on('SIGTERM', shutdownWorker);
+  process.on('SIGINT',  shutdownWorker);
+  process.on('disconnect', () => { log('[INFO] Master đã ngắt IPC, worker thoát'); process.exit(0); });
+  process.on('uncaughtException',  (e) => { log(`[FATAL] worker uncaughtException: ${e.stack || e.message}`); });
+  process.on('unhandledRejection', (e) => { log(`[FATAL] worker unhandledRejection: ${e && e.stack ? e.stack : e}`); });
+}
+
+// =============================================================================
+//  ENTRYPOINT
+// =============================================================================
+if (IS_MASTER) {
+  mainMaster().catch(e => { _err('[FATAL] master:', e); process.exit(1); });
+} else {
+  mainWorker().catch(e => { _err('[FATAL] worker:', e); process.exit(1); });
+}
