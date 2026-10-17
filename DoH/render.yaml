@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: go-doh
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: UPSTREAM_DOH
+        value: https://cloudflare-dns.com/dns-query
+      - key: BLOCKLIST
+        value: doubleclick.net,googlesyndication.com,googleadservices.com,adnxs.com
