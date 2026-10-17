@@ -1,0 +1,554 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+fix_active_conns.py — Fix nút Kick + tracking active connections.
+
+Bao gồm cả fix_kick (chưa áp) + cải tiến:
+  1. Lưu client_sock / remote_sock / udp_sock vào info map
+  2. close_conn: close socket (không kill) → handler return tự nhiên → after → remove_conn
+  3. Watchdog 500ms force-delete nếu vẫn còn entry
+  4. Monitor pid: khi handler chết (bất kể lý do) → auto cleanup ETS
+  5. all_conns: filter connection có pid đã chết (defense-in-depth)
+  6. gc_dead_conns: quét định kỳ 5s, xoá entry orphan
+  7. inc_conn: chỉ update nếu key tồn tại, không re-create
+  8. Debug endpoint /api/debug/conns
+
+Idempotent. Backup timestamp.
+"""
+import sys, time, shutil
+from pathlib import Path
+
+TARGET = Path(sys.argv[1] if len(sys.argv) > 1 else "proxy.exs")
+
+def sub_once(s, old, new, label):
+    if old in s:
+        print(f"[ OK ] {label}")
+        return s.replace(old, new, 1)
+    probe = new.strip().splitlines()[0][:60]
+    if probe and probe in s:
+        print(f"[SKIP] {label}")
+        return s
+    print(f"[MISS] {label}")
+    return s
+
+def main():
+    if not TARGET.exists():
+        print("Không tìm thấy:", TARGET); sys.exit(1)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    bak = TARGET.with_suffix(TARGET.suffix + f".{ts}.bak")
+    shutil.copy2(TARGET, bak)
+    print(f"Backup -> {bak}\n")
+
+    src = TARGET.read_text(encoding="utf-8")
+    orig = src
+
+    # =====================================================================
+    # 1) P.State.add_conn / remove_conn / all_conns / inc_conn / close_conn
+    # =====================================================================
+    src = sub_once(src,
+'''  def add_conn(id, info) do
+    :ets.insert(:p_conns, {id, info})
+    :ets.insert(:p_conn_bytes, {id, 0, 0})
+  end
+
+  def remove_conn(id) do
+    :ets.delete(:p_conns, id)
+    :ets.delete(:p_conn_bytes, id)
+  end
+
+  def get_conn(id) do
+    case :ets.lookup(:p_conns, id) do
+      [{^id, i}] ->
+        {u, d} = case :ets.lookup(:p_conn_bytes, id) do
+          [{^id, uu, dd}] -> {uu, dd}
+          [] -> {0, 0}
+        end
+        i |> Map.put(:bytes_up, u) |> Map.put(:bytes_down, d)
+      [] -> nil
+    end
+  end
+
+  def all_conns do
+    :ets.tab2list(:p_conns)
+    |> Enum.map(fn {id, info} ->
+      {u, d} = case :ets.lookup(:p_conn_bytes, id) do
+        [{^id, uu, dd}] -> {uu, dd}
+        [] -> {0, 0}
+      end
+      info
+      |> Map.put(:bytes_up, u)
+      |> Map.put(:bytes_down, d)
+      |> Map.put_new(:start, System.system_time(:second))
+      |> Map.put_new(:user, "")
+      |> Map.put_new(:target, "N/A")
+    end)
+  end
+
+  def inc_conn(id, :up, n) when n > 0 do
+    :ets.update_counter(:p_conn_bytes, id, {2, n}, {id, 0, 0})
+  rescue
+    _ -> 0
+  end
+  def inc_conn(id, :down, n) when n > 0 do
+    :ets.update_counter(:p_conn_bytes, id, {3, n}, {id, 0, 0})
+  rescue
+    _ -> 0
+  end
+  def inc_conn(_, _, _), do: :ok
+
+  def close_conn(id) do
+    case :ets.lookup(:p_conns, id) do
+      [{^id, %{pid: pid}}] when is_pid(pid) ->
+        Process.exit(pid, :kill)
+      _ -> :ok
+    end
+  end''',
+'''  def add_conn(id, info) do
+    :ets.insert(:p_conns, {id, info})
+    :ets.insert(:p_conn_bytes, {id, 0, 0})
+    case Map.get(info, :pid) do
+      pid when is_pid(pid) ->
+        GenServer.cast(__MODULE__, {:watch_conn, id, pid})
+      _ -> :ok
+    end
+    :ok
+  end
+
+  def remove_conn(id) do
+    :ets.delete(:p_conns, id)
+    :ets.delete(:p_conn_bytes, id)
+    :ok
+  end
+
+  def get_conn(id) do
+    case :ets.lookup(:p_conns, id) do
+      [{^id, i}] ->
+        {u, d} = case :ets.lookup(:p_conn_bytes, id) do
+          [{^id, uu, dd}] -> {uu, dd}
+          [] -> {0, 0}
+        end
+        i |> Map.put(:bytes_up, u) |> Map.put(:bytes_down, d)
+      [] -> nil
+    end
+  end
+
+  def all_conns do
+    :ets.tab2list(:p_conns)
+    |> Enum.filter(fn {_id, info} -> conn_alive?(info) end)
+    |> Enum.map(fn {id, info} ->
+      {u, d} = case :ets.lookup(:p_conn_bytes, id) do
+        [{^id, uu, dd}] -> {uu, dd}
+        [] -> {0, 0}
+      end
+      info
+      |> Map.put(:id, Map.get(info, :id, id))
+      |> Map.put(:bytes_up, u)
+      |> Map.put(:bytes_down, d)
+      |> Map.put_new(:start, System.system_time(:second))
+      |> Map.put_new(:user, "")
+      |> Map.put_new(:target, "N/A")
+    end)
+  end
+
+  defp conn_alive?(info) do
+    case Map.get(info, :pid) do
+      pid when is_pid(pid) -> Process.alive?(pid)
+      _ -> true
+    end
+  end
+
+  # Quét định kỳ, xoá entry có pid đã chết (dọn rác nếu handler crash mà không kịp remove)
+  def gc_dead_conns do
+    :ets.tab2list(:p_conns)
+    |> Enum.each(fn {id, info} ->
+      if not conn_alive?(info) do
+        :ets.delete(:p_conns, id)
+        :ets.delete(:p_conn_bytes, id)
+      end
+    end)
+    :ok
+  end
+
+  def inc_conn(id, dir, n) when n > 0 and dir in [:up, :down] do
+    case :ets.lookup(:p_conn_bytes, id) do
+      [{^id, _, _}] ->
+        pos = if dir == :up, do: 2, else: 3
+        :ets.update_counter(:p_conn_bytes, id, {pos, n})
+      _ -> 0
+    end
+  rescue
+    _ -> 0
+  end
+  def inc_conn(_, _, _), do: :ok
+
+  # Đóng connection: close các socket → handler pump unblock tự nhiên
+  # → return → after chạy remove_conn. KHÔNG dùng Process.exit(:kill)
+  # vì kill không chạy after → ETS không bao giờ được xoá.
+  def close_conn(id) do
+    case :ets.lookup(:p_conns, id) do
+      [{^id, info}] ->
+        close_sock(Map.get(info, :client_sock))
+        close_sock(Map.get(info, :remote_sock))
+        close_sock(Map.get(info, :udp_sock))
+
+        pid = Map.get(info, :pid)
+        # Watchdog: nếu 500ms sau vẫn còn entry thì force kill + xoá ETS
+        spawn(fn ->
+          Process.sleep(500)
+          case :ets.lookup(:p_conns, id) do
+            [{^id, _}] ->
+              if is_pid(pid) and Process.alive?(pid), do: Process.exit(pid, :kill)
+              :ets.delete(:p_conns, id)
+              :ets.delete(:p_conn_bytes, id)
+            _ -> :ok
+          end
+        end)
+        :ok
+      _ -> :ok
+    end
+  end
+
+  defp close_sock(nil), do: :ok
+  defp close_sock({:tcp, s}) do
+    try do :gen_tcp.close(s) rescue _ -> :ok catch _, _ -> :ok end
+  end
+  defp close_sock({:udp, s}) do
+    try do :gen_udp.close(s) rescue _ -> :ok catch _, _ -> :ok end
+  end
+  defp close_sock(_), do: :ok''',
+        'P.State: add_conn watch + all_conns filter + gc + close_conn socket')
+
+    # =====================================================================
+    # 2) ETS :p_conn_watch
+    # =====================================================================
+    src = sub_once(src,
+'''    safe_ets(:p_conn_bytes, [:named_table, :public, :set, {:write_concurrency, true}])
+    safe_ets(:p_udp, [:named_table, :public, :set, {:write_concurrency, true}])''',
+'''    safe_ets(:p_conn_bytes, [:named_table, :public, :set, {:write_concurrency, true}])
+    safe_ets(:p_conn_watch, [:named_table, :public, :set])
+    safe_ets(:p_udp, [:named_table, :public, :set, {:write_concurrency, true}])''',
+        'ETS :p_conn_watch')
+
+    # =====================================================================
+    # 3) Handle :watch_conn + :DOWN
+    # =====================================================================
+    src = sub_once(src,
+'''  @impl true
+  def handle_cast({:sub, ref, pid}, s), do: {:noreply, %{s | subs: Map.put(s.subs, ref, pid)}}''',
+'''  @impl true
+  def handle_cast({:watch_conn, id, pid}, s) do
+    ref = Process.monitor(pid)
+    :ets.insert(:p_conn_watch, {ref, id})
+    {:noreply, s}
+  end
+
+  def handle_cast({:sub, ref, pid}, s), do: {:noreply, %{s | subs: Map.put(s.subs, ref, pid)}}''',
+        'handle_cast :watch_conn')
+
+    src = sub_once(src,
+'''  @impl true
+  def handle_info(:flush, s) do
+    flush_usage()
+    Process.send_after(self(), :flush, 30_000)
+    {:noreply, s}
+  end''',
+'''  @impl true
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, s) do
+    case :ets.lookup(:p_conn_watch, ref) do
+      [{^ref, id}] ->
+        :ets.delete(:p_conn_watch, ref)
+        :ets.delete(:p_conns, id)
+        :ets.delete(:p_conn_bytes, id)
+      _ -> :ok
+    end
+    {:noreply, s}
+  end
+
+  def handle_info(:flush, s) do
+    flush_usage()
+    Process.send_after(self(), :flush, 30_000)
+    {:noreply, s}
+  end''',
+        'handle_info :DOWN cleanup')
+
+    # =====================================================================
+    # 4) GC trong :quota_check (10s)
+    # =====================================================================
+    src = sub_once(src,
+'''  def handle_info(:quota_check, s) do
+    kick_over_quota_users()
+    Process.send_after(self(), :quota_check, 10_000)
+    {:noreply, s}
+  end''',
+'''  def handle_info(:quota_check, s) do
+    kick_over_quota_users()
+    gc_dead_conns()
+    Process.send_after(self(), :quota_check, 10_000)
+    {:noreply, s}
+  end''',
+        'quota_check thêm gc_dead_conns')
+
+    # =====================================================================
+    # 5) Socks5.do_connect — info + sockets + try/after
+    # =====================================================================
+    src = sub_once(src,
+'''        info = %{
+          id: conn_id, ip: peer_ip, port: peer_port(sock),
+          type: "SOCKS5_TCP", target: "#{host}:#{port}",
+          user: user, rate_bps: bps,
+          bytes_up: 0, bytes_down: 0, pid: self(),
+          start: System.system_time(:second)
+        }
+        P.State.add_conn(conn_id, info)
+        P.State.inc(:socks5_tcp)
+        initial = P.Buf.drain(reader)
+        P.Tunnel.relay(sock, remote, conn_id, user, bps, initial)
+        P.State.remove_conn(conn_id)''',
+'''        info = %{
+          id: conn_id, ip: peer_ip, port: peer_port(sock),
+          type: "SOCKS5_TCP", target: "#{host}:#{port}",
+          user: user, rate_bps: bps,
+          bytes_up: 0, bytes_down: 0, pid: self(),
+          client_sock: {:tcp, sock}, remote_sock: {:tcp, remote},
+          start: System.system_time(:second)
+        }
+        P.State.add_conn(conn_id, info)
+        P.State.inc(:socks5_tcp)
+        initial = P.Buf.drain(reader)
+        try do
+          P.Tunnel.relay(sock, remote, conn_id, user, bps, initial)
+        after
+          P.State.remove_conn(conn_id)
+        end''',
+        'Socks5: +sockets, try/after')
+
+    # =====================================================================
+    # 6) HTTP CONNECT — info + sockets + try/after
+    # =====================================================================
+    src = sub_once(src,
+'''        info = %{
+          id: conn_id, ip: peer_ip, port: peer_port(sock),
+          type: "HTTP", target: "#{host}:#{port}", user: user, rate_bps: bps,
+          bytes_up: 0, bytes_down: 0, pid: self(),
+          start: System.system_time(:second)
+        }
+        P.State.add_conn(conn_id, info)
+        P.State.inc(:http)
+        initial = P.Buf.drain(reader)
+        P.Tunnel.relay(sock, remote, conn_id, user, bps, initial)
+        P.State.remove_conn(conn_id)
+      _ -> :gen_tcp.send(sock, "HTTP/1.1 502 Bad Gateway\\r\\n\\r\\n")''',
+'''        info = %{
+          id: conn_id, ip: peer_ip, port: peer_port(sock),
+          type: "HTTP", target: "#{host}:#{port}", user: user, rate_bps: bps,
+          bytes_up: 0, bytes_down: 0, pid: self(),
+          client_sock: {:tcp, sock}, remote_sock: {:tcp, remote},
+          start: System.system_time(:second)
+        }
+        P.State.add_conn(conn_id, info)
+        P.State.inc(:http)
+        initial = P.Buf.drain(reader)
+        try do
+          P.Tunnel.relay(sock, remote, conn_id, user, bps, initial)
+        after
+          P.State.remove_conn(conn_id)
+        end
+      _ -> :gen_tcp.send(sock, "HTTP/1.1 502 Bad Gateway\\r\\n\\r\\n")''',
+        'HTTP CONNECT: +sockets, try/after')
+
+    # =====================================================================
+    # 7) HTTP non-CONNECT — info + sockets + try/after
+    # =====================================================================
+    src = sub_once(src,
+'''        info = %{
+          id: conn_id, ip: peer_ip, port: peer_port(sock),
+          type: "HTTP", target: "#{host}:#{port}", user: user, rate_bps: bps,
+          bytes_up: 0, bytes_down: 0, pid: self(),
+          start: System.system_time(:second)
+        }
+        P.State.add_conn(conn_id, info)
+        P.State.inc(:http)
+        url2 = if String.starts_with?(url, ["http://", "https://"]), do: url, else: "http://" <> url''',
+'''        info = %{
+          id: conn_id, ip: peer_ip, port: peer_port(sock),
+          type: "HTTP", target: "#{host}:#{port}", user: user, rate_bps: bps,
+          bytes_up: 0, bytes_down: 0, pid: self(),
+          client_sock: {:tcp, sock}, remote_sock: {:tcp, remote},
+          start: System.system_time(:second)
+        }
+        P.State.add_conn(conn_id, info)
+        P.State.inc(:http)
+        url2 = if String.starts_with?(url, ["http://", "https://"]), do: url, else: "http://" <> url''',
+        'HTTP non-CONNECT: +sockets')
+
+    # Wrap body HTTP non-CONNECT: đặt try/after quanh toàn bộ khối gửi request
+    src = sub_once(src,
+'''        :gen_tcp.send(remote, req)
+        P.State.inc(:bytes_up, byte_size(req))
+        P.State.inc_conn(conn_id, :up, byte_size(req))
+
+        # Request smuggling protection: CL + TE cùng lúc = reject
+        cl_hdr = headers["content-length"]
+        te_hdr = headers["transfer-encoding"]
+        chunked = te_hdr && String.contains?(String.downcase(te_hdr), "chunked")
+
+        cond do
+          cl_hdr != nil and chunked ->
+            Logger.warning("Reject: cả Content-Length và Transfer-Encoding cùng lúc")
+            :gen_tcp.send(sock, "HTTP/1.1 400 Bad Request\\r\\n\\r\\n")
+          chunked ->
+            relay_chunked(reader, remote, conn_id, user)
+          cl_hdr ->
+            case Integer.parse(cl_hdr) do
+              {n, ""} when n > 0 -> forward_body(reader, remote, conn_id, n, user)
+              _ -> :ok
+            end
+          true -> :ok
+        end
+        forward_response(remote, sock, conn_id, user, bps)
+        :gen_tcp.close(remote)
+        P.State.remove_conn(conn_id)''',
+'''        try do
+          :gen_tcp.send(remote, req)
+          P.State.inc(:bytes_up, byte_size(req))
+          P.State.inc_conn(conn_id, :up, byte_size(req))
+
+          cl_hdr = headers["content-length"]
+          te_hdr = headers["transfer-encoding"]
+          chunked = te_hdr && String.contains?(String.downcase(te_hdr), "chunked")
+
+          cond do
+            cl_hdr != nil and chunked ->
+              Logger.warning("Reject: cả Content-Length và Transfer-Encoding cùng lúc")
+              :gen_tcp.send(sock, "HTTP/1.1 400 Bad Request\\r\\n\\r\\n")
+            chunked ->
+              relay_chunked(reader, remote, conn_id, user)
+            cl_hdr ->
+              case Integer.parse(cl_hdr) do
+                {n, ""} when n > 0 -> forward_body(reader, remote, conn_id, n, user)
+                _ -> :ok
+              end
+            true -> :ok
+          end
+          forward_response(remote, sock, conn_id, user, bps)
+        after
+          :gen_tcp.close(remote)
+          P.State.remove_conn(conn_id)
+        end''',
+        'HTTP non-CONNECT: try/after')
+
+    # =====================================================================
+    # 8) UDPRelay — info + sockets + try/after
+    # =====================================================================
+    src = sub_once(src,
+'''    info = %{
+      id: conn_id, ip: peer_ip, port: 0,
+      type: "SOCKS5_UDP", target: "UDP:any",
+      user: user, rate_bps: 0,
+      bytes_up: 0, bytes_down: 0, pid: self(),
+      start: System.system_time(:second)
+    }
+    P.State.add_conn(conn_id, info)
+    P.State.inc(:socks5_udp)''',
+'''    info = %{
+      id: conn_id, ip: peer_ip, port: 0,
+      type: "SOCKS5_UDP", target: "UDP:any",
+      user: user, rate_bps: 0,
+      bytes_up: 0, bytes_down: 0, pid: self(),
+      client_sock: {:tcp, sock}, udp_sock: {:udp, udp},
+      start: System.system_time(:second)
+    }
+    P.State.add_conn(conn_id, info)
+    P.State.inc(:socks5_udp)''',
+        'UDP: +sockets trong info')
+
+    src = sub_once(src,
+'''    # Watch TCP control channel
+    result = case :gen_tcp.recv(sock, 0, :infinity) do
+      {:ok, _} ->
+        send(pid, :stop)
+        start(sock, nil, nil, nil, peer_ip, user)
+      _ ->
+        send(pid, :stop)
+        :ok
+    end
+    P.State.remove_conn(conn_id)
+    result
+  end''',
+'''    try do
+      case :gen_tcp.recv(sock, 0, :infinity) do
+        {:ok, _} ->
+          send(pid, :stop)
+          start(sock, nil, nil, nil, peer_ip, user)
+        _ ->
+          send(pid, :stop)
+          :ok
+      end
+    after
+      P.State.remove_conn(conn_id)
+    end
+  end''',
+        'UDP: try/after quanh watch TCP')
+
+    # =====================================================================
+    # 9) P.Tunnel.relay — try/after kill child
+    # =====================================================================
+    src = sub_once(src,
+'''    pump(client, remote, conn_id, user, rate_bps, false, parent)
+    if Process.alive?(pid), do: Process.exit(pid, :kill)
+  end''',
+'''    try do
+      pump(client, remote, conn_id, user, rate_bps, false, parent)
+    after
+      if Process.alive?(pid), do: Process.exit(pid, :kill)
+    end
+  end''',
+        'Tunnel.relay: try/after kill child')
+
+    # =====================================================================
+    # 10) Debug endpoint /api/debug/conns
+    # =====================================================================
+    src = sub_once(src,
+'''          {"GET", "/api/audit-log"} -> respond(sock, 200, "application/json", P.JSON.encode(%{"events" => P.Audit.audit_log()}))''',
+'''          {"GET", "/api/audit-log"} -> respond(sock, 200, "application/json", P.JSON.encode(%{"events" => P.Audit.audit_log()}))
+          {"GET", "/api/debug/conns"} -> respond(sock, 200, "application/json", debug_conns())''',
+        'route /api/debug/conns')
+
+    src = sub_once(src,
+'''  defp api_users do''',
+'''  defp debug_conns do
+    raw = :ets.tab2list(:p_conns)
+    bytes = :ets.tab2list(:p_conn_bytes)
+    P.JSON.encode(%{
+      "p_conns_size" => length(raw),
+      "p_conn_bytes_size" => length(bytes),
+      "p_conns" => Enum.map(raw, fn {id, info} ->
+        pid = Map.get(info, :pid)
+        %{
+          "id" => id,
+          "type" => Map.get(info, :type),
+          "target" => Map.get(info, :target),
+          "pid" => inspect(pid),
+          "pid_alive" => (is_pid(pid) and Process.alive?(pid)) || false,
+          "start" => Map.get(info, :start)
+        }
+      end),
+      "p_conn_bytes" => Enum.map(bytes, fn {id, u, d} ->
+        %{"id" => id, "up" => u, "down" => d}
+      end)
+    })
+  end
+
+  defp api_users do''',
+        'debug_conns function')
+
+    if src == orig:
+        print("\nKhông có thay đổi.")
+        return
+    TARGET.write_text(src, encoding="utf-8")
+    print(f"\n✅ Đã ghi {TARGET} ({len(src)} bytes)")
+    print("\nKiểm tra syntax:")
+    print(f'  elixir -e \'Code.string_to_quoted!(File.read!("{TARGET}"))\' && echo SYNTAX_OK')
+
+if __name__ == "__main__":
+    main()

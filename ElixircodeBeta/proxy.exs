@@ -650,6 +650,12 @@ defmodule P.State do
 
   def all_conns do
     :ets.tab2list(:p_conns)
+    |> Enum.filter(fn {_id, info} ->
+      case Map.get(info, :pid) do
+        pid when is_pid(pid) -> Process.alive?(pid)
+        _ -> true
+      end
+    end)
     |> Enum.map(fn {id, info} ->
       {u, d} = case :ets.lookup(:p_conn_bytes, id) do
         [{^id, uu, dd}] -> {uu, dd}
@@ -665,6 +671,22 @@ defmodule P.State do
   end
 
   # Chỉ update counter nếu key còn tồn tại — tránh tái tạo ETS sau khi remove
+  def gc_dead_conns do
+    :ets.tab2list(:p_conns)
+    |> Enum.each(fn {id, info} ->
+      pid = Map.get(info, :pid)
+      alive = case pid do
+        p when is_pid(p) -> Process.alive?(p)
+        _ -> true
+      end
+      if not alive do
+        :ets.delete(:p_conns, id)
+        :ets.delete(:p_conn_bytes, id)
+      end
+    end)
+    :ok
+  end
+
   def inc_conn(id, dir, n) when n > 0 and dir in [:up, :down] do
     case :ets.lookup(:p_conn_bytes, id) do
       [{^id, _, _}] ->
@@ -788,6 +810,7 @@ defmodule P.State do
     Process.send_after(self(), :flush, 30_000)
     Process.send_after(self(), :sample, 2000)
     Process.send_after(self(), :quota_check, 10_000)
+    Process.send_after(self(), :cleanup_subs, 30_000)
     {:ok, %{subs: %{}}}
   end
 
@@ -824,8 +847,24 @@ defmodule P.State do
 
   def handle_info(:quota_check, s) do
     kick_over_quota_users()
+    gc_dead_conns()
     Process.send_after(self(), :quota_check, 10_000)
     {:noreply, s}
+  end
+
+  def handle_info(:cleanup_subs, s) do
+    # Dọn subscriber đã chết (SSE handler đã exit) — tránh leak theo mỗi reload dashboard
+    alive =
+      s.subs
+      |> Enum.filter(fn {_, pid} -> is_pid(pid) and Process.alive?(pid) end)
+      |> Map.new()
+    dropped = map_size(s.subs) - map_size(alive)
+    if dropped > 0 do
+      # không log để tránh noise — chỉ âm thầm dọn
+      _ = dropped
+    end
+    Process.send_after(self(), :cleanup_subs, 30_000)
+    {:noreply, %{s | subs: alive}}
   end
 
   def handle_info(:sample, s) do
@@ -2228,10 +2267,12 @@ defmodule P.Dashboard do
         case {method, path} do
           {"GET", "/"} -> respond(sock, 200, "text/html; charset=utf-8", html())
           {"GET", "/api/all"} -> respond(sock, 200, "application/json", api_all())
+          {"GET", "/api/conns"} -> respond(sock, 200, "application/json", api_conns())
           {"GET", "/api/users"} -> respond(sock, 200, "application/json", api_users())
           {"GET", "/api/tokens"} -> respond(sock, 200, "application/json", api_tokens())
           {"GET", "/api/network-config"} -> respond(sock, 200, "application/json", api_net())
           {"GET", "/api/audit-log"} -> respond(sock, 200, "application/json", P.JSON.encode(%{"events" => P.Audit.audit_log()}))
+          {"GET", "/api/debug/conns"} -> respond(sock, 200, "application/json", debug_conns())
           {"GET", "/api/reload-history"} -> respond(sock, 200, "application/json", P.JSON.encode(%{"history" => P.Audit.reload_history()}))
           {"GET", "/api/stream"} -> sse(sock)
           {"GET", "/api/config/export"} -> export_config(sock, actor)
@@ -2337,7 +2378,9 @@ defmodule P.Dashboard do
     resp = "HTTP/1.1 #{code} #{text}\r\n" <>
            "Content-Type: #{ctype}\r\n" <>
            "Content-Length: #{byte_size(body_b)}\r\n" <>
-           "Cache-Control: no-store\r\n" <>
+           "Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n" <>
+           "Pragma: no-cache\r\n" <>
+           "Expires: 0\r\n" <>
            "Connection: close\r\n\r\n" <> body_b
     case :gen_tcp.send(sock, resp) do
       :ok -> :ok
@@ -2367,6 +2410,50 @@ defmodule P.Dashboard do
       "udp_associations" => %{}
     })
     P.JSON.encode(d)
+  end
+
+  defp debug_conns do
+    raw = :ets.tab2list(:p_conns)
+    bytes = :ets.tab2list(:p_conn_bytes)
+    P.JSON.encode(%{
+      "p_conns_size" => length(raw),
+      "p_conn_bytes_size" => length(bytes),
+      "p_conns" => Enum.map(raw, fn {id, info} ->
+        pid = Map.get(info, :pid)
+        %{
+          "id" => id,
+          "type" => Map.get(info, :type),
+          "target" => Map.get(info, :target),
+          "pid" => inspect(pid),
+          "pid_alive" => (is_pid(pid) and Process.alive?(pid)) || false,
+          "start" => Map.get(info, :start)
+        }
+      end),
+      "p_conn_bytes" => Enum.map(bytes, fn {id, u, d} ->
+        %{"id" => id, "up" => u, "down" => d}
+      end)
+    })
+  end
+
+  defp api_conns do
+    now = System.system_time(:second)
+    conns = Enum.map(P.State.all_conns(), fn c -> %{
+      "id" => Map.get(c, :id, ""),
+      "ip" => Map.get(c, :ip, "?"),
+      "port" => Map.get(c, :port, 0),
+      "type" => Map.get(c, :type, "?"),
+      "target" => Map.get(c, :target, "N/A"),
+      "user" => Map.get(c, :user, ""),
+      "bytes_up" => Map.get(c, :bytes_up, 0),
+      "bytes_down" => Map.get(c, :bytes_down, 0),
+      "start_time" => Map.get(c, :start, now),
+      "duration" => now - Map.get(c, :start, now)
+    } end)
+    P.JSON.encode(%{
+      "t" => now,
+      "count" => length(conns),
+      "active_connections" => conns
+    })
   end
 
   defp api_users do
@@ -2902,11 +2989,46 @@ let lastConns=[],sortKey='start_time',sortDir='desc',trafficChart=null;
 const CHART_MAX_POINTS=150;
 function initChart(){const ctx=document.getElementById('trafficChart').getContext('2d');trafficChart=new Chart(ctx,{type:'line',data:{labels:[],datasets:[{label:'Upload (B/s)',data:[],borderColor:'#ea580c',backgroundColor:'rgba(234,88,12,.1)',tension:.3,pointRadius:0,borderWidth:2},{label:'Download (B/s)',data:[],borderColor:'#0891b2',backgroundColor:'rgba(8,145,178,.1)',tension:.3,pointRadius:0,borderWidth:2}]},options:{responsive:true,animation:false,interaction:{mode:'index',intersect:false},scales:{x:{ticks:{color:getComputedStyle(document.documentElement).getPropertyValue('--muted')},grid:{color:getComputedStyle(document.documentElement).getPropertyValue('--border2')}},y:{ticks:{color:getComputedStyle(document.documentElement).getPropertyValue('--muted'),callback:v=>formatBytes(v)+'/s'},grid:{color:getComputedStyle(document.documentElement).getPropertyValue('--border2')}}},plugins:{legend:{labels:{color:getComputedStyle(document.documentElement).getPropertyValue('--fg')}}}}});}
 function pushChartSample(s){if(!trafficChart)return;const label=new Date(s.t*1000).toLocaleTimeString();trafficChart.data.labels.push(label);trafficChart.data.datasets[0].data.push(s.up_bps);trafficChart.data.datasets[1].data.push(s.down_bps);if(trafficChart.data.labels.length>CHART_MAX_POINTS){trafficChart.data.labels.shift();trafficChart.data.datasets[0].data.shift();trafficChart.data.datasets[1].data.shift();}trafficChart.update('none');}
-function connectStream(){const st=document.getElementById('streamStatus');const es=new EventSource('/api/stream');es.addEventListener('history',e=>{try{JSON.parse(e.data).forEach(pushChartSample);st.textContent='(live)';st.style.color='#86efac';}catch(err){console.error(err);}});es.addEventListener('sample',e=>{try{pushChartSample(JSON.parse(e.data));}catch(err){console.error(err);}});es.onerror=()=>{st.textContent='(reconnecting...)';st.style.color='#fca5a5';};es.onopen=()=>{st.textContent='(live)';st.style.color='#86efac';};}
+function connectStream(){const st=document.getElementById('streamStatus');const es=new EventSource('/api/stream');es.addEventListener('history',e=>{try{JSON.parse(e.data).forEach(pushChartSample);st.textContent='(live)';st.style.color='#86efac';}catch(err){console.error(err);}});es.addEventListener('sample',e=>{
+    try{
+      pushChartSample(JSON.parse(e.data));
+    }catch(err){console.error(err);}
+    // Mỗi sample (~2s) trigger refresh connections — throttled tránh spam
+    if(typeof window.__lastConnFetch!=='number' || Date.now()-window.__lastConnFetch>1500){
+      window.__lastConnFetch=Date.now();
+      fetchConnsOnly();
+    }
+  });es.onerror=()=>{st.textContent='(reconnecting...)';st.style.color='#fca5a5';};es.onopen=()=>{st.textContent='(live)';st.style.color='#86efac';};}
 function applyTheme(t){document.documentElement.setAttribute('data-theme',t);document.getElementById('themeToggleBtn').textContent=t==='light'?'☀️ Theme':'🌙 Theme';try{localStorage.setItem('dashboard-theme',t);}catch(e){}}
 function toggleTheme(){const cur=document.documentElement.getAttribute('data-theme')||'dark';applyTheme(cur==='light'?'dark':'light');}
 (function(){let s='dark';try{s=localStorage.getItem('dashboard-theme')||'dark';}catch(e){}applyTheme(s);})();
-async function fetchAll(){try{const res=await fetch('/api/all');if(!res.ok)throw new Error('HTTP '+res.status);const d=await res.json();renderStats(d);lastConns=d.active_connections||[];renderConnections();renderUpstream(d.upstream||{});}catch(e){console.error(e);document.getElementById('statsGrid').innerHTML='<div style="color:#dc2626;">⚠️ Failed to load. Retrying...</div>';}}
+async function fetchAll(){
+  try{
+    const url='/api/all?_='+Date.now();
+    const res=await fetch(url,{cache:'no-store',credentials:'same-origin'});
+    if(!res.ok)throw new Error('HTTP '+res.status);
+    const d=await res.json();
+    renderStats(d);
+    lastConns=d.active_connections||[];
+    renderConnections();
+    renderUpstream(d.upstream||{});
+    console.log('[fetchAll] conns='+lastConns.length+' active='+d.active+' total='+d.total);
+  }catch(e){
+    console.error('fetchAll error:',e);
+    document.getElementById('statsGrid').innerHTML='<div style="color:#dc2626;">⚠️ Failed to load. Retrying...</div>';
+  }
+}
+
+// Chỉ fetch connections — nhẹ hơn /api/all, dùng cho refresh nhanh
+async function fetchConnsOnly(){
+  try{
+    const res=await fetch('/api/conns?_='+Date.now(),{cache:'no-store',credentials:'same-origin'});
+    if(!res.ok)return;
+    const d=await res.json();
+    lastConns=d.active_connections||[];
+    renderConnections();
+  }catch(e){}
+}
 function renderStats(d){const boxes=[['Total Connections',d.total],['Active',d.active],['SOCKS5 TCP',d.socks5_tcp],['SOCKS5 UDP',d.socks5_udp],['HTTP Requests',d.http],['UDP Associations',d.udp_assocs||0],['Bytes Up (TCP)',formatBytes(d.bytes_up)],['Bytes Down (TCP)',formatBytes(d.bytes_down)],['UDP Up',formatBytes(d.udp_up)],['UDP Down',formatBytes(d.udp_down)],['Uptime',formatUptime(d.uptime)]];document.getElementById('statsGrid').innerHTML=boxes.map(b=>'<div class="stat-box"><div class="stat-label">'+b[0]+'</div><div class="stat-value">'+b[1]+'</div></div>').join('');}
 function sortConns(k){if(sortKey===k){sortDir=sortDir==='asc'?'desc':'asc';}else{sortKey=k;sortDir='asc';}renderConnections();}
 function renderConnections(){const f=(document.getElementById('connFilter').value||'').toLowerCase().trim();let conns=lastConns.slice();if(f){conns=conns.filter(c=>(c.ip||'').toLowerCase().includes(f)||(c.target||'').toLowerCase().includes(f)||(c.type||'').toLowerCase().includes(f));}conns.sort((a,b)=>{let av=a[sortKey],bv=b[sortKey];if(typeof av==='string'){av=av.toLowerCase();bv=(bv||'').toLowerCase();}if(av<bv)return sortDir==='asc'?-1:1;if(av>bv)return sortDir==='asc'?1:-1;return 0;});if(!conns.length){document.getElementById('connectionsTable').innerHTML='<div style="padding:15px;color:var(--muted);">No active connections</div>';return;}const cols=[['ip','IP'],['port','Port'],['type','Type'],['target','Target'],['duration','Duration'],['bytes_up','Bytes Up'],['bytes_down','Bytes Down']];let thead='<tr>';cols.forEach(c=>{let cls=sortKey===c[0]?(sortDir==='asc'?'sorted-asc':'sorted-desc'):'';thead+='<th class="'+cls+'" onclick="sortConns(\''+c[0]+'\')">'+c[1]+'</th>';});thead+='<th>Action</th></tr>';let html='<table><thead>'+thead+'</thead><tbody>';conns.forEach(c=>{let bg='<span class="badge">'+esc(c.type)+'</span>';if(c.type==='SOCKS5_TCP')bg='<span class="badge socks5-tcp">SOCKS5 TCP</span>';else if(c.type==='SOCKS5_UDP')bg='<span class="badge socks5-udp">SOCKS5 UDP</span>';else if(c.type==='HTTP')bg='<span class="badge http">HTTP</span>';html+='<tr><td>'+esc(c.ip)+'</td><td>'+esc(c.port)+'</td><td>'+bg+'</td><td>'+esc(c.target||'N/A')+'</td><td>'+formatUptime(c.duration)+'</td><td>'+formatBytes(c.bytes_up)+'</td><td>'+formatBytes(c.bytes_down)+'</td><td><button class="btn btn-sm btn-danger" onclick="kickConn(\''+esc(c.id)+'\')">Kick</button></td></tr>';});html+='</tbody></table>';document.getElementById('connectionsTable').innerHTML=html;}
@@ -2941,7 +3063,7 @@ function openPwModal(){document.getElementById('pwMsg').textContent='';document.
 function closePwModal(){document.getElementById('pwModalOverlay').classList.remove('open');}
 async function submitPwChange(e){e.preventDefault();const m=document.getElementById('pwMsg');const cur=document.getElementById('curPass').value,nuser=document.getElementById('newUser').value.trim(),np=document.getElementById('newPass').value,np2=document.getElementById('newPass2').value;if(np!==np2){m.textContent='Password confirmation mismatch.';m.className='modal-msg error';return false;}if(np.length<8){m.textContent='Password >= 8 chars.';m.className='modal-msg error';return false;}try{const res=await fetch('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:cur,new_username:nuser,new_password:np})});const d=await res.json();if(!res.ok){m.textContent=d.error||'HTTP '+res.status;m.className='modal-msg error';return false;}m.textContent='Changed! Reloading...';m.className='modal-msg success';setTimeout(()=>window.location.reload(),1500);}catch(err){m.textContent='Err: '+err.message;m.className='modal-msg error';}return false;}
 fetchAll();fetchUsers();fetchNetworkConfig();fetchReloadHistory();fetchTokens();fetchAuditLog();
-setInterval(fetchAll,5000);setInterval(fetchUsers,15000);setInterval(fetchReloadHistory,15000);setInterval(fetchAuditLog,15000);
+setInterval(fetchAll,5000);setInterval(fetchConnsOnly,2000);setInterval(fetchUsers,15000);setInterval(fetchReloadHistory,15000);setInterval(fetchAuditLog,15000);
 function loadScript(src){return new Promise((res,rej)=>{const t=document.createElement('script');t.src=src;t.onload=()=>res();t.onerror=()=>rej(new Error('fail '+src));document.head.appendChild(t);});}
 async function loadChartJS(){for(const u of ['https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js','https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js','https://unpkg.com/chart.js@4.4.4/dist/chart.umd.min.js']){try{await loadScript(u);if(typeof Chart!=='undefined')return true;}catch(e){}}return false;}
 (async function(){try{const ok=await loadChartJS();if(!ok)throw new Error('Chart.js CDN blocked');initChart();connectStream();}catch(err){console.error(err);const st=document.getElementById('streamStatus');if(st){st.textContent='(unavailable)';st.style.color='#fca5a5';}const cv=document.getElementById('trafficChart');if(cv){cv.outerHTML='<div style="padding:20px;color:#fca5a5;font-size:.85rem;">⚠️ Không tải được biểu đồ: '+err.message+'<br>Stats/Connections/Users vẫn hoạt động.</div>';}}})();

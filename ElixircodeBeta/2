@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+fix_live_conns.py — Fix dashboard không update realtime.
+  1. Cache-busting: fetch URL có ?t=<timestamp> + cache: 'no-store'
+  2. SSE sample trigger fetchAll (throttled 1.5s) → realtime connections
+  3. P.State tự động dọn subscriber đã chết (30s)
+  4. Endpoint /api/conns nhẹ (chỉ connections, không stats)
+  5. Force no-cache mọi response (thêm Pragma + Expires)
+  6. Log connection count mỗi fetch để debug
+Idempotent. Backup timestamp.
+"""
+import sys, time, shutil, re
+from pathlib import Path
+
+TARGET = Path(sys.argv[1] if len(sys.argv) > 1 else "proxy.exs")
+
+def sub_once(s, old, new, label):
+    if old in s:
+        print(f"[ OK ] {label}")
+        return s.replace(old, new, 1)
+    probe = new.strip().splitlines()[0][:60]
+    if probe and probe in s:
+        print(f"[SKIP] {label}")
+        return s
+    print(f"[MISS] {label}")
+    return s
+
+def main():
+    if not TARGET.exists():
+        print("Không tìm thấy:", TARGET); sys.exit(1)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    bak = TARGET.with_suffix(TARGET.suffix + f".{ts}.bak")
+    shutil.copy2(TARGET, bak)
+    print(f"Backup -> {bak}\n")
+
+    src = TARGET.read_text(encoding="utf-8")
+    orig = src
+
+    # =====================================================================
+    # 1) Force no-cache mọi response trong P.Dashboard.respond
+    # =====================================================================
+    src = sub_once(src,
+'''    resp = "HTTP/1.1 #{code} #{text}\\r\\n" <>
+           "Content-Type: #{ctype}\\r\\n" <>
+           "Content-Length: #{byte_size(body_b)}\\r\\n" <>
+           "Cache-Control: no-store\\r\\n" <>
+           "Connection: close\\r\\n\\r\\n" <> body_b''',
+'''    resp = "HTTP/1.1 #{code} #{text}\\r\\n" <>
+           "Content-Type: #{ctype}\\r\\n" <>
+           "Content-Length: #{byte_size(body_b)}\\r\\n" <>
+           "Cache-Control: no-store, no-cache, must-revalidate, max-age=0\\r\\n" <>
+           "Pragma: no-cache\\r\\n" <>
+           "Expires: 0\\r\\n" <>
+           "Connection: close\\r\\n\\r\\n" <> body_b''',
+        'respond: force no-cache')
+
+    # =====================================================================
+    # 2) Endpoint /api/conns nhẹ (chỉ connections, không stats)
+    # =====================================================================
+    src = sub_once(src,
+'''          {"GET", "/api/all"} -> respond(sock, 200, "application/json", api_all())''',
+'''          {"GET", "/api/all"} -> respond(sock, 200, "application/json", api_all())
+          {"GET", "/api/conns"} -> respond(sock, 200, "application/json", api_conns())''',
+        'route /api/conns')
+
+    src = sub_once(src,
+'''  defp api_users do''',
+'''  defp api_conns do
+    now = System.system_time(:second)
+    conns = Enum.map(P.State.all_conns(), fn c -> %{
+      "id" => Map.get(c, :id, ""),
+      "ip" => Map.get(c, :ip, "?"),
+      "port" => Map.get(c, :port, 0),
+      "type" => Map.get(c, :type, "?"),
+      "target" => Map.get(c, :target, "N/A"),
+      "user" => Map.get(c, :user, ""),
+      "bytes_up" => Map.get(c, :bytes_up, 0),
+      "bytes_down" => Map.get(c, :bytes_down, 0),
+      "start_time" => Map.get(c, :start, now),
+      "duration" => now - Map.get(c, :start, now)
+    } end)
+    P.JSON.encode(%{
+      "t" => now,
+      "count" => length(conns),
+      "active_connections" => conns
+    })
+  end
+
+  defp api_users do''',
+        'api_conns/0')
+
+    # =====================================================================
+    # 3) Subscriber cleanup trong P.State
+    # =====================================================================
+    # Thêm timer init
+    src = sub_once(src,
+'''    Process.send_after(self(), :flush, 30_000)
+    Process.send_after(self(), :sample, 2000)
+    Process.send_after(self(), :quota_check, 10_000)
+    {:ok, %{subs: %{}}}''',
+'''    Process.send_after(self(), :flush, 30_000)
+    Process.send_after(self(), :sample, 2000)
+    Process.send_after(self(), :quota_check, 10_000)
+    Process.send_after(self(), :cleanup_subs, 30_000)
+    {:ok, %{subs: %{}}}''',
+        'State init cleanup_subs timer')
+
+    # Thêm handle_info
+    src = sub_once(src,
+'''  def handle_info(:quota_check, s) do
+    kick_over_quota_users()
+    gc_dead_conns()
+    Process.send_after(self(), :quota_check, 10_000)
+    {:noreply, s}
+  end''',
+'''  def handle_info(:quota_check, s) do
+    kick_over_quota_users()
+    gc_dead_conns()
+    Process.send_after(self(), :quota_check, 10_000)
+    {:noreply, s}
+  end
+
+  def handle_info(:cleanup_subs, s) do
+    # Dọn subscriber đã chết (SSE handler đã exit) — tránh leak theo mỗi reload dashboard
+    alive =
+      s.subs
+      |> Enum.filter(fn {_, pid} -> is_pid(pid) and Process.alive?(pid) end)
+      |> Map.new()
+    dropped = map_size(s.subs) - map_size(alive)
+    if dropped > 0 do
+      # không log để tránh noise — chỉ âm thầm dọn
+      _ = dropped
+    end
+    Process.send_after(self(), :cleanup_subs, 30_000)
+    {:noreply, %{s | subs: alive}}
+  end''',
+        'State handle_info cleanup_subs')
+
+    # =====================================================================
+    # 4) JS: fetchAll dùng cache-buster + no-store
+    # =====================================================================
+    src = sub_once(src,
+'''async function fetchAll(){try{const res=await fetch('/api/all');if(!res.ok)throw new Error('HTTP '+res.status);const d=await res.json();renderStats(d);lastConns=d.active_connections||[];renderConnections();renderUpstream(d.upstream||{});}catch(e){console.error(e);document.getElementById('statsGrid').innerHTML='<div style="color:#dc2626;">⚠️ Failed to load. Retrying...</div>';}}''',
+'''async function fetchAll(){
+  try{
+    const url='/api/all?_='+Date.now();
+    const res=await fetch(url,{cache:'no-store',credentials:'same-origin'});
+    if(!res.ok)throw new Error('HTTP '+res.status);
+    const d=await res.json();
+    renderStats(d);
+    lastConns=d.active_connections||[];
+    renderConnections();
+    renderUpstream(d.upstream||{});
+    console.log('[fetchAll] conns='+lastConns.length+' active='+d.active+' total='+d.total);
+  }catch(e){
+    console.error('fetchAll error:',e);
+    document.getElementById('statsGrid').innerHTML='<div style="color:#dc2626;">⚠️ Failed to load. Retrying...</div>';
+  }
+}
+
+// Chỉ fetch connections — nhẹ hơn /api/all, dùng cho refresh nhanh
+async function fetchConnsOnly(){
+  try{
+    const res=await fetch('/api/conns?_='+Date.now(),{cache:'no-store',credentials:'same-origin'});
+    if(!res.ok)return;
+    const d=await res.json();
+    lastConns=d.active_connections||[];
+    renderConnections();
+  }catch(e){}
+}''',
+        'JS fetchAll cache-buster + fetchConnsOnly')
+
+    # =====================================================================
+    # 5) SSE sample → trigger fetchConnsOnly (throttled)
+    # =====================================================================
+    src = sub_once(src,
+'''es.addEventListener('sample',e=>{try{pushChartSample(JSON.parse(e.data));}catch(err){console.error(err);}});''',
+'''es.addEventListener('sample',e=>{
+    try{
+      pushChartSample(JSON.parse(e.data));
+    }catch(err){console.error(err);}
+    // Mỗi sample (~2s) trigger refresh connections — throttled tránh spam
+    if(typeof window.__lastConnFetch!=='number' || Date.now()-window.__lastConnFetch>1500){
+      window.__lastConnFetch=Date.now();
+      fetchConnsOnly();
+    }
+  });''',
+        'SSE sample trigger fetchConnsOnly')
+
+    # =====================================================================
+    # 6) Tăng tần suất interval fetchAll (5s → 3s) + thêm fetchConnsOnly 2s
+    # =====================================================================
+    src = sub_once(src,
+'''setInterval(fetchAll,5000);setInterval(fetchUsers,15000);setInterval(fetchReloadHistory,15000);setInterval(fetchAuditLog,15000);''',
+'''setInterval(fetchAll,5000);setInterval(fetchConnsOnly,2000);setInterval(fetchUsers,15000);setInterval(fetchReloadHistory,15000);setInterval(fetchAuditLog,15000);''',
+        'Interval fetchConnsOnly 2s')
+
+    if src == orig:
+        print("\nKhông có thay đổi.")
+        return
+    TARGET.write_text(src, encoding="utf-8")
+    print(f"\n✅ Đã ghi {TARGET} ({len(src)} bytes)")
+    print("\nKiểm tra syntax:")
+    print(f'  elixir -e \'Code.string_to_quoted!(File.read!("{TARGET}"))\' && echo SYNTAX_OK')
+
+if __name__ == "__main__":
+    main()
