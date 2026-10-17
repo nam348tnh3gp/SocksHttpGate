@@ -1,6 +1,0 @@
-*
-!.gitignore
-!proxy.ex
-!proxy.exs
-!mix.exs
-!mix.lock
