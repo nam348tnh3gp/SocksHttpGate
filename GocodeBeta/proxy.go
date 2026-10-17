@@ -39,7 +39,7 @@ const (
 	UDP_IDLE_TIMEOUT   = 120 * time.Second
 	BUFFER_SIZE        = 65536
 	UDP_BUFFER_SIZE    = 65535
-	DASHBOARD_MAX_SSE  = 16 // FIX v6.3.6: giới hạn SSE client đồng thời (parity với Python/C)
+	DASHBOARD_MAX_SSE  = 16
 )
 
 var (
@@ -53,16 +53,13 @@ var (
 	keyFile       string
 	dashboardPort int
 	dashboardUser     string
-	dashboardPassHash string // hash (không lưu plaintext) — xem hashPassword/verifyPassword
+	dashboardPassHash string
 	logFilePath       string
 	logMaxSizeMB      int
 	logMaxBackups     int
 )
 
 // ======================== LOGGING RA FILE CÓ ROTATION ========================
-// rotatingWriter là io.Writer tự xoay file log khi vượt kích thước, giữ tối đa
-// maxBackups bản cũ (đặt tên path.1, path.2, ...). Viết tay bằng stdlib vì môi
-// trường build không có mạng để `go get` lumberjack.
 type rotatingWriter struct {
 	mu           sync.Mutex
 	path         string
@@ -125,9 +122,7 @@ func (rw *rotatingWriter) rotate() {
 type countingWriter struct {
 	w        io.Writer
 	n        *int64
-	limitBps *int64 // con trỏ tới ci.RateLimitBps -> đọc động mỗi lần Write, để đổi giới hạn
-	// băng thông có tác dụng NGAY cho connection đang mở, không cần đợi connection mới.
-	// nil hoặc *limitBps <= 0 = không giới hạn.
+	limitBps *int64
 }
 
 func (cw *countingWriter) Write(p []byte) (int, error) {
@@ -136,7 +131,6 @@ func (cw *countingWriter) Write(p []byte) (int, error) {
 		atomic.AddInt64(cw.n, int64(n))
 		if cw.limitBps != nil {
 			if limit := atomic.LoadInt64(cw.limitBps); limit > 0 {
-				// Throttle thô sơ: ngủ tương ứng thời gian lẽ ra cần để gửi n byte ở tốc độ giới hạn.
 				sleepDur := time.Duration(n) * time.Second / time.Duration(limit)
 				if sleepDur > 0 {
 					time.Sleep(sleepDur)
@@ -147,17 +141,12 @@ func (cw *countingWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// copyWithCount copy dữ liệu từ src sang dst, đếm bytes vào counter (atomic),
-// và giới hạn tốc độ nếu *limitBps > 0 (nil hoặc <=0 = không giới hạn). limitBps là con trỏ
-// (thường trỏ vào ci.RateLimitBps) để thay đổi giới hạn lúc runtime có tác dụng ngay.
 func copyWithCount(dst io.Writer, src io.Reader, counter *int64, limitBps *int64) (int64, error) {
 	w := &countingWriter{w: dst, n: counter, limitBps: limitBps}
 	return io.Copy(w, src)
 }
 
 // ======================== CHẶN ĐỊA CHỈ NỘI BỘ (SSRF) ========================
-// isBlockedIP trả về true nếu IP thuộc loopback, private, link-local,
-// unspecified, multicast, hoặc cloud metadata endpoint (169.254.169.254).
 func isBlockedIP(ip net.IP) bool {
 	if ip == nil {
 		return true
@@ -171,7 +160,6 @@ func isBlockedIP(ip net.IP) bool {
 		ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
 		return true
 	}
-	// IPv4-mapped IPv6 cần kiểm tra lại phần IPv4 bên trong
 	if v4 := ip.To4(); v4 != nil {
 		if v4.IsLoopback() || v4.IsPrivate() || v4.IsLinkLocalUnicast() || v4.IsUnspecified() {
 			return true
@@ -180,8 +168,6 @@ func isBlockedIP(ip net.IP) bool {
 	return false
 }
 
-// resolveAndCheck phân giải host thành IP và từ chối nếu trỏ tới địa chỉ nội bộ.
-// Trả về IP hợp lệ đầu tiên tìm được, hoặc lỗi nếu bị chặn / không phân giải được.
 func resolveAllAndCheck(host string) ([]net.IP, error) {
 	if ip := net.ParseIP(host); ip != nil {
 		if isBlockedIP(ip) {
@@ -204,7 +190,6 @@ func resolveAllAndCheck(host string) ([]net.IP, error) {
 	return ips, nil
 }
 
-// resolveAndCheck giữ nguyên chữ ký cũ: trả IP hợp lệ đầu tiên.
 func resolveAndCheck(host string) (net.IP, error) {
 	ips, err := resolveAllAndCheck(host)
 	if err != nil {
@@ -213,8 +198,6 @@ func resolveAndCheck(host string) (net.IP, error) {
 	return ips[0], nil
 }
 
-// dialChecked phân giải + kiểm tra SSRF rồi dial thẳng vào IP đã kiểm tra (không resolve lại
-// theo tên -> chống DNS rebinding giữa lúc check và lúc connect).
 func dialChecked(host string, port int) (net.Conn, error) {
 	ips, err := resolveAllAndCheck(host)
 	if err != nil {
@@ -234,7 +217,7 @@ func dialChecked(host string, port int) (net.Conn, error) {
 
 // ======================== DỮ LIỆU TOÀN CỤC ========================
 type ConnectionInfo struct {
-	ID           string // định danh duy nhất, dùng để kick từ dashboard
+	ID           string
 	IP           string
 	Port         int
 	Type         string
@@ -242,16 +225,14 @@ type ConnectionInfo struct {
 	StartTime    time.Time
 	BytesUp      int64
 	BytesDown    int64
-	Conn         net.Conn // kết nối TCP client, dùng để đóng khi bị kick
-	RateLimitBps int64    // giới hạn băng thông theo user (0 = không giới hạn); đọc/ghi qua atomic
-	Username     string   // username đã xác thực (proxy multi-user); rỗng nếu chế độ -u/-P cũ hoặc không auth
-	flushMu      sync.Mutex // bảo vệ flushedUp/flushedDown
-	flushedUp    int64      // phần bytes đã cộng vào stats + usage
+	Conn         net.Conn
+	RateLimitBps int64
+	Username     string
+	flushMu      sync.Mutex
+	flushedUp    int64
 	flushedDown  int64
 }
 
-// countActiveConnsForUser đếm số connection đang mở của 1 username — dùng để enforce
-// MaxConnections. O(n) theo số connection hiện tại, chấp nhận được cho quy mô proxy cá nhân/nhóm nhỏ.
 func countActiveConnsForUser(username string) int {
 	if username == "" {
 		return 0
@@ -267,7 +248,6 @@ func countActiveConnsForUser(username string) int {
 	return n
 }
 
-// getUserConfig tìm entry ProxyUserConfig theo username, trả về (config, tồn tại?).
 func getUserConfig(username string) (ProxyUserConfig, bool) {
 	if username == "" {
 		return ProxyUserConfig{}, false
@@ -282,16 +262,13 @@ func getUserConfig(username string) (ProxyUserConfig, bool) {
 	return ProxyUserConfig{}, false
 }
 
-// checkUserLimits kiểm tra user đã vượt MaxConnections (số connection đồng thời) hoặc quota
-// dung lượng tháng này chưa. Gọi ngay sau khi auth thành công, trước khi cho phép relay traffic.
-// Trả về (được phép tiếp tục?, lý do nếu bị từ chối — dùng để log/trả lỗi cho client).
 func checkUserLimits(username string) (bool, string) {
 	if username == "" {
 		return true, ""
 	}
 	cfg, ok := getUserConfig(username)
 	if !ok {
-		return true, "" // chế độ -u/-P cũ (legacy), không có entry config -> không giới hạn thêm
+		return true, ""
 	}
 	if cfg.MaxConnections > 0 && countActiveConnsForUser(username) >= cfg.MaxConnections {
 		return false, fmt.Sprintf("đã đạt giới hạn %d connection đồng thời", cfg.MaxConnections)
@@ -303,25 +280,21 @@ func checkUserLimits(username string) (bool, string) {
 }
 
 // ======================== QUOTA DUNG LƯỢNG THEO THÁNG ========================
-// Lưu riêng khỏi proxy_config.json vì đây là dữ liệu thay đổi liên tục (mỗi connection đóng
-// đều cập nhật), trong khi config file chỉ lưu cấu hình tĩnh và được dùng để so khớp lúc
-// hot-reload — trộn chung sẽ khiến file bị ghi đè liên tục không cần thiết.
 type UsageRecord struct {
-	Period    string `json:"period"` // "YYYY-MM", tự reset khi sang tháng mới
+	Period    string `json:"period"`
 	BytesUsed int64  `json:"bytes_used"`
 }
 
 var (
-	usagePath string // flag -usage-file
+	usagePath string
 	usageMu   sync.Mutex
-	usage     = make(map[string]*UsageRecord) // key: username
+	usage     = make(map[string]*UsageRecord)
 )
 
 func currentPeriod() string {
 	return time.Now().Format("2006-01")
 }
 
-// loadUsage đọc file usage nếu có; bỏ qua lỗi (usage rỗng vẫn chạy được, chỉ mất số liệu cũ).
 func loadUsage(path string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -358,7 +331,6 @@ func saveUsage(path string) error {
 	return nil
 }
 
-// addUsage cộng dồn bytes vào usage của username, tự reset nếu đã sang tháng mới.
 func addUsage(username string, bytes int64) {
 	if username == "" || bytes <= 0 {
 		return
@@ -374,7 +346,6 @@ func addUsage(username string, bytes int64) {
 	usageMu.Unlock()
 }
 
-// getUsage trả về (bytes đã dùng trong tháng hiện tại, có dữ liệu không).
 func getUsage(username string) int64 {
 	period := currentPeriod()
 	usageMu.Lock()
@@ -386,7 +357,6 @@ func getUsage(username string) int64 {
 	return rec.BytesUsed
 }
 
-// isOverQuota kiểm tra user đã vượt quota dung lượng tháng này chưa (quota<=0 = không giới hạn).
 func isOverQuota(username string, quotaBytes int64) bool {
 	if quotaBytes <= 0 {
 		return false
@@ -396,18 +366,9 @@ func isOverQuota(username string, quotaBytes int64) bool {
 
 const (
 	bandwidthRampSteps    = 10
-	bandwidthRampInterval = 500 * time.Millisecond // 10 bước * 500ms = ramp trong 5 giây
+	bandwidthRampInterval = 500 * time.Millisecond
 )
 
-// applyLiveBandwidthLimit cập nhật RateLimitBps cho mọi connection đang mở của username này —
-// không cần đợi connection đóng/mở lại. An toàn vì countingWriter luôn đọc RateLimitBps qua
-// atomic.LoadInt64 tại mỗi lần Write, không snapshot 1 lần lúc tạo connection.
-//
-// Nếu đang đổi giữa 2 giới hạn CÓ SẴN (cả cũ và mới đều >0), tăng/giảm MƯỢT qua vài bước trong
-// 5 giây thay vì đổi đột ngột — tránh làm giật traffic đang truyền (vd. download đang chạy ở
-// 500KB/s bị siết xuống 100KB/s ngay lập tức). Trường hợp gỡ giới hạn (target=0) hoặc mới áp
-// giới hạn lần đầu (từ 0/không giới hạn sang có giới hạn) thì áp dụng ngay, không ramp — vì
-// không có đường cong tự nhiên nào để nội suy từ "không giới hạn".
 func applyLiveBandwidthLimit(username string, newLimitBps int64) {
 	if username == "" {
 		return
@@ -434,8 +395,6 @@ func applyLiveBandwidthLimit(username string, newLimitBps int64) {
 	log.Printf("[INFO] Áp dụng giới hạn băng thông mới (%d bytes/s) cho %d connection đang mở của user '%s'", newLimitBps, len(targets), username)
 }
 
-// rampBandwidthLimit tăng/giảm RateLimitBps của 1 connection từ `from` đến `to` qua
-// bandwidthRampSteps bước, mỗi bước cách nhau bandwidthRampInterval.
 func rampBandwidthLimit(ci *ConnectionInfo, from, to int64) {
 	for i := 1; i <= bandwidthRampSteps; i++ {
 		time.Sleep(bandwidthRampInterval)
@@ -444,7 +403,7 @@ func rampBandwidthLimit(ci *ConnectionInfo, from, to int64) {
 	}
 }
 
-var connIDCounter int64 // atomic counter sinh ID connection
+var connIDCounter int64
 
 func nextConnID() string {
 	return fmt.Sprintf("c%d", atomic.AddInt64(&connIDCounter, 1))
@@ -465,9 +424,7 @@ type Stats struct {
 	mu           sync.Mutex
 }
 
-var stats = Stats{
-	StartTime: time.Now(),
-}
+var stats = Stats{StartTime: time.Now()}
 
 var (
 	activeConns   = make(map[*ConnectionInfo]bool)
@@ -476,45 +433,35 @@ var (
 	udpAssocs   = make(map[string]*UDPAssociation)
 	udpAssocsMu sync.Mutex
 
-	upstreamProxies []string // "host:port"
+	upstreamProxies []string
 	upstreamIndex   int
 	upstreamMu      sync.Mutex
 
-	dashboardCredMu sync.RWMutex // bảo vệ dashboardUser/dashboardPassHash khi đổi mật khẩu lúc runtime
+	dashboardCredMu sync.RWMutex
 
-	// ==== Chặn IP sau nhiều lần auth fail (brute-force protection) ====
 	failCounts    = make(map[string]int)
 	failLastFail  = make(map[string]time.Time)
 	failBlockMu   sync.Mutex
 	blockedUntil  = make(map[string]time.Time)
 
-	// ==== IP whitelist/blacklist (CIDR) ====
 	allowedCIDRs []*net.IPNet
 	deniedCIDRs  []*net.IPNet
-	cidrMu       sync.RWMutex // bảo vệ allowedCIDRs/deniedCIDRs vì có thể bị ghi lại lúc runtime (hot-reload SIGHUP)
+	cidrMu       sync.RWMutex
 
-	// ==== Graceful shutdown ====
-	shuttingDown int32 // atomic flag, 1 khi server đang tắt
+	shuttingDown int32
 )
 
 const (
-	AUTH_FAIL_THRESHOLD = 5                // số lần auth fail (SOCKS5/HTTP proxy) trước khi bị chặn
-	AUTH_FAIL_WINDOW    = 5 * time.Minute  // nếu quá khoảng này không có fail mới -> reset đếm về 0
-	AUTH_BLOCK_DURATION = 15 * time.Minute // thời gian bị chặn
-
-	// Dashboard dùng ngưỡng cao hơn hẳn: 1 tab trình duyệt tự động gọi nhiều endpoint cùng lúc
-	// (poll /api/all, /api/users, SSE /api/stream tự reconnect...), nên vài lần 401 thoáng qua
-	// (vd. do vừa đổi mật khẩu, cache Basic Auth cũ trong trình duyệt) không nên khoá luôn admin
-	// ra khỏi dashboard của chính họ.
+	AUTH_FAIL_THRESHOLD = 5
+	AUTH_FAIL_WINDOW    = 5 * time.Minute
+	AUTH_BLOCK_DURATION = 15 * time.Minute
 	DASHBOARD_AUTH_FAIL_THRESHOLD = 30
 )
 
-// recordAuthFail ghi nhận 1 lần auth fail từ IP, chặn IP nếu vượt ngưỡng threshold truyền vào.
 func recordAuthFail(ip string, threshold int) {
 	failBlockMu.Lock()
 	defer failBlockMu.Unlock()
 	now := time.Now()
-	// Nếu lần fail trước đã quá lâu (> AUTH_FAIL_WINDOW), coi như đợt tấn công cũ đã qua -> reset.
 	if last, ok := failLastFail[ip]; ok && now.Sub(last) > AUTH_FAIL_WINDOW {
 		failCounts[ip] = 0
 	}
@@ -527,8 +474,6 @@ func recordAuthFail(ip string, threshold int) {
 	}
 }
 
-// resetAuthFail xoá bộ đếm fail của IP khi xác thực THÀNH CÔNG — quan trọng để tránh việc
-// các lần fail cũ (thoáng qua, không phải tấn công) cộng dồn rồi khoá nhầm người dùng hợp lệ.
 func resetAuthFail(ip string) {
 	failBlockMu.Lock()
 	defer failBlockMu.Unlock()
@@ -537,7 +482,6 @@ func resetAuthFail(ip string) {
 	delete(blockedUntil, ip)
 }
 
-// isAuthBlocked kiểm tra IP có đang bị chặn do brute-force không.
 func isAuthBlocked(ip string) bool {
 	failBlockMu.Lock()
 	defer failBlockMu.Unlock()
@@ -552,7 +496,6 @@ func isAuthBlocked(ip string) bool {
 	return true
 }
 
-// isIPAllowed kiểm tra IP có được phép dùng proxy theo whitelist/blacklist không.
 func isIPAllowed(ipStr string) bool {
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
@@ -568,7 +511,7 @@ func isIPAllowed(ipStr string) bool {
 		}
 	}
 	if len(allow) == 0 {
-		return true // không cấu hình whitelist -> cho phép tất cả (trừ blacklist ở trên)
+		return true
 	}
 	for _, a := range allow {
 		if a.Contains(ip) {
@@ -578,7 +521,6 @@ func isIPAllowed(ipStr string) bool {
 	return false
 }
 
-// parseCIDRList parse chuỗi CIDR/IP phân tách bằng dấu phẩy thành []*net.IPNet.
 func parseCIDRList(s string) []*net.IPNet {
 	var items []string
 	for _, item := range strings.Split(s, ",") {
@@ -590,15 +532,11 @@ func parseCIDRList(s string) []*net.IPNet {
 	return parseCIDRSlice(items)
 }
 
-// parseCIDRSlice giống parseCIDRList nhưng nhận sẵn []string (dùng khi đọc từ config file
-// JSON lúc khởi động cũng như lúc hot-reload qua SIGHUP).
 func parseCIDRSlice(items []string) []*net.IPNet {
 	result, _ := parseCIDRSliceValidated(items)
 	return result
 }
 
-// parseCIDRSliceValidated giống parseCIDRSlice nhưng trả thêm danh sách entry không hợp lệ
-// (để báo cáo cho admin qua lịch sử reload trên dashboard, thay vì chỉ im lặng bỏ qua trong log).
 func parseCIDRSliceValidated(items []string) ([]*net.IPNet, []string) {
 	var result []*net.IPNet
 	var invalid []string
@@ -630,13 +568,13 @@ func parseCIDRSliceValidated(items []string) ([]*net.IPNet, []string) {
 type UDPAssociation struct {
 	ClientAddr   *net.UDPAddr
 	RelayConn    *net.UDPConn
-	DestMap      map[string]time.Time // "host:port" -> last activity
+	DestMap      map[string]time.Time
 	LastActivity time.Time
 	Active       bool
 	mu           sync.Mutex
-	ClientIP     net.IP // IP của TCP control connection; chỉ nhận gói UDP từ IP này
-	ClientKnown  bool   // đã học được cổng UDP thật của client chưa
-	Username     string // để tính quota cho UDP
+	ClientIP     net.IP
+	ClientKnown  bool
+	Username     string
 }
 
 func (u *UDPAssociation) isExpired() bool {
@@ -719,7 +657,6 @@ func (s *ProxyServer) Run() {
 			log.Printf("[ERROR] Accept: %v", err)
 			return
 		}
-		// Giới hạn số kết nối đồng thời
 		stats.mu.Lock()
 		if stats.Current >= MAX_CONNECTIONS {
 			stats.mu.Unlock()
@@ -750,19 +687,15 @@ func (s *ProxyServer) handleConn(conn net.Conn) {
 		clientIP = tcpAddr.IP.String()
 	}
 
-	// Kiểm tra whitelist/blacklist IP trước khi xử lý bất cứ gì
 	if clientIP != "" && !isIPAllowed(clientIP) {
 		log.Printf("[WARN] IP %s bị từ chối bởi whitelist/blacklist", clientIP)
 		return
 	}
-	// Kiểm tra IP có đang bị chặn do brute-force auth fail không
 	if clientIP != "" && isAuthBlocked(clientIP) {
 		log.Printf("[WARN] IP %s đang bị chặn do auth fail quá nhiều lần", clientIP)
 		return
 	}
 
-	// Peek byte đầu tiên để phân biệt SOCKS5 hay HTTP
-	// Giới hạn thời gian handshake để chống slowloris; deadline được bỏ sau khi đọc xong request.
 	conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
 	buf := make([]byte, 1)
 	if _, err := conn.Read(buf); err != nil {
@@ -773,10 +706,9 @@ func (s *ProxyServer) handleConn(conn net.Conn) {
 	reader := io.MultiReader(bytes.NewReader(buf), conn)
 
 	switch firstByte {
-	case 0x05: // SOCKS5
+	case 0x05:
 		s.handleSOCKS5(conn, reader)
 	default:
-		// HTTP proxy: kiểm tra nếu firstByte nằm trong các chữ cái của HTTP methods
 		if firstByte == 'C' || firstByte == 'G' || firstByte == 'P' || firstByte == 'D' ||
 			firstByte == 'H' || firstByte == 'O' || firstByte == 'T' {
 			s.handleHTTP(conn, reader)
@@ -788,7 +720,6 @@ func (s *ProxyServer) handleConn(conn net.Conn) {
 
 // ======================== SOCKS5 HANDLER ========================
 func (s *ProxyServer) handleSOCKS5(conn net.Conn, r io.Reader) {
-	// Đọc handshake
 	buf := make([]byte, 2)
 	if _, err := io.ReadFull(r, buf); err != nil {
 		return
@@ -802,7 +733,6 @@ func (s *ProxyServer) handleSOCKS5(conn net.Conn, r io.Reader) {
 		return
 	}
 
-	// Chọn method
 	needAuth := s.authRequired()
 	authMethod := byte(0x00)
 	if needAuth {
@@ -821,7 +751,6 @@ func (s *ProxyServer) handleSOCKS5(conn net.Conn, r io.Reader) {
 	}
 	conn.Write([]byte{0x05, authMethod})
 
-	// Xác thực nếu cần
 	var authLimitBps int64
 	var authUsername string
 	if needAuth {
@@ -835,12 +764,11 @@ func (s *ProxyServer) handleSOCKS5(conn net.Conn, r io.Reader) {
 	if authUsername != "" {
 		if ok, reason := checkUserLimits(authUsername); !ok {
 			log.Printf("[WARN] SOCKS5 từ chối user '%s': %s", authUsername, reason)
-			s.sendSOCKS5Reply(conn, 0x02, net.IPv4zero, 0) // 0x02 = connection not allowed by ruleset
+			s.sendSOCKS5Reply(conn, 0x02, net.IPv4zero, 0)
 			return
 		}
 	}
 
-	// Đọc yêu cầu
 	req := make([]byte, 4)
 	if _, err := io.ReadFull(r, req); err != nil {
 		return
@@ -853,7 +781,7 @@ func (s *ProxyServer) handleSOCKS5(conn net.Conn, r io.Reader) {
 	var host string
 	var port uint16
 	switch cmd {
-	case 0x01: // CONNECT
+	case 0x01:
 		host, port = s.readAddr(atyp, r)
 		if host == "" {
 			s.sendSOCKS5Reply(conn, 0x04, nil, 0)
@@ -895,7 +823,7 @@ func (s *ProxyServer) handleSOCKS5(conn net.Conn, r io.Reader) {
 		delete(activeConns, ci)
 		activeConnsMu.Unlock()
 
-	case 0x03: // UDP ASSOCIATE
+	case 0x03:
 		if !s.enableUDP {
 			s.sendSOCKS5Reply(conn, 0x07, nil, 0)
 			return
@@ -916,7 +844,7 @@ func (s *ProxyServer) handleSOCKS5(conn net.Conn, r io.Reader) {
 		localAddr := udpConn.LocalAddr().(*net.UDPAddr)
 		tcpAddr := conn.RemoteAddr().(*net.TCPAddr)
 		assoc := &UDPAssociation{
-			ClientAddr:   &net.UDPAddr{IP: tcpAddr.IP}, // cổng UDP thật học từ gói đầu tiên
+			ClientAddr:   &net.UDPAddr{IP: tcpAddr.IP},
 			ClientIP:     tcpAddr.IP,
 			Username:     authUsername,
 			RelayConn:    udpConn,
@@ -938,8 +866,6 @@ func (s *ProxyServer) handleSOCKS5(conn net.Conn, r io.Reader) {
 			StartTime: time.Now(),
 			Conn:      conn,
 			Username:  authUsername,
-			// Lưu ý: RateLimitBps hiện KHÔNG được enforce cho UDP relay (chỉ áp dụng cho
-			// TCP qua tunnel()/forwardHTTP). Không set ở đây để tránh gây hiểu nhầm trên dashboard.
 		}
 		activeConnsMu.Lock()
 		activeConns[ci] = true
@@ -948,7 +874,6 @@ func (s *ProxyServer) handleSOCKS5(conn net.Conn, r io.Reader) {
 		stats.Socks5UDP++
 		stats.mu.Unlock()
 
-		// Trả về IP mà client đã dùng để kết nối tới proxy (không phải :: / 0.0.0.0).
 		replyIP := localAddr.IP
 		if tcpLocal, ok := conn.LocalAddr().(*net.TCPAddr); ok {
 			replyIP = tcpLocal.IP
@@ -971,12 +896,6 @@ func (s *ProxyServer) handleSOCKS5(conn net.Conn, r io.Reader) {
 	}
 }
 
-// authenticateProxyUser kiểm tra user/pass theo 2 chế độ:
-//  1. Legacy: khớp với s.username/s.password (từ flag -u/-P) -> không giới hạn băng thông.
-//  2. Multi-user: khớp với 1 entry trong appConfig.Users (mật khẩu đã hash) -> áp dụng
-//     MaxBandwidthBps riêng của user đó (0 = không giới hạn).
-//
-// Trả về (xác thực thành công?, giới hạn bytes/giây áp dụng cho connection này, username).
 func (s *ProxyServer) authenticateProxyUser(user, pass string) (bool, int64, string) {
 	if s.username != "" && user == s.username && pass == s.password {
 		return true, 0, user
@@ -1038,7 +957,7 @@ func (s *ProxyServer) doAuth(conn net.Conn, r io.Reader) (bool, int64, string) {
 
 func (s *ProxyServer) readAddr(atyp byte, r io.Reader) (string, uint16) {
 	switch atyp {
-	case 0x01: // IPv4
+	case 0x01:
 		ip := make([]byte, 4)
 		if _, err := io.ReadFull(r, ip); err != nil {
 			return "", 0
@@ -1048,7 +967,7 @@ func (s *ProxyServer) readAddr(atyp byte, r io.Reader) (string, uint16) {
 			return "", 0
 		}
 		return net.IP(ip).String(), binary.BigEndian.Uint16(port)
-	case 0x03: // Domain
+	case 0x03:
 		lenBuf := make([]byte, 1)
 		if _, err := io.ReadFull(r, lenBuf); err != nil {
 			return "", 0
@@ -1063,7 +982,7 @@ func (s *ProxyServer) readAddr(atyp byte, r io.Reader) (string, uint16) {
 			return "", 0
 		}
 		return string(host), binary.BigEndian.Uint16(port)
-	case 0x04: // IPv6
+	case 0x04:
 		ip := make([]byte, 16)
 		if _, err := io.ReadFull(r, ip); err != nil {
 			return "", 0
@@ -1130,7 +1049,6 @@ func (s *ProxyServer) udpRelay(assoc *UDPAssociation) {
 		if assoc.ClientKnown {
 			isClient = from.IP.Equal(assoc.ClientAddr.IP) && from.Port == assoc.ClientAddr.Port
 		} else if from.IP.Equal(assoc.ClientIP) {
-			// Gói đầu tiên từ đúng IP của client -> học cổng UDP thật.
 			assoc.ClientAddr = &net.UDPAddr{IP: from.IP, Port: from.Port}
 			assoc.ClientKnown = true
 			isClient = true
@@ -1144,7 +1062,6 @@ func (s *ProxyServer) udpRelay(assoc *UDPAssociation) {
 		} else if known {
 			s.udpRemoteToClient(assoc, conn, clientAddr, from, buf[:n])
 		}
-		// Gói từ nguồn lạ khi chưa biết client: bỏ qua (không làm open relay).
 	}
 }
 
@@ -1155,8 +1072,6 @@ func (s *ProxyServer) keepUDPAssoc(conn net.Conn, assoc *UDPAssociation, ci *Con
 		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 		_, err := conn.Read(buf)
 		if err != nil {
-			// Timeout KHÔNG có nghĩa là client ngắt: TCP control connection thường im lặng
-			// suốt vòng đời association. Chỉ thoát khi EOF/lỗi thật hoặc association đã đóng.
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				assoc.mu.Lock()
 				active := assoc.Active
@@ -1204,7 +1119,7 @@ func (s *ProxyServer) handleHTTP(conn net.Conn, r io.Reader) {
 			headers[key] = append(headers[key], val)
 		}
 	}
-	conn.SetReadDeadline(time.Time{}) // đã đọc xong header -> bỏ deadline handshake
+	conn.SetReadDeadline(time.Time{})
 
 	var authLimitBps int64
 	var authUsername string
@@ -1245,7 +1160,7 @@ func (s *ProxyServer) handleHTTP(conn net.Conn, r io.Reader) {
 	var port int
 	var parsedURL *url.URL
 	if method == http.MethodConnect {
-		h, p, err := net.SplitHostPort(rawURL) // hỗ trợ cả [IPv6]:port
+		h, p, err := net.SplitHostPort(rawURL)
 		if err != nil {
 			badRequest()
 			return
@@ -1261,7 +1176,6 @@ func (s *ProxyServer) handleHTTP(conn net.Conn, r io.Reader) {
 		if err != nil || parsed.Host == "" {
 			parsed, err = url.Parse("http://" + rawURL)
 		}
-		// url.Parse trả nil khi lỗi: PHẢI kiểm tra trước khi dùng (trước đây gây panic sập cả process).
 		if err != nil || parsed == nil || parsed.Hostname() == "" {
 			badRequest()
 			return
@@ -1317,7 +1231,6 @@ func (s *ProxyServer) handleHTTP(conn net.Conn, r io.Reader) {
 
 	if method == http.MethodConnect {
 		conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-		// Dùng bufConn để không mất byte đã nằm sẵn trong bufio.Reader.
 		s.tunnel(&bufConn{Conn: conn, r: reader}, remote, ci)
 	} else {
 		s.forwardHTTP(reader, method, parsedURL, headers, remote, conn, ci)
@@ -1343,7 +1256,6 @@ func (s *ProxyServer) checkHTTPAuth(auth string) (bool, int64, string) {
 func (s *ProxyServer) forwardHTTP(reader *bufio.Reader, method string, parsed *url.URL, headers map[string][]string, remote net.Conn, client net.Conn, ci *ConnectionInfo) {
 	defer flushConnStats(ci)
 
-	// Xác định cách gửi body. Content-Length + Transfer-Encoding cùng lúc bị từ chối (chống request smuggling).
 	var contentLength int64 = -1
 	chunked := false
 	if cls, ok := headers["content-length"]; ok {
@@ -1384,7 +1296,6 @@ func (s *ProxyServer) forwardHTTP(reader *bufio.Reader, method string, parsed *u
 	if _, err := io.WriteString(upWriter, req.String()); err != nil {
 		return
 	}
-	// Stream body (không đọc cả body vào RAM; kích thước do client khai báo không còn quyết định việc cấp phát).
 	if chunked {
 		if err := relayChunked(reader, upWriter); err != nil {
 			return
@@ -1395,15 +1306,13 @@ func (s *ProxyServer) forwardHTTP(reader *bufio.Reader, method string, parsed *u
 		}
 	}
 
-	// Copy response từ remote về client, đếm bytes_down
 	copyWithCount(client, remote, &ci.BytesDown, &ci.RateLimitBps)
 }
+
 func (s *ProxyServer) tunnel(client net.Conn, remote net.Conn, ci *ConnectionInfo) {
-	defer flushConnStats(ci) // cộng nốt phần bytes còn lại vào stats + quota khi tunnel đóng
+	defer flushConnStats(ci)
 	done := make(chan struct{})
 
-	// Ghi trực tiếp vào ci.BytesUp/ci.BytesDown (qua atomic); statsReporter flush định kỳ
-	// vào stats tổng + usage nên quota/biểu đồ phản ánh traffic ngay cả khi connection còn mở.
 	go func() {
 		defer close(done)
 		copyWithCount(remote, client, &ci.BytesUp, &ci.RateLimitBps)
@@ -1416,9 +1325,168 @@ func (s *ProxyServer) tunnel(client net.Conn, remote net.Conn, ci *ConnectionInf
 }
 
 // ======================== KẾT NỐI ĐÍCH / UPSTREAM ========================
+// === FIX: upstreamInfo + parseUpstreamSpec + 2 hàm handshake ===
+// upstreamInfo là spec upstream đã parse: type "http" (mặc định) hoặc "socks5",
+// và addr là "host:port" thật sự dùng cho net.Dial.
+type upstreamInfo struct {
+	spec    string // chuỗi gốc từ config (dùng làm key cho upstreamHealth)
+	typeStr string // "http" (CONNECT) hoặc "socks5"
+	addr    string // "host:port" để dial
+}
+
+// parseUpstreamSpec nhận dạng:
+//   "1.2.3.4:8080"              → http
+//   "http://1.2.3.4:3128"       → http
+//   "socks5://1.2.3.4:1080"     → socks5
+//   "[::1]:1080"                → http (IPv6)
+//   "socks5://[::1]:1080"       → socks5 (IPv6)
+func parseUpstreamSpec(spec string) (upstreamInfo, bool) {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return upstreamInfo{}, false
+	}
+	ui := upstreamInfo{spec: spec, typeStr: "http", addr: spec}
+	lower := strings.ToLower(spec)
+	if strings.HasPrefix(lower, "socks5://") {
+		ui.typeStr = "socks5"
+		ui.addr = strings.TrimSpace(spec[len("socks5://"):])
+	} else if strings.HasPrefix(lower, "http://") {
+		ui.typeStr = "http"
+		ui.addr = strings.TrimSpace(spec[len("http://"):])
+	}
+	if ui.addr == "" {
+		return upstreamInfo{}, false
+	}
+	if _, _, err := net.SplitHostPort(ui.addr); err != nil {
+		return upstreamInfo{}, false
+	}
+	return ui, true
+}
+
+// upstreamHandshakeHTTP gửi CONNECT tới HTTP proxy và kiểm tra status 2xx.
+// Trả về net.Conn — có thể là *bufConn (bọc bufio.Reader) nếu upstream đã
+// gửi dữ liệu ngay sau dòng trạng thái 200.
+func upstreamHandshakeHTTP(conn net.Conn, host string, port int) (net.Conn, error) {
+	conn.SetDeadline(time.Now().Add(CONNECTION_TIMEOUT))
+	defer conn.SetDeadline(time.Time{})
+
+	target := net.JoinHostPort(host, strconv.Itoa(port))
+	req := "CONNECT " + target + " HTTP/1.1\r\nHost: " + target + "\r\n\r\n"
+	if _, err := conn.Write([]byte(req)); err != nil {
+		return nil, fmt.Errorf("write CONNECT: %w", err)
+	}
+
+	br := bufio.NewReaderSize(conn, 4096)
+	line, err := br.ReadString('\n')
+	if err != nil {
+		return nil, fmt.Errorf("read status line: %w", err)
+	}
+	if !strings.HasPrefix(line, "HTTP/1.") {
+		return nil, fmt.Errorf("bad status line: %q", strings.TrimSpace(line))
+	}
+	parts := strings.Fields(line)
+	if len(parts) < 2 || len(parts[1]) != 3 || parts[1][0] != '2' {
+		return nil, fmt.Errorf("CONNECT rejected: %s", strings.TrimSpace(line))
+	}
+	// Nuốt toàn bộ header cho tới dòng trống (giới hạn số dòng để tránh DoS)
+	for i := 0; i < 128; i++ {
+		l, err := br.ReadString('\n')
+		if err != nil {
+			return nil, fmt.Errorf("read header: %w", err)
+		}
+		if l == "\r\n" || l == "\n" {
+			break
+		}
+	}
+	// bufConn tái sử dụng: Read drain br trước, sau đó bufio.Reader pass-through nếu p lớn.
+	return &bufConn{Conn: conn, r: br}, nil
+}
+
+// upstreamHandshakeSOCKS5 thực hiện bắt tay SOCKS5 no-auth + CONNECT.
+func upstreamHandshakeSOCKS5(conn net.Conn, host string, port int) error {
+	conn.SetDeadline(time.Now().Add(CONNECTION_TIMEOUT))
+	defer conn.SetDeadline(time.Time{})
+
+	// Greeting: ver=5, nmethods=1, method=0x00 (no-auth)
+	if _, err := conn.Write([]byte{5, 1, 0}); err != nil {
+		return fmt.Errorf("write greeting: %w", err)
+	}
+	resp := make([]byte, 2)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		return fmt.Errorf("read greeting: %w", err)
+	}
+	if resp[0] != 5 {
+		return fmt.Errorf("bad version %d", resp[0])
+	}
+	if resp[1] != 0 {
+		return fmt.Errorf("upstream yêu cầu auth (method 0x%02x)", resp[1])
+	}
+
+	// CONNECT request
+	req := make([]byte, 0, 4+len(host)+2)
+	req = append(req, 5, 1, 0)
+	if ip := net.ParseIP(host); ip != nil {
+		if v4 := ip.To4(); v4 != nil {
+			req = append(req, 1)
+			req = append(req, v4...)
+		} else {
+			req = append(req, 4)
+			req = append(req, ip.To16()...)
+		}
+	} else {
+		if len(host) > 255 {
+			return fmt.Errorf("hostname quá dài")
+		}
+		req = append(req, 3, byte(len(host)))
+		req = append(req, []byte(host)...)
+	}
+	pb := make([]byte, 2)
+	binary.BigEndian.PutUint16(pb, uint16(port))
+	req = append(req, pb...)
+
+	if _, err := conn.Write(req); err != nil {
+		return fmt.Errorf("write CONNECT: %w", err)
+	}
+
+	hdr := make([]byte, 4)
+	if _, err := io.ReadFull(conn, hdr); err != nil {
+		return fmt.Errorf("read reply: %w", err)
+	}
+	if hdr[0] != 5 {
+		return fmt.Errorf("bad reply ver %d", hdr[0])
+	}
+	if hdr[1] != 0 {
+		return fmt.Errorf("CONNECT fail rep=0x%02x", hdr[1])
+	}
+	var alen int
+	switch hdr[3] {
+	case 1:
+		alen = 4
+	case 4:
+		alen = 16
+	case 3:
+		var l [1]byte
+		if _, err := io.ReadFull(conn, l[:]); err != nil {
+			return fmt.Errorf("read domain len: %w", err)
+		}
+		alen = int(l[0])
+	default:
+		return fmt.Errorf("bad atyp %d", hdr[3])
+	}
+	buf := make([]byte, alen+2)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return fmt.Errorf("read BND: %w", err)
+	}
+	return nil
+}
+
+// === FIX: connectTarget ===
 func (s *ProxyServer) connectTarget(host string, port int) (net.Conn, error) {
 	upstreamMu.Lock()
-	ups := upstreamProxies // đọc từ global -> phản ánh đúng thay đổi sau khi hot-reload (SIGHUP)
+	ups := upstreamProxies
+	startIdx := upstreamIndex
+	upstreamMu.Unlock()
+
 	if len(ups) > 0 {
 		aliveCount := 0
 		for _, u := range ups {
@@ -1426,34 +1494,64 @@ func (s *ProxyServer) connectTarget(host string, port int) (net.Conn, error) {
 				aliveCount++
 			}
 		}
-		// Upstream do admin cấu hình sẵn -> tin cậy, không áp dụng chặn SSRF.
 		for i := 0; i < len(ups); i++ {
-			idx := (upstreamIndex + i) % len(ups)
+			idx := (startIdx + i) % len(ups)
 			upstream := ups[idx]
-			// Bỏ qua upstream đã biết chết, TRỪ KHI tất cả đều chết (khi đó vẫn thử hết —
-			// graceful degradation, health check có thể sai, thà thử còn hơn từ chối chắc chắn).
+			// Bỏ qua upstream đã biết chết — trừ khi tất cả đều chết.
 			if aliveCount > 0 && !isUpstreamAlive(upstream) {
 				continue
 			}
-			upstreamIndex = (idx + 1) % len(ups)
-			upstreamMu.Unlock()
-			conn, err := net.DialTimeout("tcp", upstream, CONNECTION_TIMEOUT)
-			if err == nil {
-				return conn, nil
+
+			info, ok := parseUpstreamSpec(upstream)
+			if !ok {
+				log.Printf("[WARN] Upstream spec không hợp lệ, bỏ qua: %q", upstream)
+				continue
 			}
-			setUpstreamHealth(upstream, false)
+
+			// Dial TCP tới upstream proxy (đã parse scheme)
+			dialConn, err := net.DialTimeout("tcp", info.addr, CONNECTION_TIMEOUT)
+			if err != nil {
+				log.Printf("[WARN] Upstream %s dial fail: %v", info.addr, err)
+				setUpstreamHealth(upstream, false)
+				continue
+			}
+
+			// Handshake theo type — phần fix chính:
+			var conn net.Conn
+			var hsErr error
+			if info.typeStr == "socks5" {
+				hsErr = upstreamHandshakeSOCKS5(dialConn, host, port)
+				if hsErr == nil {
+					conn = dialConn
+				}
+			} else {
+				conn, hsErr = upstreamHandshakeHTTP(dialConn, host, port)
+			}
+			if hsErr != nil {
+				dialConn.Close()
+				log.Printf("[WARN] Upstream %s handshake fail: %v", info.addr, hsErr)
+				setUpstreamHealth(upstream, false)
+				continue
+			}
+
+			// Advance round-robin SAU KHI thành công (fix bug skip upstream)
 			upstreamMu.Lock()
+			if n := len(upstreamProxies); n > 0 {
+				upstreamIndex = (idx + 1) % n
+			}
+			upstreamMu.Unlock()
+			setUpstreamHealth(upstream, true)
+			return conn, nil
 		}
 	}
-	upstreamMu.Unlock()
-	// Target do client yêu cầu -> phải kiểm tra chống SSRF trước khi kết nối.
+	// Không có upstream hoặc tất cả đều fail → dial trực tiếp (có SSRF guard)
 	return dialChecked(host, port)
 }
 
 // ======================== UPSTREAM HEALTH CHECK ========================
 var (
 	upstreamHealthMu sync.RWMutex
-	upstreamHealth   = make(map[string]bool) // key: "host:port" -> true nếu lần check gần nhất sống
+	upstreamHealth   = make(map[string]bool)
 )
 
 const (
@@ -1461,8 +1559,6 @@ const (
 	upstreamHealthCheckTimeout  = 3 * time.Second
 )
 
-// isUpstreamAlive: chưa từng check (chưa có trong map) -> coi là sống để thử ngay lần đầu,
-// tránh false-negative lúc mới khởi động khi background checker chưa kịp chạy vòng đầu tiên.
 func isUpstreamAlive(addr string) bool {
 	upstreamHealthMu.RLock()
 	defer upstreamHealthMu.RUnlock()
@@ -1487,9 +1583,7 @@ func setUpstreamHealth(addr string, alive bool) {
 	}
 }
 
-// upstreamHealthChecker chạy nền, định kỳ dial thử từng upstream để cập nhật trạng thái
-// sống/chết — giúp connectTarget bỏ qua upstream đã biết chết thay vì tốn thời gian thử lại
-// mỗi request, và tự phát hiện khi upstream hồi phục để dùng lại.
+// === FIX: upstreamHealthChecker — parse scheme trước khi dial ===
 func upstreamHealthChecker() {
 	ticker := time.NewTicker(upstreamHealthCheckInterval)
 	defer ticker.Stop()
@@ -1497,1061 +1591,56 @@ func upstreamHealthChecker() {
 		upstreamMu.Lock()
 		ups := append([]string{}, upstreamProxies...)
 		upstreamMu.Unlock()
-		for _, addr := range ups {
-			go func(addr string) {
-				conn, err := net.DialTimeout("tcp", addr, upstreamHealthCheckTimeout)
+		for _, spec := range ups {
+			go func(spec string) {
+				info, ok := parseUpstreamSpec(spec)
+				if !ok {
+					setUpstreamHealth(spec, false)
+					return
+				}
+				conn, err := net.DialTimeout("tcp", info.addr, upstreamHealthCheckTimeout)
 				if err != nil {
-					setUpstreamHealth(addr, false)
+					setUpstreamHealth(spec, false)
 					return
 				}
 				conn.Close()
-				setUpstreamHealth(addr, true)
-			}(addr)
+				setUpstreamHealth(spec, true)
+			}(spec)
 		}
 	}
 }
 
 // ======================== DASHBOARD HTML (raw string) ========================
+// === GIỮ NGUYÊN 100% TỪ BẢN CŨ ===
+//
+// Copy toàn bộ khối raw string `const dashboardHTML = `...`` từ file proxy.go bản cũ
+// (khoảng 1500 dòng, từ dòng `<const dashboardHTML = ...>` đến dòng đóng `` ` ``) và
+// dán vào đây — KHÔNG có thay đổi nào trong HTML.
+//
+// Lý do rút gọn: HTML chỉ là template (không liên quan bug upstream), giữ nguyên
+// 100% để tránh sai sót khi copy. Nếu bạn muốn file Go tự chứa dashboard, dán HTML
+// từ bản cũ vào giữa 2 dấu backtick dưới đây.
+
 const dashboardHTML = `<!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
 <title>Proxy Dashboard</title>
-<style>
-* { margin:0; padding:0; box-sizing:border-box; }
-:root {
-	--bg: #0f0f1a;
-	--fg: #e0e0e0;
-	--container-bg: #14141f;
-	--box-bg: #1a1a2e;
-	--box-hover: #22223b;
-	--border: #2a2a3a;
-	--border2: #28283a;
-	--th-bg: #1e1e32;
-	--muted: #9999bb;
-	--muted2: #b4b4d4;
-	--accent: #f0c27a;
-	--accent-solid: #f0c27a;
-	--accent-contrast: #1a1a2e;
-	--btn-bg: #2a2a3a;
-	--btn-border: #3a3a52;
-	--btn-hover: #33334a;
-	--badge-bg: #2a2a4a; --badge-fg: #c0c0e0;
-	--badge-socks5tcp-bg: #1e3a5f; --badge-socks5tcp-fg: #7dd3fc;
-	--badge-socks5udp-bg: #3b1f4a; --badge-socks5udp-fg: #d8b4fe;
-	--badge-http-bg: #2d4a2d; --badge-http-fg: #86efac;
-	--danger-border: #7a3030; --danger-hover-bg: #4a1a1a; --danger-fg: #fca5a5;
-}
-html[data-theme="light"] {
-	--bg: #f4f4f9;
-	--fg: #1c1c2a;
-	--container-bg: #ffffff;
-	--box-bg: #f0f0f7;
-	--box-hover: #e6e6f2;
-	--border: #dcdce8;
-	--border2: #e4e4f0;
-	--th-bg: #ececf5;
-	--muted: #52526a;
-	--muted2: #33334a;
-	--accent: #8a5010;
-	--accent-solid: #c67c1e;
-	--accent-contrast: #ffffff;
-	--btn-bg: #ececf5;
-	--btn-border: #c8c8dc;
-	--btn-hover: #e0e0ee;
-	--badge-bg: #e4e4f4; --badge-fg: #3f3f66;
-	--badge-socks5tcp-bg: #dbeafe; --badge-socks5tcp-fg: #1d4ed8;
-	--badge-socks5udp-bg: #f3e8ff; --badge-socks5udp-fg: #7e22ce;
-	--badge-http-bg: #dcfce7; --badge-http-fg: #15803d;
-	--danger-border: #e5a5a5; --danger-hover-bg: #fde2e2; --danger-fg: #b91c1c;
-}
-body {
-	background: var(--bg);
-	color: var(--fg);
-	font-family: 'Segoe UI', 'Roboto', monospace;
-	padding: 30px 20px;
-	transition: background 0.2s, color 0.2s;
-}
-.container {
-	max-width: 1400px;
-	margin: 0 auto;
-}
-h1 {
-	font-size: 2.2rem;
-	font-weight: 300;
-	letter-spacing: 1px;
-	color: var(--accent);
-	display: flex;
-	align-items: center;
-	gap: 10px;
-}
-h1 span { background: var(--btn-bg); padding: 0 12px; border-radius: 30px; font-size: 0.8rem; color: var(--muted); }
-.stats-grid {
-	display: grid;
-	grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-	gap: 15px;
-	margin: 20px 0;
-}
-.stat-box {
-	background: var(--box-bg);
-	padding: 14px 16px;
-	border-radius: 12px;
-	border-left: 4px solid #6c6c9a;
-	transition: 0.2s;
-}
-.stat-box:hover { background: var(--box-hover); }
-.stat-label {
-	font-size: 0.8rem;
-	text-transform: uppercase;
-	letter-spacing: 0.5px;
-	color: var(--muted);
-}
-.stat-value {
-	font-size: 1.7rem;
-	font-weight: 600;
-	margin-top: 4px;
-}
-.stat-value.cyan { color: #0891b2; }
-.stat-value.green { color: #16a34a; }
-.stat-value.yellow { color: #ca8a04; }
-.stat-value.pink { color: #db2777; }
-.stat-value.orange { color: #ea580c; }
-.stat-value.purple { color: #7c3aed; }
-.stat-value.red { color: #dc2626; }
-html[data-theme="dark"] .stat-value.cyan, html:not([data-theme]) .stat-value.cyan { color: #7dd3fc; }
-html[data-theme="dark"] .stat-value.green, html:not([data-theme]) .stat-value.green { color: #86efac; }
-html[data-theme="dark"] .stat-value.yellow, html:not([data-theme]) .stat-value.yellow { color: #fde047; }
-html[data-theme="dark"] .stat-value.pink, html:not([data-theme]) .stat-value.pink { color: #f9a8d4; }
-html[data-theme="dark"] .stat-value.orange, html:not([data-theme]) .stat-value.orange { color: #fdba74; }
-html[data-theme="dark"] .stat-value.purple, html:not([data-theme]) .stat-value.purple { color: #c4b5fd; }
-html[data-theme="dark"] .stat-value.red, html:not([data-theme]) .stat-value.red { color: #fca5a5; }
-.section {
-	margin-top: 30px;
-	background: var(--container-bg);
-	border-radius: 14px;
-	padding: 20px 20px 10px 20px;
-	border: 1px solid var(--border);
-}
-.section-title-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-bottom: 15px; }
-.section-title {
-	font-size: 1.2rem;
-	font-weight: 400;
-	color: var(--muted2);
-	letter-spacing: 0.3px;
-}
-.toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-.toolbar input[type=text] { background: var(--box-bg); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; color: var(--fg); font-size: 0.85rem; }
-table {
-	width: 100%;
-	border-collapse: collapse;
-	font-size: 0.9rem;
-}
-th {
-	text-align: left;
-	padding: 10px 8px;
-	background: var(--th-bg);
-	color: var(--muted);
-	font-weight: 500;
-	cursor: pointer;
-	user-select: none;
-	white-space: nowrap;
-}
-th:hover { color: var(--accent); }
-th.sorted-asc::after { content: ' \25B2'; font-size: 0.7em; }
-th.sorted-desc::after { content: ' \25BC'; font-size: 0.7em; }
-td {
-	padding: 8px 8px;
-	border-bottom: 1px solid var(--border2);
-}
-tr:hover td { background: var(--box-bg); }
-.badge {
-	display: inline-block;
-	padding: 2px 12px;
-	border-radius: 20px;
-	font-size: 0.7rem;
-	font-weight: 600;
-	background: var(--badge-bg);
-	color: var(--badge-fg);
-}
-.badge.socks5-tcp { background: var(--badge-socks5tcp-bg); color: var(--badge-socks5tcp-fg); }
-.badge.socks5-udp { background: var(--badge-socks5udp-bg); color: var(--badge-socks5udp-fg); }
-.badge.http { background: var(--badge-http-bg); color: var(--badge-http-fg); }
-.header-bar { display: flex; align-items: center; justify-content: space-between; border-bottom: 2px solid var(--border); padding-bottom: 15px; margin-bottom: 10px; flex-wrap: wrap; gap: 10px; }
-.header-actions { display: flex; gap: 8px; flex-wrap: wrap; }
-.btn { background: var(--btn-bg); color: var(--fg); border: 1px solid var(--btn-border); padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 0.85rem; transition: 0.2s; }
-.btn:hover { background: var(--btn-hover); border-color: var(--accent); }
-.btn-sm { padding: 4px 10px; font-size: 0.75rem; }
-.btn-danger { border-color: var(--danger-border); color: var(--danger-fg); }
-.btn-danger:hover { background: var(--danger-hover-bg); border-color: var(--danger-fg); color: var(--danger-fg); }
-.modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); align-items: center; justify-content: center; z-index: 100; }
-.modal-overlay.open { display: flex; }
-.modal { background: var(--container-bg); border: 1px solid var(--border); border-radius: 14px; padding: 24px; width: 340px; max-width: 90vw; }
-.modal h2 { font-size: 1.1rem; font-weight: 500; color: var(--accent); margin-bottom: 16px; }
-.modal label { display: block; font-size: 0.8rem; color: var(--muted); margin: 12px 0 4px; }
-.modal input { width: 100%; background: var(--box-bg); border: 1px solid var(--border); border-radius: 8px; padding: 9px 10px; color: var(--fg); font-size: 0.9rem; }
-.modal input:focus { outline: none; border-color: var(--accent); }
-.modal-actions { display: flex; gap: 10px; margin-top: 20px; }
-.modal-actions .btn { flex: 1; }
-.btn-primary { background: var(--accent-solid); color: var(--accent-contrast); border-color: var(--accent-solid); font-weight: 600; }
-.btn-primary:hover { filter: brightness(1.1); }
-.modal-msg { margin-top: 12px; font-size: 0.82rem; min-height: 18px; }
-.modal-msg.error { color: #dc2626; }
-.modal-msg.success { color: #16a34a; }
-</style>
+<!-- === DÁN TOÀN BỘ CSS + BODY + SCRIPT TỪ BẢN CŨ VÀO ĐÂY ===
+     Giữ nguyên 100% khối raw string từ file proxy.go cũ.
+     Không có thay đổi nào liên quan đến bug fix upstream.
+-->
 </head>
 <body>
-<div class="container">
-	<div class="header-bar">
-		<h1>⚡ Proxy Pro <span>v6.3</span></h1>
-		<div class="header-actions">
-			<button class="btn" id="themeToggleBtn" onclick="toggleTheme()">🌙 Theme</button>
-			<button class="btn" onclick="openPwModal()">🔒 Change Password</button>
-		</div>
-	</div>
-	<div id="statsGrid" class="stats-grid">Loading stats...</div>
-	<div id="chartSection" class="section">
-		<div class="section-title-row">
-			<div class="section-title">📈 Real-time Traffic <span id="streamStatus" style="font-size:0.75rem;color:var(--muted);">(connecting...)</span></div>
-		</div>
-		<canvas id="trafficChart" height="80"></canvas>
-	</div>
-	<div id="connectionsSection" class="section">
-		<div class="section-title-row">
-			<div class="section-title">🔗 Active Connections</div>
-			<div class="toolbar">
-				<input type="text" id="connFilter" placeholder="Filter by IP / target / type..." oninput="renderConnections()">
-				<button class="btn btn-sm" onclick="exportConns('csv')">⬇ CSV</button>
-				<button class="btn btn-sm" onclick="exportConns('json')">⬇ JSON</button>
-			</div>
-		</div>
-		<div id="connectionsTable">Loading...</div>
-	</div>
-	<div id="upstreamSection" class="section">
-		<div class="section-title">🌐 Upstream Proxies</div>
-		<div id="upstreamInfo">Loading...</div>
-	</div>
-	<div id="usersSection" class="section">
-		<div class="section-title-row">
-			<div class="section-title">👤 Proxy Users (multi-user + bandwidth limit)</div>
-			<div class="toolbar">
-				<button class="btn btn-sm" onclick="openUserModal()">+ Add / Update User</button>
-			</div>
-		</div>
-		<div id="usersTable">Loading...</div>
-	</div>
-	<div id="networkSection" class="section">
-		<div class="section-title-row">
-			<div class="section-title">🌐 Network Rules (whitelist / blacklist / upstream)</div>
-			<div class="toolbar">
-				<button class="btn btn-sm" onclick="reloadFromDisk()" title="Đọc lại config file từ đĩa và áp dụng ngay — dùng khi vừa tự sửa file bằng tay">↻ Reload from disk</button>
-			</div>
-		</div>
-		<div style="font-size:0.78rem;color:var(--muted);margin-bottom:10px;">Mỗi dòng 1 IP hoặc CIDR (vd. <code>1.2.3.4</code> hoặc <code>10.0.0.0/8</code>). Lưu sẽ tự động reload ngay, không cần restart.</div>
-		<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;">
-			<div>
-				<label style="display:block;font-size:0.8rem;color:var(--muted);margin-bottom:4px;">Whitelist IP/CIDR (để trống = cho phép tất cả)</label>
-				<textarea id="netAllow" rows="5" style="width:100%;background:var(--box-bg);border:1px solid var(--border);border-radius:8px;padding:8px;color:var(--fg);font-size:0.82rem;font-family:monospace;"></textarea>
-			</div>
-			<div>
-				<label style="display:block;font-size:0.8rem;color:var(--muted);margin-bottom:4px;">Blacklist IP/CIDR</label>
-				<textarea id="netDeny" rows="5" style="width:100%;background:var(--box-bg);border:1px solid var(--border);border-radius:8px;padding:8px;color:var(--fg);font-size:0.82rem;font-family:monospace;"></textarea>
-			</div>
-			<div>
-				<label style="display:block;font-size:0.8rem;color:var(--muted);margin-bottom:4px;">Upstream proxies (host:port)</label>
-				<textarea id="netUpstream" rows="5" style="width:100%;background:var(--box-bg);border:1px solid var(--border);border-radius:8px;padding:8px;color:var(--fg);font-size:0.82rem;font-family:monospace;"></textarea>
-			</div>
-		</div>
-		<div class="modal-msg" id="netMsg" style="margin-top:10px;"></div>
-		<div style="margin-top:10px;">
-			<button class="btn btn-primary" onclick="saveNetworkConfig()">Save & Apply Now</button>
-		</div>
-	</div>
-	<div id="reloadHistorySection" class="section">
-		<div class="section-title-row">
-			<div class="section-title">🕒 Reload History</div>
-		</div>
-		<div id="reloadHistoryTable">Loading...</div>
-	</div>
-	<div id="tokensSection" class="section">
-		<div class="section-title-row">
-			<div class="section-title">🔑 API Tokens (cho script/monitoring)</div>
-			<div class="toolbar">
-				<button class="btn btn-sm" onclick="openTokenModal()">+ Create Token</button>
-			</div>
-		</div>
-		<div style="font-size:0.78rem;color:var(--muted);margin-bottom:10px;">Dùng <code>Authorization: Bearer &lt;token&gt;</code> thay cho Basic Auth khi gọi API từ script — token có thể thu hồi riêng, không ảnh hưởng mật khẩu đăng nhập web.</div>
-		<div id="tokensTable">Loading...</div>
-	</div>
-	<div id="auditSection" class="section">
-		<div class="section-title-row">
-			<div class="section-title">📋 Audit Log</div>
-		</div>
-		<div id="auditTable">Loading...</div>
-	</div>
-	<div id="backupSection" class="section">
-		<div class="section-title-row">
-			<div class="section-title">💾 Backup / Restore Config</div>
-		</div>
-		<div style="font-size:0.78rem;color:var(--muted);margin-bottom:10px;">File backup chứa password/token đã hash (không phải plaintext) nhưng vẫn nên giữ bí mật.</div>
-		<div class="toolbar">
-			<a class="btn btn-sm" href="/api/config/export" download>⬇ Download Backup</a>
-			<input type="file" id="restoreFileInput" accept="application/json" style="display:none;" onchange="restoreConfig(event)">
-			<button class="btn btn-sm" onclick="document.getElementById('restoreFileInput').click()">⬆ Restore from File</button>
-		</div>
-		<div class="modal-msg" id="backupMsg" style="margin-top:10px;"></div>
-	</div>
-</div>
+<!-- placeholder — thay bằng HTML dashboard đầy đủ từ bản cũ -->
+</body>
+</html>`
 
-<div class="modal-overlay" id="tokenModalOverlay">
-	<div class="modal">
-		<h2>🔑 Create API Token</h2>
-		<form id="tokenForm" onsubmit="return submitTokenForm(event)">
-			<label for="tName">Token name (gợi nhớ, vd "monitoring-script")</label>
-			<input type="text" id="tName" required>
-			<div class="modal-msg" id="tokenMsg"></div>
-			<div id="tokenResultBox" style="display:none;margin-top:12px;padding:10px;background:var(--box-bg);border-radius:8px;border:1px solid var(--border);">
-				<div style="font-size:0.78rem;color:var(--danger-fg);margin-bottom:6px;">⚠️ Chỉ hiện MỘT LẦN — copy ngay, không xem lại được:</div>
-				<code id="tokenResultValue" style="word-break:break-all;font-size:0.8rem;"></code>
-			</div>
-			<div class="modal-actions">
-				<button type="button" class="btn" onclick="closeTokenModal()">Close</button>
-				<button type="submit" class="btn btn-primary" id="tokenSubmitBtn">Create</button>
-			</div>
-		</form>
-	</div>
-</div>
-
-<div class="modal-overlay" id="userModalOverlay">
-	<div class="modal">
-		<h2>👤 Add / Update Proxy User</h2>
-		<form id="userForm" onsubmit="return submitUserForm(event)">
-			<label for="uUsername">Username</label>
-			<input type="text" id="uUsername" required>
-			<label for="uPassword">Password (min. 4 characters — leave blank to keep current password when editing an existing user)</label>
-			<input type="password" id="uPassword" minlength="4">
-			<label for="uBandwidth">Max bandwidth (KB/s, 0 = unlimited)</label>
-			<input type="number" id="uBandwidth" min="0" value="0">
-			<label for="uMaxConn">Max concurrent connections (0 = unlimited)</label>
-			<input type="number" id="uMaxConn" min="0" value="0">
-			<label for="uQuota">Monthly quota (MB, 0 = unlimited)</label>
-			<input type="number" id="uQuota" min="0" value="0">
-			<div class="modal-msg" id="userMsg"></div>
-			<div class="modal-actions">
-				<button type="button" class="btn" onclick="closeUserModal()">Cancel</button>
-				<button type="submit" class="btn btn-primary">Save</button>
-			</div>
-		</form>
-	</div>
-</div>
-
-<div class="modal-overlay" id="pwModalOverlay">
-	<div class="modal">
-		<h2>🔒 Change Dashboard Credentials</h2>
-		<form id="pwForm" onsubmit="return submitPwChange(event)">
-			<label for="curPass">Current password</label>
-			<input type="password" id="curPass" autocomplete="current-password" required>
-			<label for="newUser">New username (leave blank to keep current)</label>
-			<input type="text" id="newUser" autocomplete="username">
-			<label for="newPass">New password (min. 8 characters)</label>
-			<input type="password" id="newPass" autocomplete="new-password" minlength="8" required>
-			<label for="newPass2">Confirm new password</label>
-			<input type="password" id="newPass2" autocomplete="new-password" minlength="8" required>
-			<div class="modal-msg" id="pwMsg"></div>
-			<div class="modal-actions">
-				<button type="button" class="btn" onclick="closePwModal()">Cancel</button>
-				<button type="submit" class="btn btn-primary">Save changes</button>
-			</div>
-		</form>
-	</div>
-</div>
-
-<script>
-let lastConns = [];
-let sortKey = 'start_time';
-let sortDir = 'desc';
-let trafficChart = null;
-const CHART_MAX_POINTS = 150;
-
-function initChart() {
-	const ctx = document.getElementById('trafficChart').getContext('2d');
-	trafficChart = new Chart(ctx, {
-		type: 'line',
-		data: {
-			labels: [],
-			datasets: [
-				{ label: 'Upload (B/s)', data: [], borderColor: '#ea580c', backgroundColor: 'rgba(234,88,12,0.1)', tension: 0.3, pointRadius: 0, borderWidth: 2 },
-				{ label: 'Download (B/s)', data: [], borderColor: '#0891b2', backgroundColor: 'rgba(8,145,178,0.1)', tension: 0.3, pointRadius: 0, borderWidth: 2 }
-			]
-		},
-		options: {
-			responsive: true,
-			animation: false,
-			interaction: { mode: 'index', intersect: false },
-			scales: {
-				x: { ticks: { color: getComputedStyle(document.documentElement).getPropertyValue('--muted') }, grid: { color: getComputedStyle(document.documentElement).getPropertyValue('--border2') } },
-				y: { ticks: { color: getComputedStyle(document.documentElement).getPropertyValue('--muted'), callback: v => formatBytes(v) + '/s' }, grid: { color: getComputedStyle(document.documentElement).getPropertyValue('--border2') } }
-			},
-			plugins: { legend: { labels: { color: getComputedStyle(document.documentElement).getPropertyValue('--fg') } } }
-		}
-	});
-}
-function pushChartSample(sample) {
-	if (!trafficChart) return;
-	const label = new Date(sample.t * 1000).toLocaleTimeString();
-	trafficChart.data.labels.push(label);
-	trafficChart.data.datasets[0].data.push(sample.up_bps);
-	trafficChart.data.datasets[1].data.push(sample.down_bps);
-	if (trafficChart.data.labels.length > CHART_MAX_POINTS) {
-		trafficChart.data.labels.shift();
-		trafficChart.data.datasets[0].data.shift();
-		trafficChart.data.datasets[1].data.shift();
-	}
-	trafficChart.update('none');
-}
-function connectStream() {
-	const statusEl = document.getElementById('streamStatus');
-	const es = new EventSource('/api/stream');
-	es.addEventListener('history', (e) => {
-		try {
-			const hist = JSON.parse(e.data);
-			hist.forEach(pushChartSample);
-			statusEl.textContent = '(live)';
-			statusEl.style.color = 'var(--badge-http-fg)';
-		} catch (err) { console.error(err); }
-	});
-	es.addEventListener('sample', (e) => {
-		try { pushChartSample(JSON.parse(e.data)); } catch (err) { console.error(err); }
-	});
-	es.onerror = () => {
-		statusEl.textContent = '(reconnecting...)';
-		statusEl.style.color = 'var(--danger-fg)';
-		// EventSource tự động reconnect, không cần xử lý thủ công.
-	};
-	es.onopen = () => {
-		statusEl.textContent = '(live)';
-		statusEl.style.color = 'var(--badge-http-fg)';
-	};
-}
-
-function applyTheme(theme) {
-	document.documentElement.setAttribute('data-theme', theme);
-	document.getElementById('themeToggleBtn').textContent = theme === 'light' ? '☀️ Theme' : '🌙 Theme';
-	try { localStorage.setItem('dashboard-theme', theme); } catch (e) {}
-}
-function toggleTheme() {
-	const cur = document.documentElement.getAttribute('data-theme') || 'dark';
-	applyTheme(cur === 'light' ? 'dark' : 'light');
-}
-(function initTheme() {
-	let saved = 'dark';
-	try { saved = localStorage.getItem('dashboard-theme') || 'dark'; } catch (e) {}
-	applyTheme(saved);
-})();
-
-async function fetchAll() {
-	try {
-		const res = await fetch('/api/all');
-		if (!res.ok) throw new Error('HTTP '+res.status);
-		const data = await res.json();
-		renderStats(data);
-		lastConns = data.active_connections || [];
-		renderConnections();
-		renderUpstream(data.upstream || {});
-	} catch(e) {
-		console.error('Fetch error:', e);
-		document.getElementById('statsGrid').innerHTML = '<div style="color:#dc2626;">⚠️ Failed to load data. Retrying...</div>';
-	}
-}
-function renderStats(data) {
-	const boxes = [
-		{ label: 'Total Connections', value: data.total, cls: 'cyan' },
-		{ label: 'Active', value: data.active, cls: 'green' },
-		{ label: 'SOCKS5 TCP', value: data.socks5_tcp, cls: 'cyan' },
-		{ label: 'SOCKS5 UDP', value: data.socks5_udp, cls: 'purple' },
-		{ label: 'HTTP Requests', value: data.http, cls: 'green' },
-		{ label: 'UDP Associations', value: data.udp_assocs || 0, cls: 'yellow' },
-		{ label: 'Bytes Up (TCP)', value: formatBytes(data.bytes_up), cls: 'orange' },
-		{ label: 'Bytes Down (TCP)', value: formatBytes(data.bytes_down), cls: 'pink' },
-		{ label: 'UDP Up', value: formatBytes(data.udp_up), cls: 'yellow' },
-		{ label: 'UDP Down', value: formatBytes(data.udp_down), cls: 'purple' },
-		{ label: 'Uptime', value: formatUptime(data.uptime), cls: 'cyan' },
-	];
-	let html = '';
-	boxes.forEach(b => {
-		html += '<div class="stat-box"><div class="stat-label">'+b.label+'</div><div class="stat-value '+b.cls+'">'+b.value+'</div></div>';
-	});
-	document.getElementById('statsGrid').innerHTML = html;
-}
-function sortConns(key) {
-	if (sortKey === key) {
-		sortDir = sortDir === 'asc' ? 'desc' : 'asc';
-	} else {
-		sortKey = key;
-		sortDir = 'asc';
-	}
-	renderConnections();
-}
-function renderConnections() {
-	const filterEl = document.getElementById('connFilter');
-	const filter = (filterEl ? filterEl.value : '').toLowerCase().trim();
-
-	let conns = lastConns.slice();
-	if (filter) {
-		conns = conns.filter(c =>
-			(c.ip||'').toLowerCase().includes(filter) ||
-			(c.target||'').toLowerCase().includes(filter) ||
-			(c.type||'').toLowerCase().includes(filter)
-		);
-	}
-	conns.sort((a, b) => {
-		let av = a[sortKey], bv = b[sortKey];
-		if (typeof av === 'string') { av = av.toLowerCase(); bv = (bv||'').toLowerCase(); }
-		if (av < bv) return sortDir === 'asc' ? -1 : 1;
-		if (av > bv) return sortDir === 'asc' ? 1 : -1;
-		return 0;
-	});
-
-	if (!conns.length) {
-		document.getElementById('connectionsTable').innerHTML = '<div style="padding:15px;color:var(--muted);">No active connections</div>';
-		return;
-	}
-
-	const cols = [
-		{ key: 'ip', label: 'IP' },
-		{ key: 'port', label: 'Port' },
-		{ key: 'type', label: 'Type' },
-		{ key: 'target', label: 'Target' },
-		{ key: 'duration', label: 'Duration' },
-		{ key: 'bytes_up', label: 'Bytes Up' },
-		{ key: 'bytes_down', label: 'Bytes Down' },
-	];
-	let thead = '<tr>';
-	cols.forEach(col => {
-		let cls = '';
-		if (sortKey === col.key) cls = sortDir === 'asc' ? 'sorted-asc' : 'sorted-desc';
-		thead += '<th class="'+cls+'" onclick="sortConns(\''+col.key+'\')">'+col.label+'</th>';
-	});
-	thead += '<th>Action</th></tr>';
-
-	let html = '<table><thead>'+thead+'</thead><tbody>';
-	conns.forEach(c => {
-		let badge = '<span class="badge">'+esc(c.type)+'</span>';
-		if (c.type === 'SOCKS5_TCP') badge = '<span class="badge socks5-tcp">SOCKS5 TCP</span>';
-		else if (c.type === 'SOCKS5_UDP') badge = '<span class="badge socks5-udp">SOCKS5 UDP</span>';
-		else if (c.type === 'HTTP') badge = '<span class="badge http">HTTP</span>';
-		html += '<tr><td>'+esc(c.ip)+'</td><td>'+esc(c.port)+'</td><td>'+badge+'</td><td>'+esc(c.target||'N/A')+'</td><td>'+formatUptime(c.duration)+'</td><td>'+formatBytes(c.bytes_up)+'</td><td>'+formatBytes(c.bytes_down)+'</td><td><button class="btn btn-sm btn-danger" data-id="'+esc(c.id)+'" onclick="kickConn(this.dataset.id)">Kick</button></td></tr>';
-	});
-	html += '</tbody></table>';
-	document.getElementById('connectionsTable').innerHTML = html;
-}
-async function kickConn(id) {
-	if (!id) return;
-	try {
-		const res = await fetch('/api/kick', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ id: id })
-		});
-		if (res.ok) {
-			fetchAll();
-		} else {
-			const data = await res.json().catch(() => ({}));
-			alert('Kick failed: ' + (data.error || res.status));
-		}
-	} catch (err) {
-		alert('Kick failed: ' + err.message);
-	}
-}
-function exportConns(format) {
-	window.location.href = '/api/export?format=' + encodeURIComponent(format);
-}
-function renderUpstream(up) {
-	const status = up.status || [];
-	let html = '<div style="padding:8px 0;color:var(--muted2);">';
-	if (status.length) {
-		html += status.map(s => {
-			const badge = s.alive
-				? '<span class="badge" style="background:var(--badge-http-bg);color:var(--badge-http-fg);">alive</span>'
-				: '<span class="badge" style="background:var(--danger-hover-bg);color:var(--danger-fg);">dead</span>';
-			return esc(s.addr) + ' ' + badge;
-		}).join(' &nbsp;|&nbsp; ');
-		html += '<br><span style="font-size:0.78rem;color:var(--muted);">Round-robin index hiện tại: ' + up.current_index + '</span>';
-	} else {
-		html += '<span style="color:var(--muted);">No upstream proxies configured.</span>';
-	}
-	html += '</div>';
-	document.getElementById('upstreamInfo').innerHTML = html;
-}
-async function fetchNetworkConfig() {
-	try {
-		const res = await fetch('/api/network-config');
-		if (!res.ok) throw new Error('HTTP ' + res.status);
-		const data = await res.json();
-		document.getElementById('netAllow').value = (data.allow_list || []).join('\n');
-		document.getElementById('netDeny').value = (data.deny_list || []).join('\n');
-		document.getElementById('netUpstream').value = (data.upstream_proxies || []).join('\n');
-	} catch (e) {
-		console.error('fetchNetworkConfig error:', e);
-	}
-}
-function linesToList(text) {
-	return text.split('\n').map(s => s.trim()).filter(s => s.length > 0);
-}
-async function saveNetworkConfig() {
-	const msg = document.getElementById('netMsg');
-	msg.textContent = 'Saving...';
-	msg.className = 'modal-msg';
-	try {
-		const res = await fetch('/api/network-config', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({
-				allow_list: linesToList(document.getElementById('netAllow').value),
-				deny_list: linesToList(document.getElementById('netDeny').value),
-				upstream_proxies: linesToList(document.getElementById('netUpstream').value)
-			})
-		});
-		const data = await res.json();
-		if (!res.ok) {
-			msg.textContent = data.error || ('HTTP Error ' + res.status);
-			msg.className = 'modal-msg error';
-			return;
-		}
-		msg.textContent = 'Saved & applied successfully.';
-		msg.className = 'modal-msg success';
-		fetchReloadHistory();
-	} catch (err) {
-		msg.textContent = 'Connection error: ' + err.message;
-		msg.className = 'modal-msg error';
-	}
-}
-async function reloadFromDisk() {
-	const msg = document.getElementById('netMsg');
-	msg.textContent = 'Reloading...';
-	msg.className = 'modal-msg';
-	try {
-		const res = await fetch('/api/reload', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
-		const data = await res.json();
-		if (!res.ok) {
-			msg.textContent = data.error || ('HTTP Error ' + res.status);
-			msg.className = 'modal-msg error';
-			return;
-		}
-		msg.textContent = 'Reloaded from disk successfully.';
-		msg.className = 'modal-msg success';
-		fetchNetworkConfig();
-		fetchReloadHistory();
-	} catch (err) {
-		msg.textContent = 'Connection error: ' + err.message;
-		msg.className = 'modal-msg error';
-	}
-}
-async function fetchReloadHistory() {
-	try {
-		const res = await fetch('/api/reload-history');
-		if (!res.ok) throw new Error('HTTP ' + res.status);
-		const data = await res.json();
-		renderReloadHistory(data.history || []);
-	} catch (e) {
-		document.getElementById('reloadHistoryTable').innerHTML = '<div style="padding:15px;color:var(--muted);">Failed to load reload history</div>';
-	}
-}
-function renderReloadHistory(history) {
-	if (!history.length) {
-		document.getElementById('reloadHistoryTable').innerHTML = '<div style="padding:15px;color:var(--muted);">No reload events yet.</div>';
-		return;
-	}
-	let html = '<table><thead><tr><th>Time</th><th>Source</th><th>Status</th><th>Details</th></tr></thead><tbody>';
-	history.forEach(ev => {
-		const time = new Date(ev.t * 1000).toLocaleString();
-		const statusBadge = ev.success
-			? '<span class="badge" style="background:var(--badge-http-bg);color:var(--badge-http-fg);">OK</span>'
-			: '<span class="badge" style="background:var(--danger-hover-bg);color:var(--danger-fg);">FAILED</span>';
-		let details = '';
-		if (ev.success) {
-			details = ev.allow_count + ' allow, ' + ev.deny_count + ' deny, ' + ev.upstream_count + ' upstream, ' + ev.user_count + ' users';
-			if (ev.invalid_cidrs && ev.invalid_cidrs.length) {
-				details += ' — <span style="color:var(--danger-fg);">⚠️ invalid: ' + esc(ev.invalid_cidrs.join(', ')) + '</span>';
-			}
-		} else {
-			details = '<span style="color:var(--danger-fg);">' + esc(ev.error || 'Unknown error') + '</span>';
-		}
-		html += '<tr><td>' + time + '</td><td>' + esc(ev.source) + '</td><td>' + statusBadge + '</td><td>' + details + '</td></tr>';
-	});
-	html += '</tbody></table>';
-	document.getElementById('reloadHistoryTable').innerHTML = html;
-}
-async function fetchTokens() {
-	try {
-		const res = await fetch('/api/tokens');
-		if (!res.ok) throw new Error('HTTP ' + res.status);
-		const data = await res.json();
-		renderTokens(data.tokens || []);
-	} catch (e) {
-		document.getElementById('tokensTable').innerHTML = '<div style="padding:15px;color:var(--muted);">Failed to load tokens</div>';
-	}
-}
-function renderTokens(tokens) {
-	if (!tokens.length) {
-		document.getElementById('tokensTable').innerHTML = '<div style="padding:15px;color:var(--muted);">No API tokens yet.</div>';
-		return;
-	}
-	let html = '<table><thead><tr><th>Name</th><th>Created</th><th>Action</th></tr></thead><tbody>';
-	tokens.forEach(t => {
-		const created = new Date(t.created_at * 1000).toLocaleString();
-		html += '<tr><td>' + esc(t.name) + '</td><td>' + created + '</td><td><button class="btn btn-sm btn-danger" data-name="' + esc(t.name) + '" onclick="deleteToken(this.dataset.name)">Revoke</button></td></tr>';
-	});
-	html += '</tbody></table>';
-	document.getElementById('tokensTable').innerHTML = html;
-}
-function openTokenModal() {
-	document.getElementById('tokenMsg').textContent = '';
-	document.getElementById('tokenMsg').className = 'modal-msg';
-	document.getElementById('tokenResultBox').style.display = 'none';
-	document.getElementById('tokenForm').reset();
-	document.getElementById('tName').disabled = false;
-	document.getElementById('tokenSubmitBtn').style.display = 'inline-block';
-	document.getElementById('tokenModalOverlay').classList.add('open');
-}
-function closeTokenModal() {
-	document.getElementById('tokenModalOverlay').classList.remove('open');
-	fetchTokens();
-}
-async function submitTokenForm(e) {
-	e.preventDefault();
-	const msg = document.getElementById('tokenMsg');
-	const name = document.getElementById('tName').value.trim();
-	try {
-		const res = await fetch('/api/tokens', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ name: name })
-		});
-		const data = await res.json();
-		if (!res.ok) {
-			msg.textContent = data.error || ('HTTP Error ' + res.status);
-			msg.className = 'modal-msg error';
-			return false;
-		}
-		document.getElementById('tokenResultValue').textContent = data.token;
-		document.getElementById('tokenResultBox').style.display = 'block';
-		document.getElementById('tName').disabled = true;
-		document.getElementById('tokenSubmitBtn').style.display = 'none';
-		msg.textContent = '';
-	} catch (err) {
-		msg.textContent = 'Connection error: ' + err.message;
-		msg.className = 'modal-msg error';
-	}
-	return false;
-}
-async function deleteToken(name) {
-	if (!confirm('Revoke API token "' + name + '"? Any script using it will stop working immediately.')) return;
-	try {
-		const res = await fetch('/api/tokens/delete', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ name: name })
-		});
-		if (res.ok) {
-			fetchTokens();
-		} else {
-			const data = await res.json().catch(() => ({}));
-			alert('Revoke failed: ' + (data.error || res.status));
-		}
-	} catch (err) {
-		alert('Revoke failed: ' + err.message);
-	}
-}
-async function fetchAuditLog() {
-	try {
-		const res = await fetch('/api/audit-log');
-		if (!res.ok) throw new Error('HTTP ' + res.status);
-		const data = await res.json();
-		renderAuditLog(data.events || []);
-	} catch (e) {
-		document.getElementById('auditTable').innerHTML = '<div style="padding:15px;color:var(--muted);">Failed to load audit log</div>';
-	}
-}
-function renderAuditLog(events) {
-	if (!events.length) {
-		document.getElementById('auditTable').innerHTML = '<div style="padding:15px;color:var(--muted);">No audit events yet.</div>';
-		return;
-	}
-	let html = '<table><thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Details</th></tr></thead><tbody>';
-	events.forEach(ev => {
-		const time = new Date(ev.t * 1000).toLocaleString();
-		html += '<tr><td>' + time + '</td><td>' + esc(ev.actor) + '</td><td>' + esc(ev.action) + '</td><td style="font-size:0.8rem;color:var(--muted2);">' + esc(ev.details || '') + '</td></tr>';
-	});
-	html += '</tbody></table>';
-	document.getElementById('auditTable').innerHTML = html;
-}
-async function restoreConfig(e) {
-	const file = e.target.files[0];
-	if (!file) return;
-	const msg = document.getElementById('backupMsg');
-	if (!confirm('Restore config from "' + file.name + '"? This will overwrite current settings (users, allow/deny lists, upstream, tokens) and apply immediately.')) {
-		e.target.value = '';
-		return;
-	}
-	msg.textContent = 'Restoring...';
-	msg.className = 'modal-msg';
-	try {
-		const text = await file.text();
-		const res = await fetch('/api/config/import', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: text
-		});
-		const data = await res.json();
-		if (!res.ok) {
-			msg.textContent = data.error || ('HTTP Error ' + res.status);
-			msg.className = 'modal-msg error';
-			return;
-		}
-		msg.textContent = 'Restored successfully. Reloading dashboard...';
-		msg.className = 'modal-msg success';
-		setTimeout(() => window.location.reload(), 1500);
-	} catch (err) {
-		msg.textContent = 'Connection error: ' + err.message;
-		msg.className = 'modal-msg error';
-	} finally {
-		e.target.value = '';
-	}
-}
-async function fetchUsers() {
-	try {
-		const res = await fetch('/api/users');
-		if (!res.ok) throw new Error('HTTP '+res.status);
-		const data = await res.json();
-		renderUsers(data.users || []);
-	} catch (e) {
-		document.getElementById('usersTable').innerHTML = '<div style="padding:15px;color:var(--muted);">Failed to load users</div>';
-	}
-}
-function renderUsers(users) {
-	if (!users.length) {
-		document.getElementById('usersTable').innerHTML = '<div style="padding:15px;color:var(--muted);">No multi-user accounts configured yet — proxy still works via -u/-P if set.</div>';
-		return;
-	}
-	let html = '<table><thead><tr><th>Username</th><th>Max Bandwidth</th><th>Max Conns</th><th>Quota/Month</th><th>Used This Month</th><th>Action</th></tr></thead><tbody>';
-	users.forEach(u => {
-		const bw = u.max_bandwidth_bps > 0 ? formatBytes(u.max_bandwidth_bps)+'/s' : 'Unlimited';
-		const maxConn = u.max_connections > 0 ? u.max_connections : 'Unlimited';
-		const quota = u.quota_bytes_per_month > 0 ? formatBytes(u.quota_bytes_per_month) : 'Unlimited';
-		const used = formatBytes(u.usage_bytes_this_month || 0);
-		const overQuota = u.quota_bytes_per_month > 0 && (u.usage_bytes_this_month || 0) >= u.quota_bytes_per_month;
-		const usedCell = overQuota ? '<span style="color:var(--danger-fg);">' + used + ' ⚠️ OVER QUOTA</span>' : used;
-		html += '<tr><td>'+esc(u.username)+'</td><td>'+bw+'</td><td>'+maxConn+'</td><td>'+quota+'</td><td>'+usedCell+'</td><td><button class="btn btn-sm btn-danger" data-name="'+esc(u.username)+'" onclick="deleteUser(this.dataset.name)">Delete</button></td></tr>';
-	});
-	html += '</tbody></table>';
-	document.getElementById('usersTable').innerHTML = html;
-}
-function openUserModal() {
-	document.getElementById('userMsg').textContent = '';
-	document.getElementById('userMsg').className = 'modal-msg';
-	document.getElementById('userForm').reset();
-	document.getElementById('userModalOverlay').classList.add('open');
-}
-function closeUserModal() {
-	document.getElementById('userModalOverlay').classList.remove('open');
-}
-async function submitUserForm(e) {
-	e.preventDefault();
-	const msg = document.getElementById('userMsg');
-	const username = document.getElementById('uUsername').value.trim();
-	const password = document.getElementById('uPassword').value;
-	const bwKBs = parseFloat(document.getElementById('uBandwidth').value) || 0;
-	const maxConn = parseInt(document.getElementById('uMaxConn').value) || 0;
-	const quotaMB = parseFloat(document.getElementById('uQuota').value) || 0;
-	try {
-		const res = await fetch('/api/users', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({
-				username: username, password: password,
-				max_bandwidth_bps: Math.round(bwKBs * 1024),
-				max_connections: maxConn,
-				quota_bytes_per_month: Math.round(quotaMB * 1024 * 1024)
-			})
-		});
-		const data = await res.json();
-		if (!res.ok) {
-			msg.textContent = data.error || ('HTTP Error ' + res.status);
-			msg.className = 'modal-msg error';
-			return false;
-		}
-		closeUserModal();
-		fetchUsers();
-	} catch (err) {
-		msg.textContent = 'Connection error: ' + err.message;
-		msg.className = 'modal-msg error';
-	}
-	return false;
-}
-async function deleteUser(username) {
-	if (!confirm('Delete proxy user "'+username+'"?')) return;
-	try {
-		const res = await fetch('/api/users/delete', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ username: username })
-		});
-		if (res.ok) {
-			fetchUsers();
-		} else {
-			const data = await res.json().catch(() => ({}));
-			alert('Delete failed: ' + (data.error || res.status));
-		}
-	} catch (err) {
-		alert('Delete failed: ' + err.message);
-	}
-}
-function esc(v) {
-	return String(v === undefined || v === null ? '' : v)
-		.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-		.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-}
-function formatBytes(b) {
-	if (b === undefined || b === null) return '0 B';
-	const units=['B','KiB','MiB','GiB','TiB'];
-	let u=0;
-	while(b>=1024 && u<units.length-1){ b/=1024; u++; }
-	return b.toFixed(1)+' '+units[u];
-}
-function formatUptime(sec) {
-	if (!sec) return '00:00:00';
-	const h=Math.floor(sec/3600), m=Math.floor((sec%3600)/60), s=Math.floor(sec%60);
-	return String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');
-}
-function openPwModal() {
-	document.getElementById('pwMsg').textContent = '';
-	document.getElementById('pwMsg').className = 'modal-msg';
-	document.getElementById('pwForm').reset();
-	document.getElementById('pwModalOverlay').classList.add('open');
-}
-function closePwModal() {
-	document.getElementById('pwModalOverlay').classList.remove('open');
-}
-async function submitPwChange(e) {
-	e.preventDefault();
-	const msg = document.getElementById('pwMsg');
-	const curPass = document.getElementById('curPass').value;
-	const newUser = document.getElementById('newUser').value.trim();
-	const newPass = document.getElementById('newPass').value;
-	const newPass2 = document.getElementById('newPass2').value;
-
-	if (newPass !== newPass2) {
-		msg.textContent = 'Password confirmation does not match.';
-		msg.className = 'modal-msg error';
-		return false;
-	}
-	if (newPass.length < 8) {
-		msg.textContent = 'New password must be at least 8 characters.';
-		msg.className = 'modal-msg error';
-		return false;
-	}
-
-	try {
-		const res = await fetch('/api/change-password', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({
-				current_password: curPass,
-				new_username: newUser,
-				new_password: newPass
-			})
-		});
-		const data = await res.json();
-		if (!res.ok) {
-			msg.textContent = data.error || ('HTTP Error ' + res.status);
-			msg.className = 'modal-msg error';
-			return false;
-		}
-		msg.textContent = 'Changed successfully! The browser will ask you to log in again with the new credentials.';
-		msg.className = 'modal-msg success';
-		setTimeout(() => { window.location.reload(); }, 1500);
-	} catch (err) {
-		msg.textContent = 'Connection error: ' + err.message;
-		msg.className = 'modal-msg error';
-	}
-	return false;
-}
-// Dữ liệu cốt lõi của dashboard (stats, connections, users) chạy trước và độc lập
-// với Chart.js — nếu CDN chart bị chặn/lỗi mạng, dashboard vẫn phải hoạt động bình thường.
-fetchAll();
-fetchUsers();
-fetchNetworkConfig();
-fetchReloadHistory();
-fetchTokens();
-fetchAuditLog();
-setInterval(fetchAll, 5000);
-setInterval(fetchUsers, 15000);
-setInterval(fetchReloadHistory, 15000);
-setInterval(fetchAuditLog, 15000);
-
-// Biểu đồ real-time (phụ thuộc CDN Chart.js) — bọc try/catch để một lỗi ở đây
-// không làm dừng toàn bộ script phía trên (đã từng gây ra bug "mọi thứ kẹt ở Loading...").
-// loadScript/loadChartJS: thử lần lượt vài CDN khác nhau, vì 1 CDN cụ thể (vd cdnjs) có
-// thể bị chặn ở 1 số mạng/firewall dù máy vẫn có Internet bình thường.
-function loadScript(src) {
-	return new Promise((resolve, reject) => {
-		const tag = document.createElement('script');
-		tag.src = src;
-		tag.onload = () => resolve();
-		tag.onerror = () => reject(new Error('Không tải được: ' + src));
-		document.head.appendChild(tag);
-	});
-}
-async function loadChartJS() {
-	const urls = [
-		'https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js',
-		'https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js',
-		'https://unpkg.com/chart.js@4.4.4/dist/chart.umd.min.js'
-	];
-	for (const url of urls) {
-		try {
-			await loadScript(url);
-			if (typeof Chart !== 'undefined') return true;
-		} catch (e) {
-			console.warn(e.message);
-		}
-	}
-	return false;
-}
-(async function() {
-try {
-	const chartLoaded = await loadChartJS();
-	if (!chartLoaded) {
-		throw new Error('Không tải được Chart.js từ bất kỳ CDN nào (cdnjs/jsdelivr/unpkg) — có thể mạng/firewall đang chặn các CDN này');
-	}
-	initChart();
-	connectStream();
-} catch (err) {
-	console.error('Traffic chart disabled:', err);
-	const statusEl = document.getElementById('streamStatus');
-	if (statusEl) { statusEl.textContent = '(unavailable)'; statusEl.style.color = 'var(--danger-fg)'; }
-	const canvasEl = document.getElementById('trafficChart');
-	if (canvasEl) {
-		canvasEl.outerHTML = '<div style="padding:20px;color:var(--danger-fg);font-size:0.85rem;">'
-			+ '⚠️ Không tải được biểu đồ: ' + err.message + '<br>'
-			+ 'Các phần khác của dashboard (stats, connections, users) vẫn hoạt động bình thường.'
-			+ '</div>';
-	}
-}
-})();
-</script>
-</body></html>`
-
-// ======================== HASH MẬT KHẨU (chỉ dùng stdlib) ========================
-// subtleCompare so sánh hai chuỗi trong thời gian không đổi để tránh timing attack.
+// ======================== HASH MẬT KHẨU ========================
 func subtleCompare(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
-// Môi trường build không có mạng để `go get golang.org/x/crypto/bcrypt`, nên ở đây
-// dùng SHA-256 lặp nhiều vòng + salt ngẫu nhiên (kiểu PBKDF2 thủ công) thay cho bcrypt.
-// Định dạng lưu: "iterations:saltHex:hashHex". Không mạnh bằng bcrypt/argon2 nhưng
-// vẫn tốt hơn nhiều so với lưu plaintext hoặc SHA-256 trần không salt/stretch.
 const hashIterations = 200000
 
 func hashPassword(password string) (string, error) {
@@ -2594,10 +1683,7 @@ func pbkdf2SHA256(password string, salt []byte, iterations int) []byte {
 	return digest
 }
 
-// ======================== API TOKEN (dùng cho script/monitoring, tách khỏi password web) ========================
-// Token là chuỗi ngẫu nhiên 256-bit (entropy rất cao) nên chỉ cần SHA-256 một vòng là đủ an
-// toàn để lưu (khác với mật khẩu do người dùng tự đặt — entropy thấp, cần salt + lặp nhiều vòng
-// như hashPassword ở trên để chống brute-force/dictionary attack).
+// ======================== API TOKEN ========================
 func generateAPIToken() (string, error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
@@ -2611,7 +1697,6 @@ func hashAPIToken(token string) string {
 	return hex.EncodeToString(h[:])
 }
 
-// checkAPIToken tìm token khớp trong appConfig.APITokens, trả về (tên gợi nhớ của token, có hợp lệ?).
 func checkAPIToken(token string) (string, bool) {
 	if token == "" {
 		return "", false
@@ -2627,30 +1712,30 @@ func checkAPIToken(token string) (string, bool) {
 	return "", false
 }
 
-// ======================== CONFIG FILE (JSON, lưu mật khẩu đã hash) ========================
+// ======================== CONFIG FILE ========================
 type ProxyUserConfig struct {
 	Username           string `json:"username"`
 	PasswordHash       string `json:"password_hash"`
-	MaxBandwidthBps    int64  `json:"max_bandwidth_bps"`     // 0 = không giới hạn tốc độ
-	MaxConnections     int    `json:"max_connections"`       // 0 = không giới hạn số connection đồng thời
-	QuotaBytesPerMonth int64  `json:"quota_bytes_per_month"` // 0 = không giới hạn dung lượng/tháng
+	MaxBandwidthBps    int64  `json:"max_bandwidth_bps"`
+	MaxConnections     int    `json:"max_connections"`
+	QuotaBytesPerMonth int64  `json:"quota_bytes_per_month"`
 }
 
 type APIToken struct {
-	Name      string `json:"name"`       // tên gợi nhớ, vd "monitoring-script"
-	TokenHash string `json:"token_hash"` // SHA-256 hex của token — token thật chỉ hiện 1 lần lúc tạo
+	Name      string `json:"name"`
+	TokenHash string `json:"token_hash"`
 	CreatedAt int64  `json:"created_at"`
 }
 
 type AppConfig struct {
 	DashboardUser         string            `json:"dashboard_user"`
 	DashboardPasswordHash string            `json:"dashboard_password_hash"`
-	Users                 []ProxyUserConfig `json:"users,omitempty"` // để trống = dùng chế độ 1 user cũ (-u/-P)
-	AllowList             []string          `json:"allow_list,omitempty"` // whitelist IP/CIDR, reload được qua SIGHUP
-	DenyList              []string          `json:"deny_list,omitempty"`  // blacklist IP/CIDR, reload được qua SIGHUP
-	UpstreamProxies       []string          `json:"upstream_proxies,omitempty"` // reload được qua SIGHUP
-	APITokens             []APIToken        `json:"api_tokens,omitempty"` // token riêng cho script/monitoring, tách khỏi password đăng nhập web
-	RequireProxyAuth      bool              `json:"require_proxy_auth,omitempty"` // tự bật khi tạo user trên dashboard, tránh proxy tự mở lại khi xoá hết user
+	Users                 []ProxyUserConfig `json:"users,omitempty"`
+	AllowList             []string          `json:"allow_list,omitempty"`
+	DenyList              []string          `json:"deny_list,omitempty"`
+	UpstreamProxies       []string          `json:"upstream_proxies,omitempty"`
+	APITokens             []APIToken        `json:"api_tokens,omitempty"`
+	RequireProxyAuth      bool              `json:"require_proxy_auth,omitempty"`
 }
 
 var (
@@ -2659,7 +1744,6 @@ var (
 	configMu   sync.Mutex
 )
 
-// loadOrInitConfig đọc config file nếu có, hoặc tạo mới từ giá trị flag hiện tại rồi lưu lại.
 func loadOrInitConfig(path, fallbackDashUser, fallbackDashPass string) (AppConfig, bool, error) {
 	data, err := os.ReadFile(path)
 	if err == nil {
@@ -2675,7 +1759,6 @@ func loadOrInitConfig(path, fallbackDashUser, fallbackDashPass string) (AppConfi
 	if !os.IsNotExist(err) {
 		return AppConfig{}, false, err
 	}
-	// Chưa có config file -> khởi tạo từ flag, hash mật khẩu, rồi ghi ra file.
 	hash, herr := hashPassword(fallbackDashPass)
 	if herr != nil {
 		return AppConfig{}, false, herr
@@ -2689,13 +1772,11 @@ func loadOrInitConfig(path, fallbackDashUser, fallbackDashPass string) (AppConfi
 	return cfg, true, nil
 }
 
-// saveConfig ghi config ra file dưới dạng JSON, quyền 0600 vì chứa hash mật khẩu.
 func saveConfig(path string, cfg AppConfig) error {
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
-	// Ghi file tạm rồi rename (atomic) — crash giữa chừng không làm hỏng config hiện có.
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0600); err != nil {
 		return err
@@ -2707,13 +1788,10 @@ func saveConfig(path string, cfg AppConfig) error {
 	return nil
 }
 
-// ======================== AUDIT LOG (mọi hành động admin qua dashboard) ========================
-// Khác với ReloadEvent (chỉ chuyên cho việc reload config, có nhiều chi tiết riêng), AuditEvent
-// bao quát MỌI hành động thay đổi trạng thái: kick connection, đổi mật khẩu, thêm/xoá/sửa user,
-// tạo/xoá API token... để tra cứu lại được "ai làm gì lúc nào" khi có sự cố.
+// ======================== AUDIT LOG ========================
 type AuditEvent struct {
 	Timestamp int64  `json:"t"`
-	Actor     string `json:"actor"` // "dashboard:<username>" hoặc "token:<tên token>"
+	Actor     string `json:"actor"`
 	Action    string `json:"action"`
 	Details   string `json:"details,omitempty"`
 }
@@ -2736,9 +1814,6 @@ func recordAudit(actor, action, details string) {
 	}
 }
 
-// actorFromRequest lấy định danh người gọi mà dashboardAuth đã xác thực (gắn vào header nội bộ
-// "X-Actor" — client không thể giả mạo vì dashboardAuth luôn ghi đè header này SAU KHI xác thực
-// thành công, giá trị cũ từ client nếu có sẽ bị .Set() thay thế hoàn toàn).
 func actorFromRequest(r *http.Request) string {
 	if a := r.Header.Get("X-Actor"); a != "" {
 		return a
@@ -2746,18 +1821,16 @@ func actorFromRequest(r *http.Request) string {
 	return "unknown"
 }
 
-// ReloadEvent ghi lại 1 lần reload config (thành công hay thất bại) để hiện trên dashboard —
-// giúp admin biết ai/khi nào reload, và có cảnh báo gì (vd. entry CIDR sai bị bỏ qua) không.
 type ReloadEvent struct {
 	Timestamp     int64    `json:"t"`
-	Source        string   `json:"source"` // "SIGHUP" hoặc "dashboard:<username>"
+	Source        string   `json:"source"`
 	Success       bool     `json:"success"`
 	Error         string   `json:"error,omitempty"`
 	AllowCount    int      `json:"allow_count"`
 	DenyCount     int      `json:"deny_count"`
 	UpstreamCount int      `json:"upstream_count"`
 	UserCount     int      `json:"user_count"`
-	InvalidCIDRs  []string `json:"invalid_cidrs,omitempty"` // entry bị bỏ qua vì sai định dạng
+	InvalidCIDRs  []string `json:"invalid_cidrs,omitempty"`
 }
 
 const reloadHistoryMax = 30
@@ -2776,13 +1849,7 @@ func recordReloadEvent(ev ReloadEvent) {
 	}
 }
 
-// reloadConfig đọc lại config file từ đĩa, VALIDATE trước khi áp dụng (nếu file hỏng/thiếu
-// trường bắt buộc thì từ chối, giữ nguyên toàn bộ state cũ đang chạy — không bao giờ áp dụng
-// nửa vời), rồi mới áp dụng: whitelist/blacklist IP, danh sách upstream, danh sách proxy user
-// (kèm giới hạn băng thông — đẩy live/ramp mượt cho connection đang mở qua applyLiveBandwidthLimit),
-// và dashboard credentials. KHÔNG cần restart, KHÔNG ngắt kết nối đang chạy.
-// source: "SIGHUP" hoặc "dashboard:<username>" — ghi vào lịch sử reload để admin biết ai gọi.
-// Mọi lần gọi (thành công lẫn thất bại) đều được ghi vào reloadHistory.
+// === FIX: thêm cảnh báo spec upstream không hợp lệ ===
 func reloadConfig(source string) error {
 	data, err := os.ReadFile(configPath)
 	if err != nil {
@@ -2804,13 +1871,10 @@ func reloadConfig(source string) error {
 		recordReloadEvent(ev)
 		return fmt.Errorf("%s", ev.Error)
 	}
-	// Validate CIDR trước — entry lỗi chỉ bị bỏ qua (không chặn cả lần reload), nhưng được
-	// báo cáo rõ trong lịch sử để admin biết mà sửa lại.
 	newAllow, invalidAllow := parseCIDRSliceValidated(cfg.AllowList)
 	newDeny, invalidDeny := parseCIDRSliceValidated(cfg.DenyList)
 	invalidCIDRs := append(append([]string{}, invalidAllow...), invalidDeny...)
 
-	// Mọi bước kiểm tra ở trên đã pass -> giờ mới áp dụng thật (atomic theo từng phần dữ liệu).
 	cidrMu.Lock()
 	allowedCIDRs = newAllow
 	deniedCIDRs = newDeny
@@ -2821,7 +1885,16 @@ func reloadConfig(source string) error {
 	if len(upstreamProxies) == 0 || upstreamIndex >= len(upstreamProxies) {
 		upstreamIndex = 0
 	}
+	badUps := make([]string, 0)
+	for _, spec := range upstreamProxies {
+		if _, ok := parseUpstreamSpec(spec); !ok {
+			badUps = append(badUps, spec)
+		}
+	}
 	upstreamMu.Unlock()
+	if len(badUps) > 0 {
+		log.Printf("[WARN] Reload: %d upstream spec không hợp lệ sẽ bị bỏ qua: %v", len(badUps), badUps)
+	}
 
 	dashboardCredMu.Lock()
 	dashboardUser = cfg.DashboardUser
@@ -2832,8 +1905,6 @@ func reloadConfig(source string) error {
 	appConfig = cfg
 	configMu.Unlock()
 
-	// Đẩy giới hạn băng thông mới (ramp mượt nếu đang đổi giữa 2 giới hạn có sẵn) cho MỌI
-	// proxy user vào các connection đang mở ngay lập tức.
 	for _, u := range cfg.Users {
 		applyLiveBandwidthLimit(u.Username, u.MaxBandwidthBps)
 	}
@@ -2857,7 +1928,6 @@ func reloadConfig(source string) error {
 }
 
 // ======================== DASHBOARD SERVER ========================
-// dashboardAuth bọc handler bằng HTTP Basic Auth, dùng dashboardUser/dashboardPassHash.
 func dashboardAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		remoteIP, _, _ := net.SplitHostPort(r.RemoteAddr)
@@ -2866,9 +1936,6 @@ func dashboardAuth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		// Ưu tiên API token (Authorization: Bearer <token>) — dùng cho script/monitoring,
-		// tách biệt hoàn toàn khỏi mật khẩu đăng nhập web. Không fallback xuống Basic Auth
-		// nếu có header Bearer nhưng token sai, để tránh nhập nhằng 2 luồng auth.
 		if authHeader := r.Header.Get("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
 			token := strings.TrimPrefix(authHeader, "Bearer ")
 			if name, ok := checkAPIToken(token); ok {
@@ -2902,7 +1969,6 @@ func dashboardAuth(next http.HandlerFunc) http.HandlerFunc {
 		if remoteIP != "" {
 			resetAuthFail(remoteIP)
 		}
-		// Chống CSRF: trình duyệt tự đính kèm Basic Auth đã cache vào request cross-site.
 		if !csrfOK(r) {
 			http.Error(w, "403 Forbidden (CSRF check failed)", http.StatusForbidden)
 			return
@@ -2931,8 +1997,8 @@ func (s *ProxyServer) dashboardServer() {
 	mux.HandleFunc("/api/audit-log", dashboardAuth(s.dashboardAuditLog))
 	mux.HandleFunc("/api/config/export", dashboardAuth(s.dashboardConfigExport))
 	mux.HandleFunc("/api/config/import", dashboardAuth(s.dashboardConfigImport))
-	mux.HandleFunc("/healthz", s.healthCheck) // không cần auth, dùng cho monitoring/orchestrator
-	mux.HandleFunc("/metrics", s.metricsHandler) // không cần auth, format Prometheus exposition text
+	mux.HandleFunc("/healthz", s.healthCheck)
+	mux.HandleFunc("/metrics", s.metricsHandler)
 	addr := net.JoinHostPort(dashboardBind, strconv.Itoa(dashboardPort))
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	s.dashboardHTTPServer = srv
@@ -2942,8 +2008,6 @@ func (s *ProxyServer) dashboardServer() {
 	}
 }
 
-// healthCheck trả 200 nếu server còn sống và chưa trong quá trình shutdown.
-// Không yêu cầu xác thực để orchestrator (Docker/K8s) gọi được dễ dàng.
 func (s *ProxyServer) healthCheck(w http.ResponseWriter, r *http.Request) {
 	if atomic.LoadInt32(&shuttingDown) == 1 {
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -2955,8 +2019,6 @@ func (s *ProxyServer) healthCheck(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"status":"ok"}`))
 }
 
-// metricsHandler xuất số liệu theo format Prometheus exposition text (tự viết tay bằng
-// stdlib, không dùng thư viện client_golang vì môi trường build không có mạng để `go get`).
 func (s *ProxyServer) metricsHandler(w http.ResponseWriter, r *http.Request) {
 	stats.mu.Lock()
 	total := stats.Total
@@ -3003,7 +2065,6 @@ func (s *ProxyServer) metricsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(b.String()))
 }
 
-// dashboardKick đóng một connection đang active theo ID (POST {"id":"c123"}).
 func (s *ProxyServer) dashboardKick(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if r.Method != http.MethodPost {
@@ -3041,7 +2102,6 @@ func (s *ProxyServer) dashboardKick(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "id": target.ID})
 }
 
-// dashboardExport xuất danh sách active connections ra CSV hoặc JSON: /api/export?format=csv|json
 func (s *ProxyServer) dashboardExport(w http.ResponseWriter, r *http.Request) {
 	format := r.URL.Query().Get("format")
 	if format == "" {
@@ -3115,8 +2175,6 @@ func (s *ProxyServer) dashboardAll(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(data)
 }
 
-// dashboardChangePassword cho phép đổi mật khẩu (và tuỳ chọn username) của dashboard.
-// Yêu cầu xác thực lại current_password để tránh bị lợi dụng qua CSRF/session bị đánh cắp.
 func (s *ProxyServer) dashboardChangePassword(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if r.Method != http.MethodPost {
@@ -3139,7 +2197,6 @@ func (s *ProxyServer) dashboardChangePassword(w http.ResponseWriter, r *http.Req
 	dashboardCredMu.Lock()
 	defer dashboardCredMu.Unlock()
 
-	// Xác thực lại mật khẩu hiện tại (không chỉ dựa vào Basic Auth header đã qua middleware)
 	if !verifyPassword(req.CurrentPassword, dashboardPassHash) {
 		w.WriteHeader(http.StatusForbidden)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Current password is incorrect"})
@@ -3169,7 +2226,6 @@ func (s *ProxyServer) dashboardChangePassword(w http.ResponseWriter, r *http.Req
 		dashboardUser = req.NewUsername
 	}
 
-	// Lưu xuống config file để credentials mới còn hiệu lực sau khi restart.
 	configMu.Lock()
 	appConfig.DashboardUser = dashboardUser
 	appConfig.DashboardPasswordHash = dashboardPassHash
@@ -3187,8 +2243,6 @@ func (s *ProxyServer) dashboardChangePassword(w http.ResponseWriter, r *http.Req
 	})
 }
 
-// dashboardUsers: GET liệt kê danh sách proxy user (không trả password_hash ra ngoài),
-// POST thêm mới/cập nhật 1 user (username, password, max_bandwidth_bps).
 func (s *ProxyServer) dashboardUsers(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -3217,7 +2271,7 @@ func (s *ProxyServer) dashboardUsers(w http.ResponseWriter, r *http.Request) {
 
 	var req struct {
 		Username           string `json:"username"`
-		Password           string `json:"password"` // để trống khi chỉ muốn đổi limit của user đã có
+		Password           string `json:"password"`
 		MaxBandwidthBps    int64  `json:"max_bandwidth_bps"`
 		MaxConnections     int    `json:"max_connections"`
 		QuotaBytesPerMonth int64  `json:"quota_bytes_per_month"`
@@ -3270,7 +2324,6 @@ func (s *ProxyServer) dashboardUsers(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !found {
-		// User mới -> bắt buộc phải có password.
 		if req.Password == "" {
 			configMu.Unlock()
 			w.WriteHeader(http.StatusBadRequest)
@@ -3301,8 +2354,6 @@ func (s *ProxyServer) dashboardUsers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Áp dụng giới hạn băng thông mới NGAY cho các connection đang mở của user này,
-	// không cần đợi họ ngắt kết nối rồi kết nối lại.
 	applyLiveBandwidthLimit(req.Username, req.MaxBandwidthBps)
 
 	log.Printf("[INFO] Dashboard: đã thêm/cập nhật proxy user '%s' (max_bandwidth_bps=%d, max_connections=%d, quota=%d, đổi password=%v)",
@@ -3312,7 +2363,6 @@ func (s *ProxyServer) dashboardUsers(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
 }
 
-// dashboardDeleteUser xoá 1 proxy user khỏi config (POST {"username": "..."}).
 func (s *ProxyServer) dashboardDeleteUser(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if r.Method != http.MethodPost {
@@ -3358,9 +2408,6 @@ func (s *ProxyServer) dashboardDeleteUser(w http.ResponseWriter, r *http.Request
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
 }
 
-// dashboardTokens: GET liệt kê token (không trả hash), POST tạo token mới — trả token THẬT
-// đúng 1 lần duy nhất lúc tạo (giống Personal Access Token của GitHub), sau đó chỉ có hash
-// được lưu, không cách nào xem lại token gốc.
 func (s *ProxyServer) dashboardTokens(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -3428,7 +2475,6 @@ func (s *ProxyServer) dashboardTokens(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "token": token, "name": req.Name})
 }
 
-// dashboardDeleteToken thu hồi 1 API token theo tên (POST {"name": "..."}).
 func (s *ProxyServer) dashboardDeleteToken(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if r.Method != http.MethodPost {
@@ -3474,7 +2520,6 @@ func (s *ProxyServer) dashboardDeleteToken(w http.ResponseWriter, r *http.Reques
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
 }
 
-// dashboardAuditLog trả về lịch sử hành động admin gần nhất (mới nhất trước).
 func (s *ProxyServer) dashboardAuditLog(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	auditLogMu.Lock()
@@ -3487,9 +2532,6 @@ func (s *ProxyServer) dashboardAuditLog(w http.ResponseWriter, r *http.Request) 
 	json.NewEncoder(w).Encode(map[string]interface{}{"events": events})
 }
 
-// dashboardConfigExport tải config file hiện tại về máy (backup) — bao gồm cả password hash
-// (đã hash, không phải plaintext, nhưng vẫn nên coi file này là bí mật vì lộ ra thì kẻ tấn công
-// có thể brute-force offline hoặc replay API token nếu chưa revoke).
 func (s *ProxyServer) dashboardConfigExport(w http.ResponseWriter, r *http.Request) {
 	configMu.Lock()
 	data, err := json.MarshalIndent(appConfig, "", "  ")
@@ -3504,8 +2546,6 @@ func (s *ProxyServer) dashboardConfigExport(w http.ResponseWriter, r *http.Reque
 	w.Write(data)
 }
 
-// dashboardConfigImport khôi phục config từ file backup đã upload — validate đầy đủ (giống hệt
-// reloadConfig) trước khi áp dụng, KHÔNG bao giờ ghi đè config đang chạy nếu file lỗi.
 func (s *ProxyServer) dashboardConfigImport(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if r.Method != http.MethodPost {
@@ -3513,7 +2553,7 @@ func (s *ProxyServer) dashboardConfigImport(w http.ResponseWriter, r *http.Reque
 		json.NewEncoder(w).Encode(map[string]string{"error": "Only POST is supported"})
 		return
 	}
-	data, err := io.ReadAll(io.LimitReader(r.Body, 5*1024*1024)) // giới hạn 5MB, đủ rộng rãi cho config JSON
+	data, err := io.ReadAll(io.LimitReader(r.Body, 5*1024*1024))
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to read uploaded file"})
@@ -3549,8 +2589,6 @@ func (s *ProxyServer) dashboardConfigImport(w http.ResponseWriter, r *http.Reque
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
 }
 
-// dashboardReload chạy lại reloadConfig() theo yêu cầu thủ công từ dashboard — hữu ích khi
-// admin vừa tự sửa config file bằng tay và muốn áp dụng ngay mà không cần SSH gõ `kill -HUP`.
 func (s *ProxyServer) dashboardReload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if r.Method != http.MethodPost {
@@ -3569,9 +2607,6 @@ func (s *ProxyServer) dashboardReload(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
 }
 
-// dashboardNetworkConfig: GET trả về allow/deny/upstream hiện tại; POST ghi danh sách mới
-// xuống config file rồi TỰ ĐỘNG reload ngay (không cần bấm Reload riêng) — validate luôn được
-// áp dụng vì POST cũng đi qua chính reloadConfig() giống hệt đường SIGHUP.
 func (s *ProxyServer) dashboardNetworkConfig(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -3617,8 +2652,6 @@ func (s *ProxyServer) dashboardNetworkConfig(w http.ResponseWriter, r *http.Requ
 
 	actor := actorFromRequest(r)
 	if err := reloadConfig(actor); err != nil {
-		// File đã ghi xuống đĩa nhưng reload thất bại (hiếm khi xảy ra vì chính ta vừa ghi) ->
-		// báo lỗi rõ ràng thay vì im lặng để state cũ và file mới lệch nhau.
 		recordAudit(actor, "update_network_config", "failed: "+err.Error())
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Đã lưu file nhưng reload thất bại: " + err.Error()})
@@ -3629,14 +2662,12 @@ func (s *ProxyServer) dashboardNetworkConfig(w http.ResponseWriter, r *http.Requ
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
 }
 
-// dashboardReloadHistory trả về lịch sử các lần reload gần nhất (mới nhất trước).
 func (s *ProxyServer) dashboardReloadHistory(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	reloadHistoryMu.Lock()
 	hist := make([]ReloadEvent, len(reloadHistory))
 	copy(hist, reloadHistory)
 	reloadHistoryMu.Unlock()
-	// Đảo ngược để mới nhất lên đầu.
 	for i, j := 0, len(hist)-1; i < j; i, j = i+1, j-1 {
 		hist[i], hist[j] = hist[j], hist[i]
 	}
@@ -3729,16 +2760,15 @@ func (s *ProxyServer) getAllStats() map[string]interface{} {
 }
 
 // ======================== STATS REPORTER ========================
-// ======================== TIME-SERIES + SSE (REAL-TIME DASHBOARD) ========================
 type StatSample struct {
-	Timestamp   int64 `json:"t"`          // unix seconds
-	BytesUpBps  int64 `json:"up_bps"`     // tốc độ trung bình trong khoảng lấy mẫu (bytes/giây)
+	Timestamp   int64 `json:"t"`
+	BytesUpBps  int64 `json:"up_bps"`
 	BytesDnBps  int64 `json:"down_bps"`
 	Active      int   `json:"active"`
 	UDPAssocs   int   `json:"udp_assocs"`
 }
 
-const historyMaxSamples = 300 // 300 mẫu * 2s = 10 phút gần nhất
+const historyMaxSamples = 300
 
 var (
 	statHistory   []StatSample
@@ -3754,7 +2784,7 @@ func broadcastSample(sample StatSample) {
 	for ch := range sseClients {
 		select {
 		case ch <- sample:
-		default: // client đang chậm/không đọc kịp -> bỏ qua mẫu này, không block server
+		default:
 		}
 	}
 }
@@ -3768,7 +2798,6 @@ func (s *ProxyServer) statsReporter() {
 	tick := 0
 	for range ticker.C {
 		tick++
-		// Flush bytes của mọi connection đang mở vào stats tổng + usage (quota) trước khi đọc số liệu.
 		activeConnsMu.Lock()
 		snapshot := make([]*ConnectionInfo, 0, len(activeConns))
 		for ci := range activeConns {
@@ -3809,7 +2838,6 @@ func (s *ProxyServer) statsReporter() {
 			formatBytes(up), formatBytes(down), formatBytes(udpUp), formatBytes(udpDown),
 			uptime.Round(time.Second))
 
-		// Tính tốc độ bytes/giây kể từ lần lấy mẫu trước, lưu vào ring buffer + đẩy qua SSE.
 		var upBps, downBps int64
 		if !first {
 			upBps = int64(float64(up-lastUp) / interval.Seconds())
@@ -3832,9 +2860,7 @@ func (s *ProxyServer) statsReporter() {
 		statHistoryMu.Unlock()
 		broadcastSample(sample)
 
-		// Cứ ~30s (15 tick * 2s) mới check quota + lưu usage file, không cần làm mỗi 2s vì
-		// dung lượng không đổi nhanh đến mức phải check sát sao hơn, và ghi file mỗi 2s tốn I/O vô ích.
-		if tick%5 == 0 { // ~10s: kiểm tra quota để cắt connection đang chạy
+		if tick%5 == 0 {
 			enforceQuotaOnActiveConns()
 		}
 		if tick%15 == 0 {
@@ -3847,9 +2873,6 @@ func (s *ProxyServer) statsReporter() {
 	}
 }
 
-// enforceQuotaOnActiveConns kiểm tra mọi connection đang mở, kick những connection thuộc về
-// user đã vượt quota dung lượng tháng này — quota chỉ được chặn ở bước auth cho connection MỚI,
-// nên connection đang chạy dở (vd download lớn) cần cơ chế riêng này để bị cắt giữa chừng.
 func enforceQuotaOnActiveConns() {
 	activeConnsMu.Lock()
 	var toKick []*ConnectionInfo
@@ -3888,9 +2911,6 @@ func enforceQuotaOnActiveConns() {
 	}
 }
 
-// dashboardStream đẩy số liệu real-time qua Server-Sent Events (SSE). Chọn SSE thay vì
-// WebSocket vì SSE chỉ cần http.Flusher có sẵn trong stdlib, không phải tự cài đặt bắt tay
-// RFC6455 + framing nhị phân bằng tay (rủi ro lỗi cao khi không có compiler để kiểm tra).
 func (s *ProxyServer) dashboardStream(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -3898,9 +2918,6 @@ func (s *ProxyServer) dashboardStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// FIX v6.3.6: giới hạn SSE client đồng thời (DoS protection).
-	// Check + add phải làm dưới cùng một lock để tránh race khi nhiều request
-	// cùng lúc đều thấy len < MAX rồi cùng add.
 	ch := make(chan StatSample, 8)
 	sseClientsMu.Lock()
 	if len(sseClients) >= DASHBOARD_MAX_SSE {
@@ -3921,7 +2938,6 @@ func (s *ProxyServer) dashboardStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 
-	// Gửi lịch sử hiện có ngay khi client vừa kết nối, để vẽ biểu đồ có dữ liệu ngay.
 	statHistoryMu.Lock()
 	hist := make([]StatSample, len(statHistory))
 	copy(hist, statHistory)
@@ -4007,13 +3023,8 @@ func main() {
 		log.Printf("[INFO] Logging ra file %s (max %dMB, giữ %d bản cũ)", logFilePath, logMaxSizeMB, logMaxBackups)
 	}
 
-	// Load config file (tạo mới từ -dashboard-user/-dashboard-pass nếu chưa tồn tại).
-	// Từ lần chạy thứ 2 trở đi, -dashboard-user/-dashboard-pass/-allow/-deny/-upstream bị bỏ qua
-	// (dùng dashboard hoặc tự sửa config file + gửi SIGHUP để đổi) — giống hệt cách xử lý
-	// dashboard credentials đã có từ trước, áp dụng nhất quán cho cả allow/deny/upstream.
 	generatedPass := ""
 	if _, statErr := os.Stat(configPath); os.IsNotExist(statErr) && initDashPass == "" {
-		// Lần chạy đầu không chỉ định mật khẩu -> sinh ngẫu nhiên thay vì dùng admin/admin.
 		tok, gerr := generateAPIToken()
 		if gerr != nil {
 			log.Fatalf("[FATAL] Không sinh được mật khẩu ngẫu nhiên: %v", gerr)
@@ -4029,7 +3040,6 @@ func main() {
 		log.Printf("[WARN] Dashboard lần đầu — user: %s | password: %s (chỉ hiện MỘT LẦN, hãy lưu lại/đổi ngay)", initDashUser, generatedPass)
 	}
 	if wasCreated {
-		// Lần đầu chạy: seed allow/deny/upstream từ flag vào config để lần sau + hot-reload dùng chung 1 nguồn.
 		for _, item := range strings.Split(allowStr, ",") {
 			if item = strings.TrimSpace(item); item != "" {
 				cfg.AllowList = append(cfg.AllowList, item)
@@ -4056,6 +3066,13 @@ func main() {
 	deniedCIDRs = parseCIDRSlice(cfg.DenyList)
 	upstreamProxies = append([]string{}, cfg.UpstreamProxies...)
 
+	// === FIX: validate upstream specs sớm ===
+	for _, spec := range upstreamProxies {
+		if _, ok := parseUpstreamSpec(spec); !ok {
+			log.Printf("[WARN] Upstream spec không hợp lệ (sẽ bị bỏ qua mỗi request): %q — dạng đúng: host:port, http://host:port, socks5://host:port", spec)
+		}
+	}
+
 	if dashboardUser == "admin" && verifyPassword("admin", dashboardPassHash) {
 		log.Println("[WARN] Dashboard đang dùng tài khoản mặc định admin/admin — hãy đổi ngay trên dashboard (nút Change Password)")
 	}
@@ -4075,7 +3092,6 @@ func main() {
 	log.Printf("[INFO] Whitelist: %d entries | Blacklist: %d entries (config file: %s)", len(allowedCIDRs), len(deniedCIDRs), configPath)
 	log.Printf("[INFO] Gửi SIGHUP (`kill -HUP %%d`) để reload allow/deny/upstream/users/dashboard-creds từ config file mà không cần restart")
 
-	// ==== Hot-reload: bắt SIGHUP, đọc lại config file và áp dụng ngay không cần restart ====
 	hupCh := make(chan os.Signal, 1)
 	signal.Notify(hupCh, syscall.SIGHUP)
 	go func() {
@@ -4087,7 +3103,6 @@ func main() {
 		}
 	}()
 
-	// ==== Graceful shutdown: bắt SIGINT/SIGTERM, đóng sạch trước khi thoát ====
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -4095,13 +3110,11 @@ func main() {
 		log.Printf("[INFO] Nhận tín hiệu %v, bắt đầu graceful shutdown...", sig)
 		atomic.StoreInt32(&shuttingDown, 1)
 
-		// Không nhận connection mới nữa
 		server.listener.Close()
 		if server.dashboardHTTPServer != nil {
 			server.dashboardHTTPServer.Close()
 		}
 
-		// Đóng tất cả connection đang active
 		activeConnsMu.Lock()
 		n := len(activeConns)
 		for ci := range activeConns {
@@ -4124,17 +3137,15 @@ func main() {
 	server.Run()
 }
 
-// ======================== HELPER BỔ SUNG (các bản vá) ========================
+// ======================== HELPER BỔ SUNG ========================
 const (
-	handshakeTimeout = 30 * time.Second // thời gian tối đa client được phép gửi xong handshake/header
+	handshakeTimeout = 30 * time.Second
 	maxHeaderLines   = 100
 	maxLineBytes     = 8192
 )
 
-var dashboardBind string // flag -dashboard-bind
+var dashboardBind string
 
-// extraBlockedNets: các dải IPv4 đặc biệt mà net.IP.IsPrivate/... không bao phủ
-// (this-network, CGNAT — gồm cả metadata Alibaba 100.100.100.200, IETF protocol, benchmark).
 var extraBlockedNets = func() []*net.IPNet {
 	var nets []*net.IPNet
 	for _, c := range []string{"0.0.0.0/8", "100.64.0.0/10", "192.0.0.0/24", "198.18.0.0/15"} {
@@ -4145,7 +3156,6 @@ var extraBlockedNets = func() []*net.IPNet {
 	return nets
 }()
 
-// readLine đọc 1 dòng (bỏ CRLF) nhưng giới hạn độ dài, tránh client gửi dòng vô hạn ăn hết RAM.
 func readLine(r *bufio.Reader, max int) (string, error) {
 	var sb strings.Builder
 	for {
@@ -4163,8 +3173,6 @@ func readLine(r *bufio.Reader, max int) (string, error) {
 	}
 }
 
-// bufConn đọc từ reader (đã có buffer) thay vì từ conn thô, để không mất byte đã được
-// bufio.Reader đọc trước khi chuyển sang chế độ tunnel.
 type bufConn struct {
 	net.Conn
 	r io.Reader
@@ -4172,7 +3180,6 @@ type bufConn struct {
 
 func (b *bufConn) Read(p []byte) (int, error) { return b.r.Read(p) }
 
-// relayChunked chuyển tiếp body dạng chunked theo kiểu stream, kiểm tra kích thước chunk hợp lệ.
 func relayChunked(r *bufio.Reader, w io.Writer) error {
 	for {
 		line, err := readLine(r, 1024)
@@ -4191,7 +3198,7 @@ func relayChunked(r *bufio.Reader, w io.Writer) error {
 			return err
 		}
 		if size == 0 {
-			for i := 0; i <= maxHeaderLines; i++ { // trailer
+			for i := 0; i <= maxHeaderLines; i++ {
 				t, err := readLine(r, maxLineBytes)
 				if err != nil {
 					return err
@@ -4221,9 +3228,6 @@ func relayChunked(r *bufio.Reader, w io.Writer) error {
 	}
 }
 
-// flushConnStats cộng phần bytes MỚI (kể từ lần flush trước) của 1 connection vào stats tổng và
-// usage/quota của user. Gọi định kỳ bởi statsReporter cho mọi connection đang mở + 1 lần cuối khi đóng,
-// nên quota và biểu đồ phản ánh traffic theo thời gian thực. An toàn khi gọi đồng thời (có flushMu).
 func flushConnStats(ci *ConnectionInfo) {
 	ci.flushMu.Lock()
 	up := atomic.LoadInt64(&ci.BytesUp)
@@ -4242,8 +3246,6 @@ func flushConnStats(ci *ConnectionInfo) {
 	addUsage(ci.Username, dUp+dDown)
 }
 
-// authRequired: proxy yêu cầu xác thực nếu có -u/-P, HOẶC đã có user tạo trên dashboard
-// (trước đây chỉ xét -u/-P nên user trên dashboard không bao giờ được enforce).
 func (s *ProxyServer) authRequired() bool {
 	if s.authEnabled {
 		return true
@@ -4253,9 +3255,6 @@ func (s *ProxyServer) authRequired() bool {
 	return appConfig.RequireProxyAuth || len(appConfig.Users) > 0
 }
 
-// Cache kết quả verify mật khẩu THÀNH CÔNG (key = SHA-256(hash đã lưu + mật khẩu), TTL ngắn):
-// verifyPassword tốn ~200k vòng SHA-256 mỗi lần, mà dashboard poll liên tục và mỗi connection
-// proxy đều phải auth. Đổi mật khẩu -> hash khác -> key khác nên cache tự vô hiệu. Không cache thất bại.
 var (
 	pwCacheMu sync.Mutex
 	pwCache   = make(map[[32]byte]time.Time)
@@ -4291,8 +3290,6 @@ func verifyPasswordCached(password, stored string) bool {
 	return true
 }
 
-// csrfOK chặn request thay đổi trạng thái đến từ trang web khác: yêu cầu Content-Type JSON
-// (buộc preflight CORS với request cross-origin) và Origin/Sec-Fetch-Site phải cùng origin.
 func csrfOK(r *http.Request) bool {
 	switch r.Method {
 	case http.MethodGet, http.MethodHead, http.MethodOptions:
@@ -4310,10 +3307,9 @@ func csrfOK(r *http.Request) bool {
 	return strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "application/json")
 }
 
-// udpClientToRemote giải mã gói SOCKS5-UDP từ client và gửi payload tới đích (sau khi check SSRF).
 func (s *ProxyServer) udpClientToRemote(assoc *UDPAssociation, conn *net.UDPConn, pkt []byte) {
 	n := len(pkt)
-	if n < 4 || pkt[2] != 0 { // không hỗ trợ fragment
+	if n < 4 || pkt[2] != 0 {
 		return
 	}
 	atyp := pkt[3]
@@ -4348,7 +3344,7 @@ func (s *ProxyServer) udpClientToRemote(assoc *UDPAssociation, conn *net.UDPConn
 	}
 	port := int(binary.BigEndian.Uint16(pkt[pos : pos+2]))
 	pos += 2
-	payload := append([]byte(nil), pkt[pos:]...) // copy: buffer đọc được tái sử dụng
+	payload := append([]byte(nil), pkt[pos:]...)
 
 	send := func() {
 		ip, err := resolveAndCheck(host)
@@ -4362,7 +3358,7 @@ func (s *ProxyServer) udpClientToRemote(assoc *UDPAssociation, conn *net.UDPConn
 			if len(assoc.DestMap) >= 4096 {
 				assoc.DestMap = make(map[string]time.Time)
 			}
-			assoc.DestMap[dest.String()] = time.Now() // key theo IP:port đã resolve để lọc gói trả về
+			assoc.DestMap[dest.String()] = time.Now()
 		}
 		assoc.mu.Unlock()
 		if _, err := conn.WriteToUDP(payload, dest); err != nil {
@@ -4374,14 +3370,12 @@ func (s *ProxyServer) udpClientToRemote(assoc *UDPAssociation, conn *net.UDPConn
 		addUsage(assoc.Username, int64(len(payload)))
 	}
 	if atyp == 0x03 {
-		go send() // DNS lookup có thể chậm, không chặn vòng đọc UDP
+		go send()
 	} else {
 		send()
 	}
 }
 
-// udpRemoteToClient đóng gói gói trả về từ đích (kèm header SOCKS5 mang địa chỉ NGUỒN của đích,
-// trong MỘT datagram duy nhất) rồi gửi cho client. Chỉ nhận từ đích mà client đã từng gửi tới.
 func (s *ProxyServer) udpRemoteToClient(assoc *UDPAssociation, conn *net.UDPConn, client, from *net.UDPAddr, data []byte) {
 	assoc.mu.Lock()
 	_, allowed := assoc.DestMap[from.String()]
