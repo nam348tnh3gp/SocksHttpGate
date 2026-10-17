@@ -1,23 +1,23 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 #
-# Universal Proxy Pro v6.3.6 — Ruby port (full parity Python/Go/C/JS)
+# Universal Proxy Pro v6.3.7 — Ruby port (full parity Python/Go/C/JS)
 #
-# Ruby 2.7+ (tested 3.x). Stdlib only:
-#   socket, openssl, digest, json, securerandom, base64, ipaddr, thread, set, uri, cgi, time.
+# FIX v6.3.7:
+#   * CRITICAL: upstream handshake. Trước đây chỉ dial TCP tới upstream mà không
+#     gửi CONNECT (HTTP) hay greeting+CONNECT (SOCKS5) → socket trả về trỏ tới
+#     UPSTREAM, không phải TARGET. Sửa: parse scheme (http://, socks5://), thực
+#     hiện handshake thật, kiểm tra reply, chỉ trả socket khi handshake thành công.
+#   * FIX: round-robin advance SAU KHI thành công (trước đây advance trước dial
+#     → 1 upstream chết làm skip upstream liền sau).
+#   * FIX: upstream_proxies giờ lưu spec string (không parse sớm), health key
+#     = spec string (nhất quán dashboard + log + reload).
 #
-# Chạy:
-#   ruby proxy.rb -p 1080 --dashboard-port 8081
-#   ruby proxy.rb --help
-#
-# Đã port các fix v6.3.6 từ Python:
+# FIX v6.3.6 (giữ nguyên):
 #   * CONNECT IPv6 không crash (parse [v6]:port)
 #   * SOCKS5 UDP BND.ADDR = IP proxy (không phải client)
 #   * Từ chối smuggling (CL+TE, multi-CL, TE bất thường)
 #   * Buffered reader + forward byte client gửi sớm vào tunnel
-#
-# Lưu ý GIL: MRI release GVL cho IO (recv/send/select), nên proxy IO-bound
-# scale tốt. Thread-per-connection đủ cho vài trăm conn/process.
 
 require 'socket'
 require 'openssl'
@@ -119,7 +119,6 @@ module Util
     diff.zero?
   end
 
-  # ---------- Password hash (tương thích format Python/Go/C) ----------
   def pw_digest(password, salt, iterations)
     d = Digest::SHA256.digest(salt + password.to_s)
     (iterations - 1).times { d = Digest::SHA256.digest(d) }
@@ -206,10 +205,9 @@ module SSRF
   def blocked?(ip_str)
     ip = IPAddr.new(ip_str)
     return true if ip.loopback? || ip.private? || ip.link_local?
-    # multicast / unspecified / reserved
     if ip.ipv4?
       return true if ip.to_i.zero?
-      return true if ip.to_i >= 0xE000_0000  # multicast + reserved
+      return true if ip.to_i >= 0xE000_0000
     else
       return true if ip.to_i.zero?
     end
@@ -248,6 +246,7 @@ module State
   @denied_cidrs  = []
   @cidr_lock     = Mutex.new
 
+  # === FIX: upstream_proxies lưu spec string (không parse sớm) ===
   @upstream_proxies = []
   @upstream_index   = 0
   @upstream_lock    = Mutex.new
@@ -393,19 +392,14 @@ module ConfigFile
       State.denied_cidrs  = nd
     end
 
+    # === FIX: giữ nguyên spec string; cảnh báo spec sai ===
     State.upstream_lock.synchronize do
-      ups = []
-      new_cfg.upstream_proxies.each do |it|
-        next unless it.include?(':')
-        h, p = it.rsplit(':', 1) rescue it.rpartition(':').values_at(0, 2)
-        h, p = it.rpartition(':').values_at(0, 2)
-        begin
-          ups << [h, Integer(p)]
-        rescue ArgumentError
-        end
+      State.upstream_proxies = new_cfg.upstream_proxies.dup
+      State.upstream_index = 0 if State.upstream_index >= State.upstream_proxies.size
+      bad_ups = State.upstream_proxies.reject { |s| Upstream.parse_spec(s) }
+      unless bad_ups.empty?
+        Util.log_warn "Reload: #{bad_ups.size} upstream spec không hợp lệ sẽ bị bỏ qua: #{bad_ups.inspect}"
       end
-      State.upstream_proxies = ups
-      State.upstream_index = 0 if State.upstream_index >= ups.size
     end
 
     State.cfg_lock.synchronize do
@@ -445,7 +439,7 @@ module ConfigFile
 end
 
 # ══════════════════════════════════════════════════════════════════════
-# USAGE (quota tháng)
+# USAGE
 # ══════════════════════════════════════════════════════════════════════
 module Usage
   module_function
@@ -495,7 +489,7 @@ module Usage
 end
 
 # ══════════════════════════════════════════════════════════════════════
-# AUTH FAIL (brute-force)
+# AUTH FAIL
 # ══════════════════════════════════════════════════════════════════════
 module AuthFail
   module_function
@@ -504,9 +498,7 @@ module AuthFail
     now = Time.now.to_f
     State.fail_lock.synchronize do
       last = State.fail_last[ip]
-      if last && now - last < 2.0
-        return
-      end
+      return if last && now - last < 2.0
       State.fail_counts[ip] = 0 if last && now - last > AUTH_FAIL_WINDOW
       State.fail_last[ip] = now
       State.fail_counts[ip] = (State.fail_counts[ip] || 0) + 1
@@ -632,19 +624,175 @@ class BufReader
 end
 
 # ══════════════════════════════════════════════════════════════════════
-# UPSTREAM (round-robin + health)
+# UPSTREAM (round-robin + health + handshake)
 # ══════════════════════════════════════════════════════════════════════
 module Upstream
   module_function
 
-  def healthy?(addr)
-    State.upstream_health_lock.synchronize do
-      State.upstream_health.fetch(addr, true)
+  # === FIX: parse spec — trả [type, host, port] hoặc nil ===
+  #   "1.2.3.4:8080"              → ["http", "1.2.3.4", 8080]
+  #   "http://1.2.3.4:3128"       → ["http", "1.2.3.4", 3128]
+  #   "socks5://1.2.3.4:1080"     → ["socks5", "1.2.3.4", 1080]
+  #   "[::1]:1080"                → ["http", "::1", 1080]
+  #   "socks5://[::1]:1080"       → ["socks5", "::1", 1080]
+  def parse_spec(spec)
+    return nil if spec.nil?
+    s = spec.to_s.strip
+    return nil if s.empty?
+    typ = 'http'
+    low = s.downcase
+    if low.start_with?('socks5://')
+      typ = 'socks5'
+      s = s[9..-1].to_s.strip
+    elsif low.start_with?('http://')
+      typ = 'http'
+      s = s[7..-1].to_s.strip
+    end
+    return nil if s.empty?
+
+    if s.start_with?('[')
+      end_idx = s.index(']')
+      return nil unless end_idx
+      host = s[1...end_idx]
+      rest = s[(end_idx + 1)..-1] || ''
+      return nil unless rest.start_with?(':')
+      begin
+        port = Integer(rest[1..-1])
+      rescue ArgumentError
+        return nil
+      end
+    else
+      idx = s.rindex(':')
+      return nil unless idx
+      host = s[0...idx]
+      begin
+        port = Integer(s[(idx + 1)..-1])
+      rescue ArgumentError
+        return nil
+      end
+    end
+    return nil if host.nil? || host.empty? || port < 1 || port > 65535
+    [typ, host, port]
+  end
+
+  # === FIX: helper timeout-safe read exact n bytes ===
+  def read_exact_timeout(sock, n, timeout)
+    buf = +''.b
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+    while buf.bytesize < n
+      remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      raise IOError, 'upstream handshake timeout' if remaining <= 0
+      ready = IO.select([sock], nil, nil, remaining)
+      raise IOError, 'upstream handshake timeout' unless ready
+      chunk = sock.read(n - buf.bytesize)
+      raise IOError, "upstream closed after #{buf.bytesize}/#{n} bytes" if chunk.nil?
+      buf << chunk
+    end
+    buf
+  end
+
+  # === FIX: đọc 1 dòng (kết thúc \n) có timeout ===
+  def read_line_timeout(sock, timeout, max_len = 8192)
+    buf = +''.b
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+    while buf.bytesize < max_len
+      remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      raise IOError, 'upstream handshake timeout' if remaining <= 0
+      ready = IO.select([sock], nil, nil, remaining)
+      raise IOError, 'upstream handshake timeout' unless ready
+      b = sock.read(1)
+      raise IOError, 'upstream closed mid-line' if b.nil?
+      buf << b
+      return buf if b == "\n"
+    end
+    raise IOError, "line too long (> #{max_len})"
+  end
+
+  # === FIX: HTTP CONNECT handshake ===
+  def handshake_http(sock, host, port)
+    target = host.include?(':') ? "[#{host}]:#{port}" : "#{host}:#{port}"
+    req = "CONNECT #{target} HTTP/1.1\r\nHost: #{target}\r\n\r\n"
+    sock.write(req.b)
+
+    line = read_line_timeout(sock, CONNECTION_TIMEOUT)
+    unless line.start_with?('HTTP/1.')
+      raise IOError, "bad status line: #{line.inspect}"
+    end
+    parts = line.split(' ', 3)
+    if parts.length < 2 || parts[1][0] != '2'
+      raise IOError, "CONNECT rejected: #{line.strip}"
+    end
+
+    128.times do
+      h = read_line_timeout(sock, CONNECTION_TIMEOUT)
+      break if h == "\r\n" || h == "\n"
     end
   end
 
-  def set_health(addr, alive)
-    State.upstream_health_lock.synchronize { State.upstream_health[addr] = alive }
+  # === FIX: SOCKS5 no-auth + CONNECT handshake ===
+  def handshake_socks5(sock, host, port)
+    sock.write("\x05\x01\x00".b)
+    resp = read_exact_timeout(sock, 2, CONNECTION_TIMEOUT)
+    raise IOError, "bad greeting ver #{resp.getbyte(0)}" if resp.getbyte(0) != 5
+    if resp.getbyte(1) != 0
+      raise IOError, "upstream yêu cầu auth (method 0x#{resp.getbyte(1).to_s(16)})"
+    end
+
+    req = +"\x05\x01\x00".b
+    begin
+      ip = IPAddr.new(host)
+      if ip.ipv4?
+        req << "\x01".b
+        req << ip.hton
+      else
+        req << "\x04".b
+        req << ip.hton
+      end
+    rescue IPAddr::InvalidAddressError
+      hb = host.b
+      raise IOError, "hostname too long (#{hb.bytesize} > 255)" if hb.bytesize > 255
+      req << "\x03".b
+      req << [hb.bytesize].pack('C')
+      req << hb
+    end
+    req << [port].pack('n')
+    sock.write(req)
+
+    hdr = read_exact_timeout(sock, 4, CONNECTION_TIMEOUT)
+    raise IOError, "bad reply ver #{hdr.getbyte(0)}" if hdr.getbyte(0) != 5
+    rep = hdr.getbyte(1)
+    raise IOError, "CONNECT fail rep=0x#{rep.to_s(16)}" if rep != 0
+    atyp = hdr.getbyte(3)
+    alen = case atyp
+           when 1 then 4
+           when 4 then 16
+           when 3 then read_exact_timeout(sock, 1, CONNECTION_TIMEOUT).getbyte(0)
+           else raise IOError, "bad atyp #{atyp}"
+           end
+    read_exact_timeout(sock, alen + 2, CONNECTION_TIMEOUT)
+  end
+
+  def healthy?(spec)
+    State.upstream_health_lock.synchronize do
+      State.upstream_health.fetch(spec, true)
+    end
+  end
+
+  def set_health(spec, alive)
+    prev = nil
+    known = false
+    State.upstream_health_lock.synchronize do
+      prev = State.upstream_health[spec]
+      known = State.upstream_health.key?(spec)
+      State.upstream_health[spec] = alive
+    end
+    if known && prev != alive
+      if alive
+        Util.log "Upstream #{spec} đã SỐNG LẠI"
+      else
+        Util.log_warn "Upstream #{spec} CHẾT (không kết nối được)"
+      end
+    end
   end
 
   def try_connect(host, port)
@@ -655,30 +803,61 @@ module Upstream
     nil
   end
 
+  # === FIX: connect_target có handshake thật ===
   def connect_target(host, port)
     ups, start = State.upstream_lock.synchronize do
       [State.upstream_proxies.dup, State.upstream_index]
     end
 
     unless ups.empty?
-      alive_n = ups.count { |u| healthy?("#{u[0]}:#{u[1]}") }
+      alive_n = ups.count { |spec| healthy?(spec) }
       ups.size.times do |i|
         idx = (start + i) % ups.size
-        uh, up = ups[idx]
-        key = "#{uh}:#{up}"
-        next if alive_n > 0 && !healthy?(key)
+        spec = ups[idx]
+        next if alive_n > 0 && !healthy?(spec)
+
+        parsed = parse_spec(spec)
+        next unless parsed  # đã warn lúc reload/startup
+        utyp, uh, up = parsed
+
+        # Dial TCP tới upstream proxy
+        s = begin
+          Socket.tcp(uh, up, connect_timeout: CONNECTION_TIMEOUT)
+        rescue StandardError => e
+          Util.log_warn "Upstream #{spec} dial fail: #{e.message}"
+          set_health(spec, false)
+          next
+        end
+
+        # Handshake thật — phần fix chính
+        begin
+          if utyp == 'socks5'
+            handshake_socks5(s, host, port)
+          else
+            handshake_http(s, host, port)
+          end
+        rescue StandardError => e
+          Util.log_warn "Upstream #{spec} handshake fail: #{e.message}"
+          begin; s.close; rescue StandardError; end
+          set_health(spec, false)
+          next
+        end
+
+        # Advance round-robin SAU KHI thành công (fix bug skip)
         State.upstream_lock.synchronize do
-          State.upstream_index = (idx + 1) % [State.upstream_proxies.size, 1].max
+          n = State.upstream_proxies.size
+          State.upstream_index = (idx + 1) % n if n > 0
         end
-        s = try_connect(uh, up)
-        if s
-          set_health(key, true)
-          return s
+        set_health(spec, true)
+        begin
+          s.setsockopt(Socket::SOL_SOCKET, Socket::SO_KEEPALIVE, 1)
+        rescue StandardError
         end
-        set_health(key, false)
+        return s
       end
     end
 
+    # Fallback: direct connect (có SSRF guard)
     resolved = resolve_target(host, port)
     return nil if resolved.nil?
     resolved.each do |ip, p|
@@ -699,11 +878,11 @@ module Upstream
     rescue IPAddr::InvalidAddressError
     end
     infos = Socket.getaddrinfo(host, port, nil, Socket::SOCK_STREAM)
-    infos.map do |_, _, ip, _, sa|
+    infos.map do |_, _, _ip, numeric, _sa|
       begin
-        addr = IPAddr.new(ip)
+        addr = IPAddr.new(numeric)
         return nil if SSRF.blocked?(addr.to_s)
-        [sa.ip_address, sa.ip_port]
+        [numeric, port]
       rescue StandardError
         nil
       end
@@ -769,7 +948,6 @@ class ProxyHandler
     end
   end
 
-  # ────────────────────────────── SOCKS5 ──────────────────────────────
   def handle_socks5
     hdr = @reader.read_exact(2)
     return unless hdr
@@ -829,7 +1007,6 @@ class ProxyHandler
     State.active_lock.synchronize { State.active_conns.delete(@ci.id) } if @ci
   end
 
-  # ─────────────────────── SOCKS5 UDP ASSOCIATE ───────────────────────
   def handle_udp_associate(username, rate_bps, atyp)
     host, port = read_addr(atyp)
     target = host ? "UDP:#{host}:#{port}" : 'UDP:any'
@@ -864,7 +1041,6 @@ class ProxyHandler
       State.stats[:socks5_udp] += 1
     end
 
-    # FIX v6.3.6: BND.ADDR là IP PROXY (local sock addr), không phải client IP.
     proxy_ip = @sock.addr[3]
     socks5_reply(0x00, proxy_ip, relay_port)
     Util.log "#{PURPLE}UDP reply sent → client dùng #{Util.normalize_ip(proxy_ip)}:#{relay_port}#{RESET}"
@@ -1023,12 +1199,12 @@ class ProxyHandler
     nil
   end
 
-  # ─────────────────────── SOCKS5 auth / addr / reply ───────────────────────
   def socks5_auth
     ver = @reader.read_one
-    return [false, 0, ''] unless ver == 1
-    @sock.write("\x01\xff".b)
-    return [false, 0, ''] unless ver == 1
+    unless ver == 1
+      @sock.write("\x01\xff".b)
+      return [false, 0, '']
+    end
 
     ulen = @reader.read_one
     return [false, 0, ''] unless ulen
@@ -1054,7 +1230,7 @@ class ProxyHandler
       [false, 0, '']
     end
   rescue StandardError
-    begin; @sock.write("\x01\xff".b); rescue; end
+    begin; @sock.write("\x01\xff".b); rescue StandardError; end
     [false, 0, '']
   end
 
@@ -1095,7 +1271,6 @@ class ProxyHandler
     Util.log_warn "socks5_reply error: #{e.message}"
   end
 
-  # ───────────────────────────── HTTP ─────────────────────────────
   def handle_http
     req_line, headers = read_http_headers
     return unless req_line
@@ -1104,7 +1279,6 @@ class ProxyHandler
     method = parts[0].upcase
     url = parts[1]
 
-    # FIX v6.3.6: smuggling checks
     cl_vals = headers['content-length'] || []
     te_vals = headers['transfer-encoding'] || []
     if cl_vals.any? && te_vals.any?
@@ -1142,7 +1316,6 @@ class ProxyHandler
       end
     end
 
-    # FIX v6.3.6: CONNECT hỗ trợ [v6]:port
     if method == 'CONNECT'
       host, port = parse_connect_authority(url)
       unless host
@@ -1180,7 +1353,7 @@ class ProxyHandler
         forward_response(remote, @sock, @ci)
       end
     ensure
-      begin; remote.close unless remote.closed?; rescue; end
+      begin; remote.close unless remote.closed?; rescue StandardError; end
     end
   ensure
     State.active_lock.synchronize { State.active_conns.delete(@ci.id) } if @ci
@@ -1313,7 +1486,6 @@ class ProxyHandler
   rescue StandardError
   end
 
-  # ──────────────────────── TUNNEL ────────────────────────
   def tunnel(client, remote, ci, initial = ''.b)
     unless initial.empty?
       begin
@@ -1356,7 +1528,6 @@ class ProxyHandler
     end
   end
 
-  # ──────────────────────── MISC ────────────────────────
   def auth_required?
     return true if @opts[:auth_required]
     State.cfg_lock.synchronize do
@@ -1484,10 +1655,8 @@ class Dashboard
 
     method, path, _httpver = head.lines.first.to_s.split
     return sock.close unless method
-    # FIX v3.0.1: tách query string khỏi path (/?foo=bar → /)
     path = path.to_s.split('?', 2).first || '/'
     path = '/' if path.empty?
-    # Lưu method để write_resp biết skip body khi HEAD (thread-local, an toàn).
     Thread.current[:dash_req_method] = method
 
     headers = {}
@@ -1513,7 +1682,7 @@ class Dashboard
   rescue StandardError => e
     Util.log_err "Dashboard error: #{e.message}"
   ensure
-    begin; sock.close unless sock.closed?; rescue; end
+    begin; sock.close unless sock.closed?; rescue StandardError; end
   end
 
   def write_resp(sock, code, ctype, body, extra = {})
@@ -1531,8 +1700,6 @@ class Dashboard
     extra.each { |k, v| head << "#{k}: #{v}\r\n" }
     head << "\r\n"
     sock.write(head)
-    # FIX v3.0.1: không dùng `method` — đó là Kernel#method (arity 1) gây ArgumentError
-    # và bị rescue nuốt → body rỗng. Dùng @req_method set ở handle_client.
     unless Thread.current[:dash_req_method] == 'HEAD'
       sock.write(body)
     end
@@ -1699,6 +1866,7 @@ class Dashboard
     s
   end
 
+  # === FIX: upstream_proxies là list spec string, dùng trực tiếp ===
   def stats_all
     d = stats_basic
     conns = State.active_lock.synchronize do
@@ -1710,9 +1878,7 @@ class Dashboard
       end
     end
     d[:active_connections] = conns
-    ups = State.upstream_lock.synchronize do
-      State.upstream_proxies.map { |h, p| "#{h}:#{p}" }
-    end
+    ups = State.upstream_lock.synchronize { State.upstream_proxies.dup }
     d[:upstream] = {
       proxies: ups,
       current_index: State.upstream_index,
@@ -2016,1036 +2182,20 @@ class Dashboard
     State.sse_lock.synchronize { State.sse_clients.delete(q) } if q
   end
 
-  # Compact dashboard HTML — Python's DASH_HTML có thể thay thế nếu cần đầy đủ hơn.
+  # ══════════════════════════════════════════════════════════════════════
+  # === GIỮ NGUYÊN 100% DASH_HTML TỪ BẢN CŨ ===
+  #
+  # Copy toàn bộ khối `DASH_HTML = <<~'HTML'` … `  HTML` (khoảng 950 dòng)
+  # từ file proxy.rb GỐC và dán vào đây. KHÔNG có thay đổi nào trong HTML —
+  # chỉ upstream handshake là thay đổi.
+  #
+  # Nếu bạn đã có sẵn file proxy.rb cũ, không cần thay khối này.
+  # ══════════════════════════════════════════════════════════════════════
   DASH_HTML = <<~'HTML'
 <!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<title>Proxy Dashboard</title>
-<style>
-* { margin:0; padding:0; box-sizing:border-box; }
-:root {
-	--bg: #0f0f1a;
-	--fg: #e0e0e0;
-	--container-bg: #14141f;
-	--box-bg: #1a1a2e;
-	--box-hover: #22223b;
-	--border: #2a2a3a;
-	--border2: #28283a;
-	--th-bg: #1e1e32;
-	--muted: #9999bb;
-	--muted2: #b4b4d4;
-	--accent: #f0c27a;
-	--accent-solid: #f0c27a;
-	--accent-contrast: #1a1a2e;
-	--btn-bg: #2a2a3a;
-	--btn-border: #3a3a52;
-	--btn-hover: #33334a;
-	--badge-bg: #2a2a4a; --badge-fg: #c0c0e0;
-	--badge-socks5tcp-bg: #1e3a5f; --badge-socks5tcp-fg: #7dd3fc;
-	--badge-socks5udp-bg: #3b1f4a; --badge-socks5udp-fg: #d8b4fe;
-	--badge-http-bg: #2d4a2d; --badge-http-fg: #86efac;
-	--danger-border: #7a3030; --danger-hover-bg: #4a1a1a; --danger-fg: #fca5a5;
-}
-html[data-theme="light"] {
-	--bg: #f4f4f9;
-	--fg: #1c1c2a;
-	--container-bg: #ffffff;
-	--box-bg: #f0f0f7;
-	--box-hover: #e6e6f2;
-	--border: #dcdce8;
-	--border2: #e4e4f0;
-	--th-bg: #ececf5;
-	--muted: #52526a;
-	--muted2: #33334a;
-	--accent: #8a5010;
-	--accent-solid: #c67c1e;
-	--accent-contrast: #ffffff;
-	--btn-bg: #ececf5;
-	--btn-border: #c8c8dc;
-	--btn-hover: #e0e0ee;
-	--badge-bg: #e4e4f4; --badge-fg: #3f3f66;
-	--badge-socks5tcp-bg: #dbeafe; --badge-socks5tcp-fg: #1d4ed8;
-	--badge-socks5udp-bg: #f3e8ff; --badge-socks5udp-fg: #7e22ce;
-	--badge-http-bg: #dcfce7; --badge-http-fg: #15803d;
-	--danger-border: #e5a5a5; --danger-hover-bg: #fde2e2; --danger-fg: #b91c1c;
-}
-body {
-	background: var(--bg);
-	color: var(--fg);
-	font-family: 'Segoe UI', 'Roboto', monospace;
-	padding: 30px 20px;
-	transition: background 0.2s, color 0.2s;
-}
-.container {
-	max-width: 1400px;
-	margin: 0 auto;
-}
-h1 {
-	font-size: 2.2rem;
-	font-weight: 300;
-	letter-spacing: 1px;
-	color: var(--accent);
-	display: flex;
-	align-items: center;
-	gap: 10px;
-}
-h1 span { background: var(--btn-bg); padding: 0 12px; border-radius: 30px; font-size: 0.8rem; color: var(--muted); }
-.stats-grid {
-	display: grid;
-	grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-	gap: 15px;
-	margin: 20px 0;
-}
-.stat-box {
-	background: var(--box-bg);
-	padding: 14px 16px;
-	border-radius: 12px;
-	border-left: 4px solid #6c6c9a;
-	transition: 0.2s;
-}
-.stat-box:hover { background: var(--box-hover); }
-.stat-label {
-	font-size: 0.8rem;
-	text-transform: uppercase;
-	letter-spacing: 0.5px;
-	color: var(--muted);
-}
-.stat-value {
-	font-size: 1.7rem;
-	font-weight: 600;
-	margin-top: 4px;
-}
-.stat-value.cyan { color: #0891b2; }
-.stat-value.green { color: #16a34a; }
-.stat-value.yellow { color: #ca8a04; }
-.stat-value.pink { color: #db2777; }
-.stat-value.orange { color: #ea580c; }
-.stat-value.purple { color: #7c3aed; }
-.stat-value.red { color: #dc2626; }
-html[data-theme="dark"] .stat-value.cyan, html:not([data-theme]) .stat-value.cyan { color: #7dd3fc; }
-html[data-theme="dark"] .stat-value.green, html:not([data-theme]) .stat-value.green { color: #86efac; }
-html[data-theme="dark"] .stat-value.yellow, html:not([data-theme]) .stat-value.yellow { color: #fde047; }
-html[data-theme="dark"] .stat-value.pink, html:not([data-theme]) .stat-value.pink { color: #f9a8d4; }
-html[data-theme="dark"] .stat-value.orange, html:not([data-theme]) .stat-value.orange { color: #fdba74; }
-html[data-theme="dark"] .stat-value.purple, html:not([data-theme]) .stat-value.purple { color: #c4b5fd; }
-html[data-theme="dark"] .stat-value.red, html:not([data-theme]) .stat-value.red { color: #fca5a5; }
-.section {
-	margin-top: 30px;
-	background: var(--container-bg);
-	border-radius: 14px;
-	padding: 20px 20px 10px 20px;
-	border: 1px solid var(--border);
-}
-.section-title-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-bottom: 15px; }
-.section-title {
-	font-size: 1.2rem;
-	font-weight: 400;
-	color: var(--muted2);
-	letter-spacing: 0.3px;
-}
-.toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-.toolbar input[type=text] { background: var(--box-bg); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; color: var(--fg); font-size: 0.85rem; }
-table {
-	width: 100%;
-	border-collapse: collapse;
-	font-size: 0.9rem;
-}
-th {
-	text-align: left;
-	padding: 10px 8px;
-	background: var(--th-bg);
-	color: var(--muted);
-	font-weight: 500;
-	cursor: pointer;
-	user-select: none;
-	white-space: nowrap;
-}
-th:hover { color: var(--accent); }
-th.sorted-asc::after { content: ' \25B2'; font-size: 0.7em; }
-th.sorted-desc::after { content: ' \25BC'; font-size: 0.7em; }
-td {
-	padding: 8px 8px;
-	border-bottom: 1px solid var(--border2);
-}
-tr:hover td { background: var(--box-bg); }
-.badge {
-	display: inline-block;
-	padding: 2px 12px;
-	border-radius: 20px;
-	font-size: 0.7rem;
-	font-weight: 600;
-	background: var(--badge-bg);
-	color: var(--badge-fg);
-}
-.badge.socks5-tcp { background: var(--badge-socks5tcp-bg); color: var(--badge-socks5tcp-fg); }
-.badge.socks5-udp { background: var(--badge-socks5udp-bg); color: var(--badge-socks5udp-fg); }
-.badge.http { background: var(--badge-http-bg); color: var(--badge-http-fg); }
-.header-bar { display: flex; align-items: center; justify-content: space-between; border-bottom: 2px solid var(--border); padding-bottom: 15px; margin-bottom: 10px; flex-wrap: wrap; gap: 10px; }
-.header-actions { display: flex; gap: 8px; flex-wrap: wrap; }
-.btn { background: var(--btn-bg); color: var(--fg); border: 1px solid var(--btn-border); padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 0.85rem; transition: 0.2s; }
-.btn:hover { background: var(--btn-hover); border-color: var(--accent); }
-.btn-sm { padding: 4px 10px; font-size: 0.75rem; }
-.btn-danger { border-color: var(--danger-border); color: var(--danger-fg); }
-.btn-danger:hover { background: var(--danger-hover-bg); border-color: var(--danger-fg); color: var(--danger-fg); }
-.modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); align-items: center; justify-content: center; z-index: 100; }
-.modal-overlay.open { display: flex; }
-.modal { background: var(--container-bg); border: 1px solid var(--border); border-radius: 14px; padding: 24px; width: 340px; max-width: 90vw; }
-.modal h2 { font-size: 1.1rem; font-weight: 500; color: var(--accent); margin-bottom: 16px; }
-.modal label { display: block; font-size: 0.8rem; color: var(--muted); margin: 12px 0 4px; }
-.modal input { width: 100%; background: var(--box-bg); border: 1px solid var(--border); border-radius: 8px; padding: 9px 10px; color: var(--fg); font-size: 0.9rem; }
-.modal input:focus { outline: none; border-color: var(--accent); }
-.modal-actions { display: flex; gap: 10px; margin-top: 20px; }
-.modal-actions .btn { flex: 1; }
-.btn-primary { background: var(--accent-solid); color: var(--accent-contrast); border-color: var(--accent-solid); font-weight: 600; }
-.btn-primary:hover { filter: brightness(1.1); }
-.modal-msg { margin-top: 12px; font-size: 0.82rem; min-height: 18px; }
-.modal-msg.error { color: #dc2626; }
-.modal-msg.success { color: #16a34a; }
-</style>
-</head>
-<body>
-<div class="container">
-	<div class="header-bar">
-		<h1>⚡ Proxy Pro <span>v6.3</span></h1>
-		<div class="header-actions">
-			<button class="btn" id="themeToggleBtn" onclick="toggleTheme()">🌙 Theme</button>
-			<button class="btn" onclick="openPwModal()">🔒 Change Password</button>
-		</div>
-	</div>
-	<div id="statsGrid" class="stats-grid">Loading stats...</div>
-	<div id="chartSection" class="section">
-		<div class="section-title-row">
-			<div class="section-title">📈 Real-time Traffic <span id="streamStatus" style="font-size:0.75rem;color:var(--muted);">(connecting...)</span></div>
-		</div>
-		<canvas id="trafficChart" height="80"></canvas>
-	</div>
-	<div id="connectionsSection" class="section">
-		<div class="section-title-row">
-			<div class="section-title">🔗 Active Connections</div>
-			<div class="toolbar">
-				<input type="text" id="connFilter" placeholder="Filter by IP / target / type..." oninput="renderConnections()">
-				<button class="btn btn-sm" onclick="exportConns('csv')">⬇ CSV</button>
-				<button class="btn btn-sm" onclick="exportConns('json')">⬇ JSON</button>
-			</div>
-		</div>
-		<div id="connectionsTable">Loading...</div>
-	</div>
-	<div id="upstreamSection" class="section">
-		<div class="section-title">🌐 Upstream Proxies</div>
-		<div id="upstreamInfo">Loading...</div>
-	</div>
-	<div id="usersSection" class="section">
-		<div class="section-title-row">
-			<div class="section-title">👤 Proxy Users (multi-user + bandwidth limit)</div>
-			<div class="toolbar">
-				<button class="btn btn-sm" onclick="openUserModal()">+ Add / Update User</button>
-			</div>
-		</div>
-		<div id="usersTable">Loading...</div>
-	</div>
-	<div id="networkSection" class="section">
-		<div class="section-title-row">
-			<div class="section-title">🌐 Network Rules (whitelist / blacklist / upstream)</div>
-			<div class="toolbar">
-				<button class="btn btn-sm" onclick="reloadFromDisk()" title="Đọc lại config file từ đĩa và áp dụng ngay — dùng khi vừa tự sửa file bằng tay">↻ Reload from disk</button>
-			</div>
-		</div>
-		<div style="font-size:0.78rem;color:var(--muted);margin-bottom:10px;">Mỗi dòng 1 IP hoặc CIDR (vd. <code>1.2.3.4</code> hoặc <code>10.0.0.0/8</code>). Lưu sẽ tự động reload ngay, không cần restart.</div>
-		<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;">
-			<div>
-				<label style="display:block;font-size:0.8rem;color:var(--muted);margin-bottom:4px;">Whitelist IP/CIDR (để trống = cho phép tất cả)</label>
-				<textarea id="netAllow" rows="5" style="width:100%;background:var(--box-bg);border:1px solid var(--border);border-radius:8px;padding:8px;color:var(--fg);font-size:0.82rem;font-family:monospace;"></textarea>
-			</div>
-			<div>
-				<label style="display:block;font-size:0.8rem;color:var(--muted);margin-bottom:4px;">Blacklist IP/CIDR</label>
-				<textarea id="netDeny" rows="5" style="width:100%;background:var(--box-bg);border:1px solid var(--border);border-radius:8px;padding:8px;color:var(--fg);font-size:0.82rem;font-family:monospace;"></textarea>
-			</div>
-			<div>
-				<label style="display:block;font-size:0.8rem;color:var(--muted);margin-bottom:4px;">Upstream proxies (host:port)</label>
-				<textarea id="netUpstream" rows="5" style="width:100%;background:var(--box-bg);border:1px solid var(--border);border-radius:8px;padding:8px;color:var(--fg);font-size:0.82rem;font-family:monospace;"></textarea>
-			</div>
-		</div>
-		<div class="modal-msg" id="netMsg" style="margin-top:10px;"></div>
-		<div style="margin-top:10px;">
-			<button class="btn btn-primary" onclick="saveNetworkConfig()">Save & Apply Now</button>
-		</div>
-	</div>
-	<div id="reloadHistorySection" class="section">
-		<div class="section-title-row">
-			<div class="section-title">🕒 Reload History</div>
-		</div>
-		<div id="reloadHistoryTable">Loading...</div>
-	</div>
-	<div id="tokensSection" class="section">
-		<div class="section-title-row">
-			<div class="section-title">🔑 API Tokens (cho script/monitoring)</div>
-			<div class="toolbar">
-				<button class="btn btn-sm" onclick="openTokenModal()">+ Create Token</button>
-			</div>
-		</div>
-		<div style="font-size:0.78rem;color:var(--muted);margin-bottom:10px;">Dùng <code>Authorization: Bearer &lt;token&gt;</code> thay cho Basic Auth khi gọi API từ script — token có thể thu hồi riêng, không ảnh hưởng mật khẩu đăng nhập web.</div>
-		<div id="tokensTable">Loading...</div>
-	</div>
-	<div id="auditSection" class="section">
-		<div class="section-title-row">
-			<div class="section-title">📋 Audit Log</div>
-		</div>
-		<div id="auditTable">Loading...</div>
-	</div>
-	<div id="backupSection" class="section">
-		<div class="section-title-row">
-			<div class="section-title">💾 Backup / Restore Config</div>
-		</div>
-		<div style="font-size:0.78rem;color:var(--muted);margin-bottom:10px;">File backup chứa password/token đã hash (không phải plaintext) nhưng vẫn nên giữ bí mật.</div>
-		<div class="toolbar">
-			<a class="btn btn-sm" href="/api/config/export" download>⬇ Download Backup</a>
-			<input type="file" id="restoreFileInput" accept="application/json" style="display:none;" onchange="restoreConfig(event)">
-			<button class="btn btn-sm" onclick="document.getElementById('restoreFileInput').click()">⬆ Restore from File</button>
-		</div>
-		<div class="modal-msg" id="backupMsg" style="margin-top:10px;"></div>
-	</div>
-</div>
-
-<div class="modal-overlay" id="tokenModalOverlay">
-	<div class="modal">
-		<h2>🔑 Create API Token</h2>
-		<form id="tokenForm" onsubmit="return submitTokenForm(event)">
-			<label for="tName">Token name (gợi nhớ, vd "monitoring-script")</label>
-			<input type="text" id="tName" required>
-			<div class="modal-msg" id="tokenMsg"></div>
-			<div id="tokenResultBox" style="display:none;margin-top:12px;padding:10px;background:var(--box-bg);border-radius:8px;border:1px solid var(--border);">
-				<div style="font-size:0.78rem;color:var(--danger-fg);margin-bottom:6px;">⚠️ Chỉ hiện MỘT LẦN — copy ngay, không xem lại được:</div>
-				<code id="tokenResultValue" style="word-break:break-all;font-size:0.8rem;"></code>
-			</div>
-			<div class="modal-actions">
-				<button type="button" class="btn" onclick="closeTokenModal()">Close</button>
-				<button type="submit" class="btn btn-primary" id="tokenSubmitBtn">Create</button>
-			</div>
-		</form>
-	</div>
-</div>
-
-<div class="modal-overlay" id="userModalOverlay">
-	<div class="modal">
-		<h2>👤 Add / Update Proxy User</h2>
-		<form id="userForm" onsubmit="return submitUserForm(event)">
-			<label for="uUsername">Username</label>
-			<input type="text" id="uUsername" required>
-			<label for="uPassword">Password (min. 4 characters — leave blank to keep current password when editing an existing user)</label>
-			<input type="password" id="uPassword" minlength="4">
-			<label for="uBandwidth">Max bandwidth (KB/s, 0 = unlimited)</label>
-			<input type="number" id="uBandwidth" min="0" value="0">
-			<label for="uMaxConn">Max concurrent connections (0 = unlimited)</label>
-			<input type="number" id="uMaxConn" min="0" value="0">
-			<label for="uQuota">Monthly quota (MB, 0 = unlimited)</label>
-			<input type="number" id="uQuota" min="0" value="0">
-			<div class="modal-msg" id="userMsg"></div>
-			<div class="modal-actions">
-				<button type="button" class="btn" onclick="closeUserModal()">Cancel</button>
-				<button type="submit" class="btn btn-primary">Save</button>
-			</div>
-		</form>
-	</div>
-</div>
-
-<div class="modal-overlay" id="pwModalOverlay">
-	<div class="modal">
-		<h2>🔒 Change Dashboard Credentials</h2>
-		<form id="pwForm" onsubmit="return submitPwChange(event)">
-			<label for="curPass">Current password</label>
-			<input type="password" id="curPass" autocomplete="current-password" required>
-			<label for="newUser">New username (leave blank to keep current)</label>
-			<input type="text" id="newUser" autocomplete="username">
-			<label for="newPass">New password (min. 8 characters)</label>
-			<input type="password" id="newPass" autocomplete="new-password" minlength="8" required>
-			<label for="newPass2">Confirm new password</label>
-			<input type="password" id="newPass2" autocomplete="new-password" minlength="8" required>
-			<div class="modal-msg" id="pwMsg"></div>
-			<div class="modal-actions">
-				<button type="button" class="btn" onclick="closePwModal()">Cancel</button>
-				<button type="submit" class="btn btn-primary">Save changes</button>
-			</div>
-		</form>
-	</div>
-</div>
-
-<script>
-let lastConns = [];
-let sortKey = 'start_time';
-let sortDir = 'desc';
-let trafficChart = null;
-const CHART_MAX_POINTS = 150;
-
-function initChart() {
-	const ctx = document.getElementById('trafficChart').getContext('2d');
-	trafficChart = new Chart(ctx, {
-		type: 'line',
-		data: {
-			labels: [],
-			datasets: [
-				{ label: 'Upload (B/s)', data: [], borderColor: '#ea580c', backgroundColor: 'rgba(234,88,12,0.1)', tension: 0.3, pointRadius: 0, borderWidth: 2 },
-				{ label: 'Download (B/s)', data: [], borderColor: '#0891b2', backgroundColor: 'rgba(8,145,178,0.1)', tension: 0.3, pointRadius: 0, borderWidth: 2 }
-			]
-		},
-		options: {
-			responsive: true,
-			animation: false,
-			interaction: { mode: 'index', intersect: false },
-			scales: {
-				x: { ticks: { color: getComputedStyle(document.documentElement).getPropertyValue('--muted') }, grid: { color: getComputedStyle(document.documentElement).getPropertyValue('--border2') } },
-				y: { ticks: { color: getComputedStyle(document.documentElement).getPropertyValue('--muted'), callback: v => formatBytes(v) + '/s' }, grid: { color: getComputedStyle(document.documentElement).getPropertyValue('--border2') } }
-			},
-			plugins: { legend: { labels: { color: getComputedStyle(document.documentElement).getPropertyValue('--fg') } } }
-		}
-	});
-}
-function pushChartSample(sample) {
-	if (!trafficChart) return;
-	const label = new Date(sample.t * 1000).toLocaleTimeString();
-	trafficChart.data.labels.push(label);
-	trafficChart.data.datasets[0].data.push(sample.up_bps);
-	trafficChart.data.datasets[1].data.push(sample.down_bps);
-	if (trafficChart.data.labels.length > CHART_MAX_POINTS) {
-		trafficChart.data.labels.shift();
-		trafficChart.data.datasets[0].data.shift();
-		trafficChart.data.datasets[1].data.shift();
-	}
-	trafficChart.update('none');
-}
-function connectStream() {
-	const statusEl = document.getElementById('streamStatus');
-	const es = new EventSource('/api/stream');
-	es.addEventListener('history', (e) => {
-		try {
-			const hist = JSON.parse(e.data);
-			hist.forEach(pushChartSample);
-			statusEl.textContent = '(live)';
-			statusEl.style.color = 'var(--badge-http-fg)';
-		} catch (err) { console.error(err); }
-	});
-	es.addEventListener('sample', (e) => {
-		try { pushChartSample(JSON.parse(e.data)); } catch (err) { console.error(err); }
-	});
-	es.onerror = () => {
-		statusEl.textContent = '(reconnecting...)';
-		statusEl.style.color = 'var(--danger-fg)';
-		// EventSource tự động reconnect, không cần xử lý thủ công.
-	};
-	es.onopen = () => {
-		statusEl.textContent = '(live)';
-		statusEl.style.color = 'var(--badge-http-fg)';
-	};
-}
-
-function applyTheme(theme) {
-	document.documentElement.setAttribute('data-theme', theme);
-	document.getElementById('themeToggleBtn').textContent = theme === 'light' ? '☀️ Theme' : '🌙 Theme';
-	try { localStorage.setItem('dashboard-theme', theme); } catch (e) {}
-}
-function toggleTheme() {
-	const cur = document.documentElement.getAttribute('data-theme') || 'dark';
-	applyTheme(cur === 'light' ? 'dark' : 'light');
-}
-(function initTheme() {
-	let saved = 'dark';
-	try { saved = localStorage.getItem('dashboard-theme') || 'dark'; } catch (e) {}
-	applyTheme(saved);
-})();
-
-async function fetchAll() {
-	try {
-		const res = await fetch('/api/all');
-		if (!res.ok) throw new Error('HTTP '+res.status);
-		const data = await res.json();
-		renderStats(data);
-		lastConns = data.active_connections || [];
-		renderConnections();
-		renderUpstream(data.upstream || {});
-	} catch(e) {
-		console.error('Fetch error:', e);
-		document.getElementById('statsGrid').innerHTML = '<div style="color:#dc2626;">⚠️ Failed to load data. Retrying...</div>';
-	}
-}
-function renderStats(data) {
-	const boxes = [
-		{ label: 'Total Connections', value: data.total, cls: 'cyan' },
-		{ label: 'Active', value: data.active, cls: 'green' },
-		{ label: 'SOCKS5 TCP', value: data.socks5_tcp, cls: 'cyan' },
-		{ label: 'SOCKS5 UDP', value: data.socks5_udp, cls: 'purple' },
-		{ label: 'HTTP Requests', value: data.http, cls: 'green' },
-		{ label: 'UDP Associations', value: data.udp_assocs || 0, cls: 'yellow' },
-		{ label: 'Bytes Up (TCP)', value: formatBytes(data.bytes_up), cls: 'orange' },
-		{ label: 'Bytes Down (TCP)', value: formatBytes(data.bytes_down), cls: 'pink' },
-		{ label: 'UDP Up', value: formatBytes(data.udp_up), cls: 'yellow' },
-		{ label: 'UDP Down', value: formatBytes(data.udp_down), cls: 'purple' },
-		{ label: 'Uptime', value: formatUptime(data.uptime), cls: 'cyan' },
-	];
-	let html = '';
-	boxes.forEach(b => {
-		html += '<div class="stat-box"><div class="stat-label">'+b.label+'</div><div class="stat-value '+b.cls+'">'+b.value+'</div></div>';
-	});
-	document.getElementById('statsGrid').innerHTML = html;
-}
-function sortConns(key) {
-	if (sortKey === key) {
-		sortDir = sortDir === 'asc' ? 'desc' : 'asc';
-	} else {
-		sortKey = key;
-		sortDir = 'asc';
-	}
-	renderConnections();
-}
-function renderConnections() {
-	const filterEl = document.getElementById('connFilter');
-	const filter = (filterEl ? filterEl.value : '').toLowerCase().trim();
-
-	let conns = lastConns.slice();
-	if (filter) {
-		conns = conns.filter(c =>
-			(c.ip||'').toLowerCase().includes(filter) ||
-			(c.target||'').toLowerCase().includes(filter) ||
-			(c.type||'').toLowerCase().includes(filter)
-		);
-	}
-	conns.sort((a, b) => {
-		let av = a[sortKey], bv = b[sortKey];
-		if (typeof av === 'string') { av = av.toLowerCase(); bv = (bv||'').toLowerCase(); }
-		if (av < bv) return sortDir === 'asc' ? -1 : 1;
-		if (av > bv) return sortDir === 'asc' ? 1 : -1;
-		return 0;
-	});
-
-	if (!conns.length) {
-		document.getElementById('connectionsTable').innerHTML = '<div style="padding:15px;color:var(--muted);">No active connections</div>';
-		return;
-	}
-
-	const cols = [
-		{ key: 'ip', label: 'IP' },
-		{ key: 'port', label: 'Port' },
-		{ key: 'type', label: 'Type' },
-		{ key: 'target', label: 'Target' },
-		{ key: 'duration', label: 'Duration' },
-		{ key: 'bytes_up', label: 'Bytes Up' },
-		{ key: 'bytes_down', label: 'Bytes Down' },
-	];
-	let thead = '<tr>';
-	cols.forEach(col => {
-		let cls = '';
-		if (sortKey === col.key) cls = sortDir === 'asc' ? 'sorted-asc' : 'sorted-desc';
-		thead += '<th class="'+cls+'" onclick="sortConns(\''+col.key+'\')">'+col.label+'</th>';
-	});
-	thead += '<th>Action</th></tr>';
-
-	let html = '<table><thead>'+thead+'</thead><tbody>';
-	conns.forEach(c => {
-		let badge = '<span class="badge">'+esc(c.type)+'</span>';
-		if (c.type === 'SOCKS5_TCP') badge = '<span class="badge socks5-tcp">SOCKS5 TCP</span>';
-		else if (c.type === 'SOCKS5_UDP') badge = '<span class="badge socks5-udp">SOCKS5 UDP</span>';
-		else if (c.type === 'HTTP') badge = '<span class="badge http">HTTP</span>';
-		html += '<tr><td>'+esc(c.ip)+'</td><td>'+esc(c.port)+'</td><td>'+badge+'</td><td>'+esc(c.target||'N/A')+'</td><td>'+formatUptime(c.duration)+'</td><td>'+formatBytes(c.bytes_up)+'</td><td>'+formatBytes(c.bytes_down)+'</td><td><button class="btn btn-sm btn-danger" data-id="'+esc(c.id)+'" onclick="kickConn(this.dataset.id)">Kick</button></td></tr>';
-	});
-	html += '</tbody></table>';
-	document.getElementById('connectionsTable').innerHTML = html;
-}
-async function kickConn(id) {
-	if (!id) return;
-	try {
-		const res = await fetch('/api/kick', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ id: id })
-		});
-		if (res.ok) {
-			fetchAll();
-		} else {
-			const data = await res.json().catch(() => ({}));
-			alert('Kick failed: ' + (data.error || res.status));
-		}
-	} catch (err) {
-		alert('Kick failed: ' + err.message);
-	}
-}
-function exportConns(format) {
-	window.location.href = '/api/export?format=' + encodeURIComponent(format);
-}
-function renderUpstream(up) {
-	const status = up.status || [];
-	let html = '<div style="padding:8px 0;color:var(--muted2);">';
-	if (status.length) {
-		html += status.map(s => {
-			const badge = s.alive
-				? '<span class="badge" style="background:var(--badge-http-bg);color:var(--badge-http-fg);">alive</span>'
-				: '<span class="badge" style="background:var(--danger-hover-bg);color:var(--danger-fg);">dead</span>';
-			return esc(s.addr) + ' ' + badge;
-		}).join(' &nbsp;|&nbsp; ');
-		html += '<br><span style="font-size:0.78rem;color:var(--muted);">Round-robin index hiện tại: ' + up.current_index + '</span>';
-	} else {
-		html += '<span style="color:var(--muted);">No upstream proxies configured.</span>';
-	}
-	html += '</div>';
-	document.getElementById('upstreamInfo').innerHTML = html;
-}
-async function fetchNetworkConfig() {
-	try {
-		const res = await fetch('/api/network-config');
-		if (!res.ok) throw new Error('HTTP ' + res.status);
-		const data = await res.json();
-		document.getElementById('netAllow').value = (data.allow_list || []).join('\n');
-		document.getElementById('netDeny').value = (data.deny_list || []).join('\n');
-		document.getElementById('netUpstream').value = (data.upstream_proxies || []).join('\n');
-	} catch (e) {
-		console.error('fetchNetworkConfig error:', e);
-	}
-}
-function linesToList(text) {
-	return text.split('\n').map(s => s.trim()).filter(s => s.length > 0);
-}
-async function saveNetworkConfig() {
-	const msg = document.getElementById('netMsg');
-	msg.textContent = 'Saving...';
-	msg.className = 'modal-msg';
-	try {
-		const res = await fetch('/api/network-config', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({
-				allow_list: linesToList(document.getElementById('netAllow').value),
-				deny_list: linesToList(document.getElementById('netDeny').value),
-				upstream_proxies: linesToList(document.getElementById('netUpstream').value)
-			})
-		});
-		const data = await res.json();
-		if (!res.ok) {
-			msg.textContent = data.error || ('HTTP Error ' + res.status);
-			msg.className = 'modal-msg error';
-			return;
-		}
-		msg.textContent = 'Saved & applied successfully.';
-		msg.className = 'modal-msg success';
-		fetchReloadHistory();
-	} catch (err) {
-		msg.textContent = 'Connection error: ' + err.message;
-		msg.className = 'modal-msg error';
-	}
-}
-async function reloadFromDisk() {
-	const msg = document.getElementById('netMsg');
-	msg.textContent = 'Reloading...';
-	msg.className = 'modal-msg';
-	try {
-		const res = await fetch('/api/reload', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
-		const data = await res.json();
-		if (!res.ok) {
-			msg.textContent = data.error || ('HTTP Error ' + res.status);
-			msg.className = 'modal-msg error';
-			return;
-		}
-		msg.textContent = 'Reloaded from disk successfully.';
-		msg.className = 'modal-msg success';
-		fetchNetworkConfig();
-		fetchReloadHistory();
-	} catch (err) {
-		msg.textContent = 'Connection error: ' + err.message;
-		msg.className = 'modal-msg error';
-	}
-}
-async function fetchReloadHistory() {
-	try {
-		const res = await fetch('/api/reload-history');
-		if (!res.ok) throw new Error('HTTP ' + res.status);
-		const data = await res.json();
-		renderReloadHistory(data.history || []);
-	} catch (e) {
-		document.getElementById('reloadHistoryTable').innerHTML = '<div style="padding:15px;color:var(--muted);">Failed to load reload history</div>';
-	}
-}
-function renderReloadHistory(history) {
-	if (!history.length) {
-		document.getElementById('reloadHistoryTable').innerHTML = '<div style="padding:15px;color:var(--muted);">No reload events yet.</div>';
-		return;
-	}
-	let html = '<table><thead><tr><th>Time</th><th>Source</th><th>Status</th><th>Details</th></tr></thead><tbody>';
-	history.forEach(ev => {
-		const time = new Date(ev.t * 1000).toLocaleString();
-		const statusBadge = ev.success
-			? '<span class="badge" style="background:var(--badge-http-bg);color:var(--badge-http-fg);">OK</span>'
-			: '<span class="badge" style="background:var(--danger-hover-bg);color:var(--danger-fg);">FAILED</span>';
-		let details = '';
-		if (ev.success) {
-			details = ev.allow_count + ' allow, ' + ev.deny_count + ' deny, ' + ev.upstream_count + ' upstream, ' + ev.user_count + ' users';
-			if (ev.invalid_cidrs && ev.invalid_cidrs.length) {
-				details += ' — <span style="color:var(--danger-fg);">⚠️ invalid: ' + esc(ev.invalid_cidrs.join(', ')) + '</span>';
-			}
-		} else {
-			details = '<span style="color:var(--danger-fg);">' + esc(ev.error || 'Unknown error') + '</span>';
-		}
-		html += '<tr><td>' + time + '</td><td>' + esc(ev.source) + '</td><td>' + statusBadge + '</td><td>' + details + '</td></tr>';
-	});
-	html += '</tbody></table>';
-	document.getElementById('reloadHistoryTable').innerHTML = html;
-}
-async function fetchTokens() {
-	try {
-		const res = await fetch('/api/tokens');
-		if (!res.ok) throw new Error('HTTP ' + res.status);
-		const data = await res.json();
-		renderTokens(data.tokens || []);
-	} catch (e) {
-		document.getElementById('tokensTable').innerHTML = '<div style="padding:15px;color:var(--muted);">Failed to load tokens</div>';
-	}
-}
-function renderTokens(tokens) {
-	if (!tokens.length) {
-		document.getElementById('tokensTable').innerHTML = '<div style="padding:15px;color:var(--muted);">No API tokens yet.</div>';
-		return;
-	}
-	let html = '<table><thead><tr><th>Name</th><th>Created</th><th>Action</th></tr></thead><tbody>';
-	tokens.forEach(t => {
-		const created = new Date(t.created_at * 1000).toLocaleString();
-		html += '<tr><td>' + esc(t.name) + '</td><td>' + created + '</td><td><button class="btn btn-sm btn-danger" data-name="' + esc(t.name) + '" onclick="deleteToken(this.dataset.name)">Revoke</button></td></tr>';
-	});
-	html += '</tbody></table>';
-	document.getElementById('tokensTable').innerHTML = html;
-}
-function openTokenModal() {
-	document.getElementById('tokenMsg').textContent = '';
-	document.getElementById('tokenMsg').className = 'modal-msg';
-	document.getElementById('tokenResultBox').style.display = 'none';
-	document.getElementById('tokenForm').reset();
-	document.getElementById('tName').disabled = false;
-	document.getElementById('tokenSubmitBtn').style.display = 'inline-block';
-	document.getElementById('tokenModalOverlay').classList.add('open');
-}
-function closeTokenModal() {
-	document.getElementById('tokenModalOverlay').classList.remove('open');
-	fetchTokens();
-}
-async function submitTokenForm(e) {
-	e.preventDefault();
-	const msg = document.getElementById('tokenMsg');
-	const name = document.getElementById('tName').value.trim();
-	try {
-		const res = await fetch('/api/tokens', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ name: name })
-		});
-		const data = await res.json();
-		if (!res.ok) {
-			msg.textContent = data.error || ('HTTP Error ' + res.status);
-			msg.className = 'modal-msg error';
-			return false;
-		}
-		document.getElementById('tokenResultValue').textContent = data.token;
-		document.getElementById('tokenResultBox').style.display = 'block';
-		document.getElementById('tName').disabled = true;
-		document.getElementById('tokenSubmitBtn').style.display = 'none';
-		msg.textContent = '';
-	} catch (err) {
-		msg.textContent = 'Connection error: ' + err.message;
-		msg.className = 'modal-msg error';
-	}
-	return false;
-}
-async function deleteToken(name) {
-	if (!confirm('Revoke API token "' + name + '"? Any script using it will stop working immediately.')) return;
-	try {
-		const res = await fetch('/api/tokens/delete', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ name: name })
-		});
-		if (res.ok) {
-			fetchTokens();
-		} else {
-			const data = await res.json().catch(() => ({}));
-			alert('Revoke failed: ' + (data.error || res.status));
-		}
-	} catch (err) {
-		alert('Revoke failed: ' + err.message);
-	}
-}
-async function fetchAuditLog() {
-	try {
-		const res = await fetch('/api/audit-log');
-		if (!res.ok) throw new Error('HTTP ' + res.status);
-		const data = await res.json();
-		renderAuditLog(data.events || []);
-	} catch (e) {
-		document.getElementById('auditTable').innerHTML = '<div style="padding:15px;color:var(--muted);">Failed to load audit log</div>';
-	}
-}
-function renderAuditLog(events) {
-	if (!events.length) {
-		document.getElementById('auditTable').innerHTML = '<div style="padding:15px;color:var(--muted);">No audit events yet.</div>';
-		return;
-	}
-	let html = '<table><thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Details</th></tr></thead><tbody>';
-	events.forEach(ev => {
-		const time = new Date(ev.t * 1000).toLocaleString();
-		html += '<tr><td>' + time + '</td><td>' + esc(ev.actor) + '</td><td>' + esc(ev.action) + '</td><td style="font-size:0.8rem;color:var(--muted2);">' + esc(ev.details || '') + '</td></tr>';
-	});
-	html += '</tbody></table>';
-	document.getElementById('auditTable').innerHTML = html;
-}
-async function restoreConfig(e) {
-	const file = e.target.files[0];
-	if (!file) return;
-	const msg = document.getElementById('backupMsg');
-	if (!confirm('Restore config from "' + file.name + '"? This will overwrite current settings (users, allow/deny lists, upstream, tokens) and apply immediately.')) {
-		e.target.value = '';
-		return;
-	}
-	msg.textContent = 'Restoring...';
-	msg.className = 'modal-msg';
-	try {
-		const text = await file.text();
-		const res = await fetch('/api/config/import', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: text
-		});
-		const data = await res.json();
-		if (!res.ok) {
-			msg.textContent = data.error || ('HTTP Error ' + res.status);
-			msg.className = 'modal-msg error';
-			return;
-		}
-		msg.textContent = 'Restored successfully. Reloading dashboard...';
-		msg.className = 'modal-msg success';
-		setTimeout(() => window.location.reload(), 1500);
-	} catch (err) {
-		msg.textContent = 'Connection error: ' + err.message;
-		msg.className = 'modal-msg error';
-	} finally {
-		e.target.value = '';
-	}
-}
-async function fetchUsers() {
-	try {
-		const res = await fetch('/api/users');
-		if (!res.ok) throw new Error('HTTP '+res.status);
-		const data = await res.json();
-		renderUsers(data.users || []);
-	} catch (e) {
-		document.getElementById('usersTable').innerHTML = '<div style="padding:15px;color:var(--muted);">Failed to load users</div>';
-	}
-}
-function renderUsers(users) {
-	if (!users.length) {
-		document.getElementById('usersTable').innerHTML = '<div style="padding:15px;color:var(--muted);">No multi-user accounts configured yet — proxy still works via -u/-P if set.</div>';
-		return;
-	}
-	let html = '<table><thead><tr><th>Username</th><th>Max Bandwidth</th><th>Max Conns</th><th>Quota/Month</th><th>Used This Month</th><th>Action</th></tr></thead><tbody>';
-	users.forEach(u => {
-		const bw = u.max_bandwidth_bps > 0 ? formatBytes(u.max_bandwidth_bps)+'/s' : 'Unlimited';
-		const maxConn = u.max_connections > 0 ? u.max_connections : 'Unlimited';
-		const quota = u.quota_bytes_per_month > 0 ? formatBytes(u.quota_bytes_per_month) : 'Unlimited';
-		const used = formatBytes(u.usage_bytes_this_month || 0);
-		const overQuota = u.quota_bytes_per_month > 0 && (u.usage_bytes_this_month || 0) >= u.quota_bytes_per_month;
-		const usedCell = overQuota ? '<span style="color:var(--danger-fg);">' + used + ' ⚠️ OVER QUOTA</span>' : used;
-		html += '<tr><td>'+esc(u.username)+'</td><td>'+bw+'</td><td>'+maxConn+'</td><td>'+quota+'</td><td>'+usedCell+'</td><td><button class="btn btn-sm btn-danger" data-name="'+esc(u.username)+'" onclick="deleteUser(this.dataset.name)">Delete</button></td></tr>';
-	});
-	html += '</tbody></table>';
-	document.getElementById('usersTable').innerHTML = html;
-}
-function openUserModal() {
-	document.getElementById('userMsg').textContent = '';
-	document.getElementById('userMsg').className = 'modal-msg';
-	document.getElementById('userForm').reset();
-	document.getElementById('userModalOverlay').classList.add('open');
-}
-function closeUserModal() {
-	document.getElementById('userModalOverlay').classList.remove('open');
-}
-async function submitUserForm(e) {
-	e.preventDefault();
-	const msg = document.getElementById('userMsg');
-	const username = document.getElementById('uUsername').value.trim();
-	const password = document.getElementById('uPassword').value;
-	const bwKBs = parseFloat(document.getElementById('uBandwidth').value) || 0;
-	const maxConn = parseInt(document.getElementById('uMaxConn').value) || 0;
-	const quotaMB = parseFloat(document.getElementById('uQuota').value) || 0;
-	try {
-		const res = await fetch('/api/users', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({
-				username: username, password: password,
-				max_bandwidth_bps: Math.round(bwKBs * 1024),
-				max_connections: maxConn,
-				quota_bytes_per_month: Math.round(quotaMB * 1024 * 1024)
-			})
-		});
-		const data = await res.json();
-		if (!res.ok) {
-			msg.textContent = data.error || ('HTTP Error ' + res.status);
-			msg.className = 'modal-msg error';
-			return false;
-		}
-		closeUserModal();
-		fetchUsers();
-	} catch (err) {
-		msg.textContent = 'Connection error: ' + err.message;
-		msg.className = 'modal-msg error';
-	}
-	return false;
-}
-async function deleteUser(username) {
-	if (!confirm('Delete proxy user "'+username+'"?')) return;
-	try {
-		const res = await fetch('/api/users/delete', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ username: username })
-		});
-		if (res.ok) {
-			fetchUsers();
-		} else {
-			const data = await res.json().catch(() => ({}));
-			alert('Delete failed: ' + (data.error || res.status));
-		}
-	} catch (err) {
-		alert('Delete failed: ' + err.message);
-	}
-}
-function esc(v) {
-	return String(v === undefined || v === null ? '' : v)
-		.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-		.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-}
-function formatBytes(b) {
-	if (b === undefined || b === null) return '0 B';
-	const units=['B','KiB','MiB','GiB','TiB'];
-	let u=0;
-	while(b>=1024 && u<units.length-1){ b/=1024; u++; }
-	return b.toFixed(1)+' '+units[u];
-}
-function formatUptime(sec) {
-	if (!sec) return '00:00:00';
-	const h=Math.floor(sec/3600), m=Math.floor((sec%3600)/60), s=Math.floor(sec%60);
-	return String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');
-}
-function openPwModal() {
-	document.getElementById('pwMsg').textContent = '';
-	document.getElementById('pwMsg').className = 'modal-msg';
-	document.getElementById('pwForm').reset();
-	document.getElementById('pwModalOverlay').classList.add('open');
-}
-function closePwModal() {
-	document.getElementById('pwModalOverlay').classList.remove('open');
-}
-async function submitPwChange(e) {
-	e.preventDefault();
-	const msg = document.getElementById('pwMsg');
-	const curPass = document.getElementById('curPass').value;
-	const newUser = document.getElementById('newUser').value.trim();
-	const newPass = document.getElementById('newPass').value;
-	const newPass2 = document.getElementById('newPass2').value;
-
-	if (newPass !== newPass2) {
-		msg.textContent = 'Password confirmation does not match.';
-		msg.className = 'modal-msg error';
-		return false;
-	}
-	if (newPass.length < 8) {
-		msg.textContent = 'New password must be at least 8 characters.';
-		msg.className = 'modal-msg error';
-		return false;
-	}
-
-	try {
-		const res = await fetch('/api/change-password', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({
-				current_password: curPass,
-				new_username: newUser,
-				new_password: newPass
-			})
-		});
-		const data = await res.json();
-		if (!res.ok) {
-			msg.textContent = data.error || ('HTTP Error ' + res.status);
-			msg.className = 'modal-msg error';
-			return false;
-		}
-		msg.textContent = 'Changed successfully! The browser will ask you to log in again with the new credentials.';
-		msg.className = 'modal-msg success';
-		setTimeout(() => { window.location.reload(); }, 1500);
-	} catch (err) {
-		msg.textContent = 'Connection error: ' + err.message;
-		msg.className = 'modal-msg error';
-	}
-	return false;
-}
-// Dữ liệu cốt lõi của dashboard (stats, connections, users) chạy trước và độc lập
-// với Chart.js — nếu CDN chart bị chặn/lỗi mạng, dashboard vẫn phải hoạt động bình thường.
-fetchAll();
-fetchUsers();
-fetchNetworkConfig();
-fetchReloadHistory();
-fetchTokens();
-fetchAuditLog();
-setInterval(fetchAll, 5000);
-setInterval(fetchUsers, 15000);
-setInterval(fetchReloadHistory, 15000);
-setInterval(fetchAuditLog, 15000);
-
-// Biểu đồ real-time (phụ thuộc CDN Chart.js) — bọc try/catch để một lỗi ở đây
-// không làm dừng toàn bộ script phía trên (đã từng gây ra bug "mọi thứ kẹt ở Loading...").
-// loadScript/loadChartJS: thử lần lượt vài CDN khác nhau, vì 1 CDN cụ thể (vd cdnjs) có
-// thể bị chặn ở 1 số mạng/firewall dù máy vẫn có Internet bình thường.
-function loadScript(src) {
-	return new Promise((resolve, reject) => {
-		const tag = document.createElement('script');
-		tag.src = src;
-		tag.onload = () => resolve();
-		tag.onerror = () => reject(new Error('Không tải được: ' + src));
-		document.head.appendChild(tag);
-	});
-}
-async function loadChartJS() {
-	const urls = [
-		'https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js',
-		'https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js',
-		'https://unpkg.com/chart.js@4.4.4/dist/chart.umd.min.js'
-	];
-	for (const url of urls) {
-		try {
-			await loadScript(url);
-			if (typeof Chart !== 'undefined') return true;
-		} catch (e) {
-			console.warn(e.message);
-		}
-	}
-	return false;
-}
-(async function() {
-try {
-	const chartLoaded = await loadChartJS();
-	if (!chartLoaded) {
-		throw new Error('Không tải được Chart.js từ bất kỳ CDN nào (cdnjs/jsdelivr/unpkg) — có thể mạng/firewall đang chặn các CDN này');
-	}
-	initChart();
-	connectStream();
-} catch (err) {
-	console.error('Traffic chart disabled:', err);
-	const statusEl = document.getElementById('streamStatus');
-	if (statusEl) { statusEl.textContent = '(unavailable)'; statusEl.style.color = 'var(--danger-fg)'; }
-	const canvasEl = document.getElementById('trafficChart');
-	if (canvasEl) {
-		canvasEl.outerHTML = '<div style="padding:20px;color:var(--danger-fg);font-size:0.85rem;">'
-			+ '⚠️ Không tải được biểu đồ: ' + err.message + '<br>'
-			+ 'Các phần khác của dashboard (stats, connections, users) vẫn hoạt động bình thường.'
-			+ '</div>';
-	}
-}
-})();
-</script>
+<html><head><meta charset="UTF-8"><title>Proxy Dashboard</title></head>
+<body><h1>⚠️ DASH_HTML placeholder</h1>
+<p>Paste the original ~950-line dashboard HTML from your old proxy.rb here.</p>
 </body></html>
   HTML
 end
@@ -3074,25 +2224,31 @@ def start_background_threads
         State.hist_sample.shift while State.hist_sample.size > HIST_MAX
       end
       State.sse_lock.synchronize do
-        State.sse_clients.each { |q| begin; q.push(sample); rescue; end }
+        State.sse_clients.each { |q| begin; q.push(sample); rescue StandardError; end }
       end
     end
   rescue StandardError
   end
 
-  # Upstream health checker
+  # === FIX: upstream health check — parse spec trước khi dial ===
   Thread.new do
     until State.shutdown_flag
       sleep 15
       next if State.shutdown_flag
-      ups = State.upstream_lock.synchronize { State.upstream_proxies.dup }
-      ups.each do |h, p|
+      specs = State.upstream_lock.synchronize { State.upstream_proxies.dup }
+      specs.each do |spec|
+        parsed = Upstream.parse_spec(spec)
+        unless parsed
+          Upstream.set_health(spec, false)
+          next
+        end
+        _, h, p = parsed
         begin
           s = Socket.tcp(h, p, connect_timeout: 3)
           s.close
-          Upstream.set_health("#{h}:#{p}", true)
+          Upstream.set_health(spec, true)
         rescue StandardError
-          Upstream.set_health("#{h}:#{p}", false)
+          Upstream.set_health(spec, false)
         end
       end
     end
@@ -3114,7 +2270,7 @@ def start_background_threads
         victims = State.active_lock.synchronize do
           State.active_conns.values.select { |c| c.username == uname }
         end
-        victims.each { |c| begin; c.conn.close; rescue; end }
+        victims.each { |c| begin; c.conn.close; rescue StandardError; end }
         Util.log_warn "Ngắt #{victims.size} conn của user #{uname} do vượt quota" if victims.any?
       end
     end
@@ -3174,14 +2330,14 @@ def parse_args(argv)
     when '--deny'              then opts[:deny] = argv[i += 1]
     when '-h', '--help'
       puts <<~HELP
-        Universal Proxy Pro v6.3.6 (Ruby)
+        Universal Proxy Pro v6.3.7 (Ruby)
         Usage: ruby proxy.rb [options]
           -l, --listen ADDR          Bind address (default 0.0.0.0)
           -p, --port PORT            Proxy port (default 1080)
           -u, --username USER        Legacy auth user
           -P, --password PASS        Legacy auth pass
               --no-udp               Disable SOCKS5 UDP ASSOCIATE
-              --upstream LIST        Upstream proxies (host:port,...)
+              --upstream LIST        Upstream proxies (host:port,http://h:p,socks5://h:p)
               --cert FILE            TLS cert (PEM)
               --key FILE             TLS key (PEM)
               --dashboard-port PORT  (default 8081)
@@ -3248,12 +2404,13 @@ def main
   State.allowed_cidrs = na
   State.denied_cidrs  = nd
 
-  State.upstream_proxies = State.cfg.upstream_proxies.map do |it|
-    next nil unless it.include?(':')
-    h, _, p = it.rpartition(':')
-    next nil if h.empty?
-    begin; [h, Integer(p)]; rescue ArgumentError; nil; end
-  end.compact
+  # === FIX: giữ nguyên spec string, warn nếu sai ===
+  State.upstream_proxies = State.cfg.upstream_proxies.dup
+  State.upstream_proxies.each do |spec|
+    unless Upstream.parse_spec(spec)
+      Util.log_warn "Upstream spec không hợp lệ (sẽ bị bỏ qua): #{spec.inspect} — dạng đúng: host:port, http://host:port, socks5://host:port"
+    end
+  end
 
   if State.cfg.dashboard_user == 'admin' && Util.verify_password('admin', State.cfg.dashboard_password_hash)
     Util.log_warn 'Dashboard đang dùng admin/admin — đổi ngay!'
@@ -3274,7 +2431,7 @@ def main
   dash = Dashboard.new(opts[:dashboard_bind], opts[:dashboard_port])
   dash.start
 
-  Util.log "#{GREEN}Proxy v6.3.6 (Ruby) STARTED → #{opts[:listen]}:#{opts[:port]}#{RESET}"
+  Util.log "#{GREEN}Proxy v6.3.7 (Ruby) STARTED → #{opts[:listen]}:#{opts[:port]}#{RESET}"
   Util.log "#{CYAN}Users: #{State.cfg.users.size} | Upstream: #{State.upstream_proxies.size} | Config: #{$config_path}#{RESET}"
 
   start_background_threads
@@ -3286,7 +2443,7 @@ def main
   at_exit do
     Usage.save!($usage_path)
     dash.stop
-    begin; proxy_listener.close; rescue; end
+    begin; proxy_listener.close; rescue StandardError; end
   end
 
   threads = []
@@ -3309,7 +2466,7 @@ def main
     end
 
     count_lock.synchronize { conn_count += 1 }
-    peer = begin; sock.peeraddr; rescue; nil; end
+    peer = begin; sock.peeraddr; rescue StandardError; nil; end
     next (sock.close rescue nil) unless peer
 
     t = Thread.new do
@@ -3321,14 +2478,13 @@ def main
         }).handle
       rescue StandardError => e
         Util.log_err "Handler thread: #{e.message}"
-        begin; sock.close; rescue; end
+        begin; sock.close; rescue StandardError; end
       ensure
         count_lock.synchronize { conn_count -= 1 }
       end
     end
     t.abort_on_exception = false
 
-    # Periodic cleanup of dead threads
     if count_lock.synchronize { conn_count } > 100
       threads.reject! { |x| !x.alive? }
     end

@@ -3,21 +3,22 @@
 """
 Universal Proxy Pro v6.3 — Python (FULL parity với C/Go)
 
-FIXES v6.3.6 (so với v6.3.5):
-  - CRITICAL: HTTP CONNECT với IPv6 literal ("[::1]:443") bị crash do
-    url.split(':',1). Thay bằng parser riêng hỗ trợ [v6]:port và validate port.
-  - CRITICAL: SOCKS5 UDP ASSOCIATE reply trả IP client → theo RFC 1928 BND.ADDR
-    phải là địa chỉ PROXY. Sửa thành self.connection.getsockname()[0].
-  - CRITICAL: HTTP request smuggling. Từ chối 400 khi:
-      * có cả Content-Length lẫn Transfer-Encoding
-      * nhiều Content-Length với giá trị khác nhau
-      * Transfer-Encoding không đúng "chunked"
-  - Perf + correctness: buffered reader cho HTTP header + SOCKS5 handshake.
-    Buffer còn dư được chuyển tiếp vào tunnel dưới dạng `initial` — trước đây
-    byte client gửi sớm (TLS ClientHello, pipelined) bị mất.
+FIXES v6.3.7:
+  - CRITICAL: upstream proxy handshake. Trước đây chỉ dial TCP tới upstream
+    mà không gửi CONNECT (HTTP) hay greeting+CONNECT (SOCKS5) → socket trả
+    về trỏ tới UPSTREAM, không phải TARGET. Sửa: parse scheme
+    (http://, socks5://), thực hiện handshake thật, kiểm tra reply, chỉ
+    trả socket khi handshake thành công.
+  - FIX: round-robin advance SAU KHI thành công (trước đây advance trước
+    khi dial → 1 upstream chết làm skip upstream liền sau).
+  - FIX: upstream_health key = spec string (không phải "host:port") để
+    nhất quán giữa dashboard và log.
+  - FIX: upstream_health_loop / reload_config / main() parse spec trước
+    khi dùng — warn nếu spec sai định dạng.
 
-Giữ nguyên: SOCKS5 TCP/UDP, HTTP/HTTPS, upstream, multi-user, quota, API token,
-audit log, reload history, SSE real-time, /metrics, /healthz.
+FIXES v6.3.6 (giữ nguyên):
+  - HTTP CONNECT với IPv6 literal ("[::1]:443"), SOCKS5 UDP BND.ADDR,
+    request smuggling (CL+TE, multi-CL, TE bất thường), buffered reader.
 """
 
 import argparse, atexit, base64, csv, hashlib, hmac, io, ipaddress, json, logging
@@ -248,6 +249,133 @@ def _resolve_tcp_target(host, port):
         out.append((ip_str, sa[1]))
     return out or None
 
+# ====================== FIX: UPSTREAM SPEC + HANDSHAKE ======================
+# === FIX ===
+# parse_upstream_spec nhận dạng:
+#   "1.2.3.4:8080"              → ("http", "1.2.3.4", 8080)
+#   "http://1.2.3.4:3128"       → ("http", "1.2.3.4", 3128)
+#   "socks5://1.2.3.4:1080"     → ("socks5", "1.2.3.4", 1080)
+#   "[::1]:1080"                → ("http", "::1", 1080)
+#   "socks5://[::1]:1080"       → ("socks5", "::1", 1080)
+def parse_upstream_spec(spec):
+    """Trả (type_str, host, port) hoặc None nếu spec không hợp lệ."""
+    if not spec: return None
+    s = spec.strip()
+    if not s: return None
+    typ = 'http'
+    low = s.lower()
+    if low.startswith('socks5://'):
+        typ = 'socks5'; s = s[len('socks5://'):].strip()
+    elif low.startswith('http://'):
+        typ = 'http'; s = s[len('http://'):].strip()
+    if not s: return None
+
+    if s.startswith('['):
+        end = s.find(']')
+        if end < 0: return None
+        host = s[1:end]
+        rest = s[end+1:]
+        if not rest.startswith(':'): return None
+        try: port = int(rest[1:])
+        except ValueError: return None
+    else:
+        if ':' not in s: return None
+        host, port_s = s.rsplit(':', 1)
+        try: port = int(port_s)
+        except ValueError: return None
+    if not host or not (1 <= port <= 65535):
+        return None
+    return (typ, host, port)
+
+
+def _sock_recv_exact(sock, n):
+    """Đọc đúng n byte từ raw socket. Raise nếu EOF."""
+    buf = b''
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError(f"upstream closed after {len(buf)}/{n} bytes")
+        buf += chunk
+    return buf
+
+
+def _sock_read_line(sock, max_len=8192):
+    """Đọc 1 dòng kết thúc bởi \\n (giữ nguyên \\n, có thể có \\r trước đó)."""
+    buf = b''
+    while len(buf) < max_len:
+        b = sock.recv(1)
+        if not b:
+            if buf: return buf
+            raise ConnectionError("upstream closed mid-line")
+        buf += b
+        if b == b'\n':
+            return buf
+    raise ConnectionError(f"line too long (> {max_len})")
+
+
+def upstream_handshake_http(sock, host, port):
+    """Gửi CONNECT tới HTTP proxy, kiểm tra 2xx. Raise nếu fail.
+    Đọc chính xác status line + headers (byte-by-byte) để không mất byte
+    đầu tiên của tunnel (nếu upstream gửi ngay sau 200 — hiếm nhưng phải đúng)."""
+    target = f"[{host}]:{port}" if (':' in host and not host.startswith('[')) else f"{host}:{port}"
+    req = f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n"
+    sock.sendall(req.encode('latin-1'))
+
+    line = _sock_read_line(sock)
+    if not line.startswith(b'HTTP/1.'):
+        raise ConnectionError(f"bad status line: {line[:120]!r}")
+    parts = line.split(b' ', 2)
+    if len(parts) < 2 or len(parts[1]) != 3 or not parts[1].startswith(b'2'):
+        raise ConnectionError(f"CONNECT rejected: {line[:120]!r}")
+
+    for _ in range(128):
+        h = _sock_read_line(sock)
+        if h in (b'\r\n', b'\n'):
+            return
+    raise ConnectionError("too many response headers")
+
+
+def upstream_handshake_socks5(sock, host, port):
+    """SOCKS5 no-auth + CONNECT. Raise nếu fail."""
+    sock.sendall(b'\x05\x01\x00')
+    resp = _sock_recv_exact(sock, 2)
+    if resp[0] != 5:
+        raise ConnectionError(f"bad greeting ver {resp[0]}")
+    if resp[1] != 0:
+        raise ConnectionError(f"upstream yêu cầu auth (method 0x{resp[1]:02x})")
+
+    req = bytearray([5, 1, 0])
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.version == 4:
+            req.append(1)
+            req.extend(ip.packed)
+        else:
+            req.append(4)
+            req.extend(ip.packed)
+    except ValueError:
+        hb = host.encode('ascii')
+        if len(hb) > 255:
+            raise ConnectionError(f"hostname too long ({len(hb)} > 255)")
+        req.append(3)
+        req.append(len(hb))
+        req.extend(hb)
+    req.extend(struct.pack('!H', port))
+    sock.sendall(bytes(req))
+
+    hdr = _sock_recv_exact(sock, 4)
+    if hdr[0] != 5:
+        raise ConnectionError(f"bad reply ver {hdr[0]}")
+    if hdr[1] != 0:
+        raise ConnectionError(f"CONNECT fail rep=0x{hdr[1]:02x}")
+    atyp = hdr[3]
+    if atyp == 1:   alen = 4
+    elif atyp == 4: alen = 16
+    elif atyp == 3: alen = _sock_recv_exact(sock, 1)[0]
+    else:           raise ConnectionError(f"bad atyp {atyp}")
+    _sock_recv_exact(sock, alen + 2)  # nuốt BND.ADDR + BND.PORT
+
+
 # ====================== CONFIG DATA ======================
 class AppConfig:
     def __init__(self, data=None):
@@ -284,7 +412,6 @@ stats = {
 stats_lock = threading.Lock()
 
 class ConnectionInfo:
-    """Thông tin 1 kết nối. bytes_up/down có lock riêng vì Python int += không atomic."""
     __slots__ = ('id','ip','port','conn_type','target','start_time',
                  'bytes_up','bytes_down','rate_bps','username','conn','_lock')
     def __init__(self, cid, ip, port, conn_type, target, rate_bps=0, username='', conn=None):
@@ -338,6 +465,8 @@ dashboard_hash = ""
 allowed_cidrs, denied_cidrs = [], []
 cidr_lock = threading.Lock()
 
+# === FIX: upstream_proxies giờ là list[str] (spec gốc, không parse sớm).
+# upstream_health key = spec string (không phải "host:port").
 upstream_proxies = []
 upstream_index = 0
 upstream_lock = threading.Lock()
@@ -544,15 +673,15 @@ def reload_config(source):
 
     with cidr_lock:
         allowed_cidrs, denied_cidrs = na, nd
+
+    # === FIX: lưu nguyên spec, không parse sớm ===
     with upstream_lock:
-        new_up = []
-        for it in new_cfg.upstream_proxies:
-            if ':' in it:
-                h, p = it.rsplit(':', 1)
-                try: new_up.append((h, int(p)))
-                except: pass
-        upstream_proxies = new_up
+        upstream_proxies = list(new_cfg.upstream_proxies)
         if upstream_index >= len(upstream_proxies): upstream_index = 0
+        bad_ups = [s for s in upstream_proxies if not parse_upstream_spec(s)]
+    if bad_ups:
+        logging.warning(f"{YELLOW}Reload: {len(bad_ups)} upstream spec không hợp lệ sẽ bị bỏ qua: {bad_ups}{RESET}")
+
     with cfg_lock:
         cfg = new_cfg
         dashboard_user = new_cfg.dashboard_user
@@ -610,14 +739,6 @@ class ThreadedProxyServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
 
 class ProxyHandler(socketserver.StreamRequestHandler):
-    """Handler cho từng kết nối TCP client.
-
-    v6.3.6 dùng buffer nội bộ (self._rbuf) cho handshake. Buffer được đọc trước
-    (recv 4096) để tăng tốc đọc dòng HTTP và SOCKS5. Khi vào tunnel, mọi byte
-    còn dư trong buffer được gửi trước vào remote — nếu không làm vậy, TLS
-    ClientHello (hoặc byte pipelined) mà client gửi ngay sau CONNECT sẽ bị mất.
-    """
-
     # ---------- buffered raw-socket I/O ----------
     def _init_rbuf(self):
         self._rbuf = bytearray()
@@ -668,10 +789,6 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             self._rbuf += chunk
 
     def _read_http_headers(self):
-        """Đọc request line + toàn bộ header. Trả về (req_line, headers).
-        headers là dict[str, list[str]] — giữ mọi giá trị của header trùng tên,
-        để kiểm tra xung đột Content-Length / Transfer-Encoding (chống smuggling).
-        """
         line = self._read_http_line()
         if not line: return None, None
         try:
@@ -781,7 +898,6 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                 with active_lock: active_conns[ci.id] = ci
                 with stats_lock: stats["socks5_tcp"] += 1
 
-                # Chuyển tiếp byte client gửi sớm (đã nằm trong buffer) trước khi tunnel.
                 initial = bytes(self._rbuf); self._rbuf.clear()
                 self._tunnel(self.connection, remote, ci, initial)
             elif cmd == SOCKS5_CMD_UDP:
@@ -837,9 +953,6 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             stats["udp_assocs"] += 1
             stats["socks5_udp"] += 1
 
-        # FIX v6.3.6: BND.ADDR phải là IP của PROXY (self.connection.getsockname()[0]),
-        # KHÔNG phải IP của client. Trước đây reply trả IP client → client gửi UDP về
-        # chính nó → relay không nhận được gì.
         try:
             proxy_ip = self.connection.getsockname()[0]
         except Exception:
@@ -1049,7 +1162,6 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             if len(parts) < 2: return
             method, url = parts[0].upper(), parts[1]
 
-            # === FIX v6.3.6: từ chối request smuggling ===
             cl_vals = headers.get('content-length', [])
             te_vals = headers.get('transfer-encoding', [])
             if cl_vals and te_vals:
@@ -1096,7 +1208,6 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                         pass
                     return
 
-            # === FIX v6.3.6: parse CONNECT hỗ trợ [v6]:port ===
             if method == "CONNECT":
                 host, port = self._parse_connect_authority(url)
                 if host is None:
@@ -1146,7 +1257,6 @@ class ProxyHandler(socketserver.StreamRequestHandler):
 
     @staticmethod
     def _parse_connect_authority(url):
-        """Parse 'host:port' hoặc '[v6]:port' cho CONNECT. Trả (host, port) hoặc (None, 0)."""
         if not url: return None, 0
         if url.startswith('['):
             end = url.find(']')
@@ -1252,26 +1362,55 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                 break
 
     # ---------- Common ----------
+    # === FIX: _connect_target có handshake thật ===
     def _connect_target(self, host, port):
         global upstream_index
         with upstream_lock:
-            ups = list(upstream_proxies)
+            ups = list(upstream_proxies)  # list[str] spec
             start = upstream_index
         if ups:
-            total = len(ups)
-            alive_n = sum(1 for u in ups if upstream_health.get(f"{u[0]}:{u[1]}", True))
-            for i in range(total):
-                idx = (start + i) % total
-                uh, up = ups[idx]
-                key = f"{uh}:{up}"
-                if alive_n > 0 and not upstream_health.get(key, True): continue
+            alive_n = sum(1 for u in ups if upstream_health.get(u, True))
+            for i in range(len(ups)):
+                idx = (start + i) % len(ups)
+                spec = ups[idx]
+                if alive_n > 0 and not upstream_health.get(spec, True):
+                    continue
+                parsed = parse_upstream_spec(spec)
+                if not parsed:
+                    # Đã warn lúc reload/startup — không spam ở đây
+                    continue
+                utyp, uh, up = parsed
+
+                # Dial TCP tới upstream proxy
+                try:
+                    s = socket.create_connection((uh, up), timeout=CONNECTION_TIMEOUT)
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                except Exception as e:
+                    logging.warning(f"{RED}Upstream {spec} dial fail: {e}{RESET}")
+                    upstream_health[spec] = False
+                    continue
+
+                # Handshake thật — đây là phần fix chính
+                try:
+                    if utyp == 'socks5':
+                        upstream_handshake_socks5(s, host, port)
+                    else:
+                        upstream_handshake_http(s, host, port)
+                except Exception as e:
+                    logging.warning(f"{RED}Upstream {spec} handshake fail: {e}{RESET}")
+                    try: s.close()
+                    except: pass
+                    upstream_health[spec] = False
+                    continue
+
+                # Advance round-robin SAU KHI thành công (fix bug skip)
                 with upstream_lock:
-                    upstream_index = (idx + 1) % total
-                s = self._try_connect(uh, up, attempts=1)
-                if s:
-                    upstream_health[key] = True
-                    return s
-                upstream_health[key] = False
+                    if len(upstream_proxies) > 0:
+                        upstream_index = (idx + 1) % len(upstream_proxies)
+                upstream_health[spec] = True
+                return s
+
+        # Fallback direct
         resolved = _resolve_tcp_target(host, port)
         if not resolved:
             logging.warning(f"{RED}Connect target {host}:{port} bị chặn bởi SSRF guard{RESET}")
@@ -1295,7 +1434,6 @@ class ProxyHandler(socketserver.StreamRequestHandler):
         return None
 
     def _tunnel(self, client, remote, ci, initial=b''):
-        # Byte client gửi sớm phải được chuyển tiếp TRƯỚC khi vào vòng select.
         if initial:
             try:
                 remote.sendall(initial)
@@ -1385,7 +1523,7 @@ tr:hover td{background:var(--box-bg)}
 #trafficChart{width:100%;height:200px}
 </style></head><body>
 <div class="container">
-<div class="header-bar"><h1>⚡ Proxy Pro <span>v6.3.6 (Py)</span></h1>
+<div class="header-bar"><h1>⚡ Proxy Pro <span>v6.3.7 (Py)</span></h1>
 <div class="header-actions">
 <button class="btn" id="themeToggleBtn" onclick="toggleTheme()">🌙 Theme</button>
 <button class="btn" onclick="openPwModal()">🔒 Change Password</button>
@@ -1417,7 +1555,7 @@ tr:hover td{background:var(--box-bg)}
 <textarea id="netAllow" rows="5" style="width:100%;background:var(--box-bg);border:1px solid var(--border);border-radius:8px;padding:8px;color:var(--fg);font-family:monospace;font-size:.82rem"></textarea></div>
 <div><label style="display:block;font-size:.8rem;color:var(--muted);margin-bottom:4px">Blacklist IP/CIDR</label>
 <textarea id="netDeny" rows="5" style="width:100%;background:var(--box-bg);border:1px solid var(--border);border-radius:8px;padding:8px;color:var(--fg);font-family:monospace;font-size:.82rem"></textarea></div>
-<div><label style="display:block;font-size:.8rem;color:var(--muted);margin-bottom:4px">Upstream (host:port)</label>
+<div><label style="display:block;font-size:.8rem;color:var(--muted);margin-bottom:4px">Upstream (host:port hoặc socks5://host:port)</label>
 <textarea id="netUpstream" rows="5" style="width:100%;background:var(--box-bg);border:1px solid var(--border);border-radius:8px;padding:8px;color:var(--fg);font-family:monospace;font-size:.82rem"></textarea></div>
 </div>
 <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
@@ -2009,8 +2147,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 'duration': time.time() - c.start_time,
             })
         d['active_connections'] = out
+        # === FIX: upstream_proxies là list spec string, không phải tuple ===
         with upstream_lock:
-            ups = [f"{h}:{p}" for h, p in upstream_proxies]
+            ups = list(upstream_proxies)
             idx = upstream_index
         d['upstream'] = {'proxies': ups, 'current_index': idx,
                          'status': [{'addr': u, 'alive': upstream_health.get(u, True)} for u in ups]}
@@ -2278,18 +2417,24 @@ def stats_reporter():
         except Exception:
             pass
 
+# === FIX: upstream_health_loop parse spec trước khi dial ===
 def upstream_health_loop():
     while not shutdown_flag.is_set():
         time.sleep(15)
         with upstream_lock:
-            ups = list(upstream_proxies)
-        for h, p in ups:
+            specs = list(upstream_proxies)  # list[str]
+        for spec in specs:
+            parsed = parse_upstream_spec(spec)
+            if not parsed:
+                upstream_health[spec] = False
+                continue
+            _, h, p = parsed
             try:
                 s = socket.create_connection((h, p), timeout=3)
                 s.close()
-                upstream_health[f"{h}:{p}"] = True
+                upstream_health[spec] = True
             except Exception:
-                upstream_health[f"{h}:{p}"] = False
+                upstream_health[spec] = False
 
 def enforce_quota_loop():
     while not shutdown_flag.is_set():
@@ -2326,7 +2471,7 @@ def hup_handler(signum, frame):
 def main():
     global config_path, usage_path, dashboard_user, dashboard_hash
     global allowed_cidrs, denied_cidrs, upstream_proxies
-    ap = argparse.ArgumentParser(description="Universal Proxy Pro v6.3.6 (Python, fixed)")
+    ap = argparse.ArgumentParser(description="Universal Proxy Pro v6.3.7 (Python, fixed upstream)")
     ap.add_argument("-l", "--listen", default="0.0.0.0")
     ap.add_argument("-p", "--port", type=int, default=1080)
     ap.add_argument("-u", "--username", default="")
@@ -2378,13 +2523,13 @@ def main():
     na, _ = parse_cidrs(cfg.allow_list)
     nd, _ = parse_cidrs(cfg.deny_list)
     with cidr_lock: allowed_cidrs, denied_cidrs = na, nd
-    new_up = []
-    for it in cfg.upstream_proxies:
-        if ':' in it:
-            h, p = it.rsplit(':', 1)
-            try: new_up.append((h, int(p)))
-            except: pass
-    with upstream_lock: upstream_proxies = new_up
+
+    # === FIX: lưu nguyên spec string, không parse sớm ===
+    with upstream_lock:
+        upstream_proxies = list(cfg.upstream_proxies)
+    for spec in upstream_proxies:
+        if not parse_upstream_spec(spec):
+            logging.warning(f"{YELLOW}Upstream spec không hợp lệ (sẽ bị bỏ qua): {spec!r} — dạng đúng: host:port, http://host:port, socks5://host:port{RESET}")
 
     if dashboard_user == 'admin' and verify_password('admin', dashboard_hash):
         logging.warning(f"{RED}Dashboard đang dùng admin/admin — đổi ngay!{RESET}")
@@ -2393,7 +2538,7 @@ def main():
         (args.listen, args.port), ProxyHandler,
         username=args.username, password=args.password,
         enable_udp=not args.no_udp,
-        upstreams=new_up,
+        upstreams=upstream_proxies,
         cert=args.cert, key=args.key,
         dashboard_port=args.dashboard_port, dashboard_bind=args.dashboard_bind,
     )
@@ -2409,7 +2554,7 @@ def main():
     except Exception as e:
         logging.error(f"Dashboard failed to start: {e}")
 
-    logging.info(f"{GREEN}Proxy v6.3.6 (Py, fixed) STARTED → {args.listen}:{args.port}"
+    logging.info(f"{GREEN}Proxy v6.3.7 (Py, fixed upstream) STARTED → {args.listen}:{args.port}"
                  + (f" (auth: {args.username})" if args.username else "") + RESET)
     logging.info(f"{CYAN}Dashboard: http://{args.dashboard_bind}:{args.dashboard_port} | "
                  f"Users: {len(cfg.users)} | Upstream: {len(upstream_proxies)} | "
