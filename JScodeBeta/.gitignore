@@ -1,0 +1,5 @@
+*
+!.gitignore
+!proxy.js
+!package.json
+!package-lock.json

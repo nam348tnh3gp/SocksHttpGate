@@ -1,0 +1,5 @@
+*
+!.gitignore
+!proxy.rb
+!Gemfile
+!Gemfile.lock

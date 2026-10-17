@@ -1,0 +1,62 @@
+# ════════════════════════════════════════════════════════════════════
+# ~/sockshttpgate/.gitignore — SINGLE FILE, blacklist approach.
+#
+# Nguyên tắc: chỉ liệt kê ARTIFACT cần bỏ. Mọi thứ khác được track
+# mặc định — bao gồm:
+#   • Root:        Makefile, README.md, LICENSE, requirements.txt, *.py
+#   • Mỗi *codeBeta/: source (Proxy.java, proxy.go, proxy.kt, proxy.c,
+#                  proxy.js, proxy.rb, proxy.ex, proxy.py…),
+#                  Makefile, build.sh, go.mod, package.json, Gemfile…
+# ════════════════════════════════════════════════════════════════════
+
+# ─── Binary build output ────────────────────────────────────────────
+/proxy
+/main
+*codeBeta/proxy
+*codeBeta/main
+*codeBeta/*.exe
+*codeBeta/*.out
+
+# ─── Java / Kotlin ──────────────────────────────────────────────────
+*codeBeta/*.class
+*codeBeta/*.jar
+*codeBeta/*.kotlin_module
+
+# ─── C / C++ ────────────────────────────────────────────────────────
+*codeBeta/*.o
+*codeBeta/*.a
+*codeBeta/*.so
+*codeBeta/*.dylib
+
+# ─── Elixir ─────────────────────────────────────────────────────────
+*codeBeta/*.beam
+*codeBeta/_build/
+*codeBeta/deps/
+
+# ─── Python ─────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+*.egg-info/
+
+# ─── Node ───────────────────────────────────────────────────────────
+*codeBeta/node_modules/
+
+# ─── Runtime config / state (chứa hash mật khẩu + quota) ────────────
+proxy_config.json
+proxy_usage.json
+
+# ─── Logs / data output ─────────────────────────────────────────────
+*.log
+/trace.csv
+/stats.csv
+
+# ─── Backup / editor temp ───────────────────────────────────────────
+*.bak
+*.bak-*
+*.swp
+*.swo
+*~
+.DS_Store
