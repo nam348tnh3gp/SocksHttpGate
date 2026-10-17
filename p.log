@@ -1,0 +1,7 @@
+nohup: ignoring input
+
+05:55:12.619 [warning] Dashboard lần đầu — user: admin | password: 2f44649d19439f4d (chỉ hiện MỘT LẦN)
+
+05:55:12.676 [info] Proxy STARTED → 0.0.0.0:1080
+
+05:55:12.677 [info] Dashboard: http://0.0.0.0:8081
