@@ -9,3 +9,7 @@ services:
         value: https://cloudflare-dns.com/dns-query
       - key: BLOCKLIST
         value: doubleclick.net,googlesyndication.com,googleadservices.com,adnxs.com
+      - key: BLOCKLIST_URLS
+        value: https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts
+      - key: BLOCKLIST_REFRESH
+        value: 6h
