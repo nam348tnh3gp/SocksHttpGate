@@ -1,0 +1,113 @@
+name: Test DoT
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "DoT/**"
+      - ".github/workflows/test-dot.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test-dot:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: DoT
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: DoT/go.mod
+          cache: true
+          cache-dependency-path: DoT/go.sum
+
+      - name: Format check
+        run: |
+          test -z "$(gofmt -l *.go)" || {
+            gofmt -l *.go
+            exit 1
+          }
+
+      - name: Unit tests
+        run: go test -v ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build -trimpath -ldflags="-s -w" -o /tmp/sockshttpgate-dot .
+
+      - name: Smoke test DoT and dashboard
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/dot-test
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout /tmp/dot-test/key.pem \
+            -out /tmp/dot-test/cert.pem \
+            -days 1 -subj "/CN=localhost" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+
+          DOT_ADDR=127.0.0.1:8853 \
+          DASHBOARD_ADDR=127.0.0.1:8080 \
+          TLS_CERT_FILE=/tmp/dot-test/cert.pem \
+          TLS_KEY_FILE=/tmp/dot-test/key.pem \
+          /tmp/sockshttpgate-dot > /tmp/dot-test/server.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/api/stats >/tmp/dot-test/stats.json; then
+              break
+            fi
+            sleep 1
+          done
+          test -s /tmp/dot-test/stats.json
+          grep -q '"ready":true' /tmp/dot-test/stats.json
+
+          cat >/tmp/dot-test/client.go <<'EOF'
+          package main
+
+          import (
+            "crypto/tls"
+            "fmt"
+            "os"
+
+            "github.com/miekg/dns"
+          )
+
+          func main() {
+            client := &dns.Client{
+              Net: "tcp-tls",
+              TLSConfig: &tls.Config{
+                ServerName: "localhost",
+                InsecureSkipVerify: true, // Self-signed certificate used only in this CI smoke test.
+              },
+            }
+            query := new(dns.Msg)
+            query.SetQuestion("example.com.", dns.TypeA)
+            response, _, err := client.Exchange(query, "127.0.0.1:8853")
+            if err != nil {
+              fmt.Fprintln(os.Stderr, "DoT query failed:", err)
+              os.Exit(1)
+            }
+            if response == nil || response.Rcode != dns.RcodeSuccess {
+              fmt.Fprintf(os.Stderr, "unexpected DNS response: %#v\n", response)
+              os.Exit(1)
+            }
+            fmt.Printf("DoT OK: rcode=%s answers=%d\n", dns.RcodeToString[response.Rcode], len(response.Answer))
+          }
+          EOF
+
+          go run /tmp/dot-test/client.go
+          echo "Dashboard stats:"
+          cat /tmp/dot-test/stats.json
+          echo "DoT server log:"
+          cat /tmp/dot-test/server.log
