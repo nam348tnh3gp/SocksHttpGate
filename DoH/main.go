@@ -14,6 +14,9 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"runtime"
+	"runtime/metrics"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,10 +42,18 @@ body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSyst
 h1{font-size:20px;margin-bottom:4px;display:flex;align-items:center;gap:10px}
 .sub{color:var(--muted);font-size:13px;margin-bottom:16px;font-family:ui-monospace,monospace}
 .sub a{color:var(--accent);text-decoration:none}
+.section-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin:4px 0 8px;font-weight:600}
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin-bottom:16px}
 .card{background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:12px}
 .card .label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.5px}
 .card .value{font-size:22px;font-weight:600;margin-top:4px;font-family:ui-monospace,monospace}
+.upstream-card{background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:12px;margin-bottom:16px}
+.upstream-card .label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+.upstream-card input{flex:1;background:#0d1117;border:1px solid var(--border);color:var(--fg);padding:8px 10px;border-radius:4px;font-family:ui-monospace,monospace;font-size:12px;outline:none}
+.upstream-card input:focus{border-color:var(--accent)}
+.upstream-card button{padding:8px 16px;background:var(--accent);color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:600;font-size:12px}
+.upstream-card button:disabled{opacity:.5;cursor:wait}
+.upstream-card button:hover:not(:disabled){background:#4090d0}
 .panels{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 @media(max-width:900px){.panels{grid-template-columns:1fr}}
 .panel{background:var(--panel);border:1px solid var(--border);border-radius:6px;overflow:hidden;display:flex;flex-direction:column;height:62vh}
@@ -78,8 +89,19 @@ Endpoint: <a href="/dns-query">/dns-query</a>
 · <span id="conn" class="conn off">● disconnected</span>
 · Last refresh: <span id="last-refresh">never</span>
 · <span id="sources-line">no remote sources</span>
+· <span id="platform">-</span>
 </div>
 
+<div class="upstream-card">
+  <div class="label">Upstream DoH <span style="text-transform:none;font-weight:400;letter-spacing:0">(runtime only — resets on restart)</span></div>
+  <div style="display:flex;gap:8px;margin-top:6px">
+    <input id="upstream-input" type="url" placeholder="https://dns.google/dns-query" spellcheck="false" autocomplete="off">
+    <button id="upstream-btn" onclick="saveUpstream()">Save</button>
+  </div>
+  <div id="upstream-msg" style="font-size:11px;color:var(--muted);margin-top:6px;min-height:14px"></div>
+</div>
+
+<div class="section-label">Resolver</div>
 <div class="stats">
   <div class="card"><div class="label">Blocked domains</div><div class="value" id="st-blocked">-</div></div>
   <div class="card"><div class="label">Total queries</div><div class="value" id="st-total">-</div></div>
@@ -87,6 +109,16 @@ Endpoint: <a href="/dns-query">/dns-query</a>
   <div class="card"><div class="label">Passed</div><div class="value" id="st-pq" style="color:var(--ok)">-</div></div>
   <div class="card"><div class="label">Errors</div><div class="value" id="st-eq" style="color:var(--warn)">-</div></div>
   <div class="card"><div class="label">Uptime</div><div class="value" id="st-uptime" style="font-size:16px">-</div></div>
+</div>
+
+<div class="section-label">Runtime</div>
+<div class="stats">
+  <div class="card"><div class="label">Memory (Alloc)</div><div class="value" id="st-mem" style="font-size:16px">-</div></div>
+  <div class="card"><div class="label">Heap</div><div class="value" id="st-heap" style="font-size:16px">-</div></div>
+  <div class="card"><div class="label">Sys memory</div><div class="value" id="st-sys" style="font-size:16px">-</div></div>
+  <div class="card"><div class="label">Goroutines</div><div class="value" id="st-goroutines">-</div></div>
+  <div class="card"><div class="label">CPU time</div><div class="value" id="st-cpu" style="font-size:16px">-</div></div>
+  <div class="card"><div class="label">GC runs / CPUs</div><div class="value" id="st-gc" style="font-size:16px">-</div></div>
 </div>
 
 <div class="panels">
@@ -122,6 +154,7 @@ Endpoint: <a href="/dns-query">/dns-query</a>
 (function(){
   var qbody=document.getElementById('qbody'),lbody=document.getElementById('lbody');
   var conn=document.getElementById('conn'),statusEl=document.getElementById('status');
+  var upInput=document.getElementById('upstream-input');
   var qcount=0,lcount=0,MAX=200;
 
   function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
@@ -158,8 +191,39 @@ Endpoint: <a href="/dns-query">/dns-query</a>
       statusEl.className='badge '+(s.ready?'ready':'loading');
       if(s.sources&&s.sources.length)document.getElementById('sources-line').textContent=s.sources.length+' source(s)';
       else document.getElementById('sources-line').textContent='no remote sources';
+      if(s.platform)document.getElementById('platform').textContent=s.platform+' / '+s.go_version;
+      document.getElementById('st-mem').textContent=(s.mem_alloc_mb||0).toFixed(2)+' MB';
+      document.getElementById('st-heap').textContent=(s.heap_mb||0).toFixed(2)+' MB';
+      document.getElementById('st-sys').textContent=(s.mem_sys_mb||0).toFixed(2)+' MB';
+      document.getElementById('st-goroutines').textContent=s.goroutines||0;
+      document.getElementById('st-cpu').textContent=(s.cpu_seconds||0).toFixed(1)+' s';
+      document.getElementById('st-gc').textContent=(s.num_gc||0)+' / '+(s.num_cpu||0);
+      if(s.upstream && document.activeElement!==upInput && !upInput.value)upInput.value=s.upstream;
     }).catch(function(){});
   }
+
+  window.saveUpstream=function(){
+    var u=upInput.value.trim();
+    if(!u)return;
+    var msg=document.getElementById('upstream-msg');
+    var btn=document.getElementById('upstream-btn');
+    msg.textContent='Saving...';msg.style.color='var(--muted)';
+    btn.disabled=true;
+    fetch('/api/upstream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:u})})
+      .then(function(r){return r.json().then(function(j){return {ok:r.ok,body:j};});})
+      .then(function(x){
+        if(x.ok){
+          msg.textContent='✓ Upstream set to '+x.body.url;
+          msg.style.color='var(--ok)';
+          refreshStats();
+        }else{
+          msg.textContent='✗ '+(x.body.error||'save failed');
+          msg.style.color='var(--err)';
+        }
+      })
+      .catch(function(e){msg.textContent='✗ '+e.message;msg.style.color='var(--err)';})
+      .finally(function(){btn.disabled=false;});
+  };
 
   function connect(){
     var es=new EventSource('/events');
@@ -199,6 +263,7 @@ type statsResponse struct {
 	Ready          bool     `json:"ready"`
 	BlockedDomains int      `json:"blocked_domains"`
 	Sources        []string `json:"sources"`
+	Upstream       string   `json:"upstream"`
 	RefreshEvery   string   `json:"refresh_every"`
 	LastRefresh    string   `json:"last_refresh"`
 	Uptime         string   `json:"uptime"`
@@ -206,6 +271,16 @@ type statsResponse struct {
 	TotalBlocked   uint64   `json:"total_blocked"`
 	TotalPassed    uint64   `json:"total_passed"`
 	TotalErrors    uint64   `json:"total_errors"`
+	// Runtime
+	MemAllocMB float64 `json:"mem_alloc_mb"`
+	MemSysMB   float64 `json:"mem_sys_mb"`
+	HeapMB     float64 `json:"heap_mb"`
+	NumGC      uint32  `json:"num_gc"`
+	Goroutines int     `json:"goroutines"`
+	NumCPU     int     `json:"num_cpu"`
+	CPUSeconds float64 `json:"cpu_seconds"`
+	Platform   string  `json:"platform"`
+	GoVersion  string  `json:"go_version"`
 }
 
 // ─── Ring buffer + realtime subscribers ────────────────────────────────────
@@ -293,7 +368,9 @@ func (l *dashLogger) emit(level, format string, args ...any) {
 // ─── Server ────────────────────────────────────────────────────────────────
 
 type server struct {
+	upstreamMu  sync.RWMutex
 	upstreamURL string
+
 	client      *http.Client
 	blockClient *http.Client
 
@@ -310,6 +387,18 @@ type server struct {
 	totalErrors  atomic.Uint64
 
 	startTime time.Time
+}
+
+func (s *server) getUpstream() string {
+	s.upstreamMu.RLock()
+	defer s.upstreamMu.RUnlock()
+	return s.upstreamURL
+}
+
+func (s *server) setUpstream(u string) {
+	s.upstreamMu.Lock()
+	s.upstreamURL = u
+	s.upstreamMu.Unlock()
 }
 
 func main() {
@@ -340,6 +429,11 @@ func main() {
 			s.refreshLoop()
 		}()
 	} else {
+		if raw := strings.TrimSpace(os.Getenv("BLOCKLIST_URLS")); raw != "" {
+			dlog.Errorf("BLOCKLIST_URLS is set to %q but no valid HTTPS URL was parsed — check for typos, quotes, or non-https scheme", raw)
+		} else {
+			dlog.Warnf("BLOCKLIST_URLS is empty or unset — remote blocklist download disabled; only hardcoded defaults + BLOCKLIST will be used")
+		}
 		s.ready.Store(true)
 	}
 
@@ -350,10 +444,11 @@ func main() {
 	mux.HandleFunc("/events", s.handleEvents)
 	mux.HandleFunc("/api/stats", s.handleAPIStats)
 	mux.HandleFunc("/api/logs", s.handleLogDownload)
+	mux.HandleFunc("/api/upstream", s.handleAPIUpstream)
 
 	addr := ":" + port
-	dlog.Infof("HTTP listening on %s; upstream=%s; remote sources=%d; refresh=%s",
-		addr, upstream, len(s.blocklistURLs), s.refreshEvery)
+	dlog.Infof("HTTP listening on %s; upstream=%s; remote sources=%d; refresh=%s; platform=%s/%s; go=%s",
+		addr, upstream, len(s.blocklistURLs), s.refreshEvery, runtime.GOOS, runtime.GOARCH, runtime.Version())
 	log.Fatal(http.ListenAndServe(addr, securityHeaders(mux)))
 }
 
@@ -388,10 +483,15 @@ func (s *server) handleAPIStats(w http.ResponseWriter, r *http.Request) {
 	if t := s.lastRefresh.Load(); t > 0 {
 		lr = time.Unix(t, 0).UTC().Format(time.RFC3339)
 	}
+
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
 	st := statsResponse{
 		Ready:          s.ready.Load(),
 		BlockedDomains: blocked,
 		Sources:        s.blocklistURLs,
+		Upstream:       s.getUpstream(),
 		RefreshEvery:   s.refreshEvery.String(),
 		LastRefresh:    lr,
 		Uptime:         time.Since(s.startTime).Truncate(time.Second).String(),
@@ -399,20 +499,75 @@ func (s *server) handleAPIStats(w http.ResponseWriter, r *http.Request) {
 		TotalBlocked:   bq,
 		TotalPassed:    pq,
 		TotalErrors:    eq,
+		MemAllocMB:     float64(m.Alloc) / (1024 * 1024),
+		MemSysMB:       float64(m.Sys) / (1024 * 1024),
+		HeapMB:         float64(m.HeapAlloc) / (1024 * 1024),
+		NumGC:          m.NumGC,
+		Goroutines:     runtime.NumGoroutine(),
+		NumCPU:         runtime.NumCPU(),
+		CPUSeconds:     readCPUSeconds(),
+		Platform:       runtime.GOOS + "/" + runtime.GOARCH,
+		GoVersion:      runtime.Version(),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	_ = json.NewEncoder(w).Encode(st)
 }
 
+func (s *server) handleAPIUpstream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var body struct {
+		URL string `json:"url"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	u := strings.TrimSpace(body.URL)
+	if !strings.HasPrefix(u, "https://") {
+		writeJSONError(w, http.StatusBadRequest, "upstream must be an https:// URL")
+		return
+	}
+	parsed, err := url.Parse(u)
+	if err != nil || parsed.Host == "" || parsed.User != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid URL")
+		return
+	}
+	old := s.getUpstream()
+	if old == u {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "unchanged", "url": u})
+		return
+	}
+	s.setUpstream(u)
+	dlog.Infof("upstream: %s -> %s (runtime only; persists until restart)", old, u)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "url": u, "old": old})
+}
+
+func writeJSONError(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
 func (s *server) handleLogDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	typ := r.URL.Query().Get("type")
 	var body []byte
 	var filename, ctype string
 
 	switch typ {
 	case "query":
-		entries := queryRing.Snapshot()
+		entries := applyLimit(r.URL.Query().Get("limit"), queryRing.Snapshot())
 		var b strings.Builder
 		b.WriteString("time,domain,type,status,latency_ms\n")
 		for _, e := range entries {
@@ -424,7 +579,7 @@ func (s *server) handleLogDownload(w http.ResponseWriter, r *http.Request) {
 		filename = "query-log-" + time.Now().UTC().Format("20060102-150405") + ".csv"
 		ctype = "text/csv; charset=utf-8"
 	case "system":
-		entries := logRing.Snapshot()
+		entries := applyLimit(r.URL.Query().Get("limit"), logRing.Snapshot())
 		var b strings.Builder
 		for _, e := range entries {
 			b.WriteString(fmt.Sprintf("%s [%s] %s\n",
@@ -440,9 +595,21 @@ func (s *server) handleLogDownload(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", ctype)
 	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
+}
+
+func applyLimit[T any](raw string, entries []T) []T {
+	if raw == "" {
+		return entries
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 || n >= len(entries) {
+		return entries
+	}
+	return entries[len(entries)-n:]
 }
 
 func csvEscape(s string) string {
@@ -464,7 +631,6 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 
-	// Replay history so dashboard shows state on first connect.
 	for _, e := range logRing.Snapshot() {
 		data, _ := json.Marshal(e)
 		fmt.Fprintf(w, "event: log\ndata: %s\n\n", data)
@@ -570,8 +736,9 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	upstream := s.getUpstream()
 	ctx := r.Context()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.upstreamURL, bytes.NewReader(packet))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, upstream, bytes.NewReader(packet))
 	if err != nil {
 		s.totalErrors.Add(1)
 		s.recordQuery(qName, qType, false, "upstream_error", time.Since(started))
@@ -586,7 +753,7 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.totalErrors.Add(1)
 		s.recordQuery(qName, qType, false, "upstream_error", time.Since(started))
-		dlog.Warnf("upstream: %v (domain=%s)", err, qName)
+		dlog.Warnf("upstream: %v (domain=%s upstream=%s)", err, qName, upstream)
 		http.Error(w, "DNS upstream unavailable", http.StatusBadGateway)
 		return
 	}
@@ -667,6 +834,24 @@ func (s *server) blockedCount() int {
 	s.blockMu.RLock()
 	defer s.blockMu.RUnlock()
 	return len(s.blocked)
+}
+
+// ─── Runtime stats — cross-platform ────────────────────────────────────────
+
+// readCPUSeconds trả về tổng CPU time (user + sys) của process, tính bằng giây.
+// Dùng runtime/metrics nên hoạt động trên MỌI nền tảng Go hỗ trợ:
+// Linux, macOS, Windows, FreeBSD, OpenBSD, NetBSD, DragonFly, Solaris, AIX.
+//
+// Trước đây đọc /proc/self/stat (chỉ có trên Linux) → trả 0 trên macOS/Windows.
+func readCPUSeconds() float64 {
+	samples := []metrics.Sample{
+		{Name: "/cpu/classes/total:cpu-seconds"},
+	}
+	metrics.Read(samples)
+	if samples[0].Value.Kind() == metrics.KindFloat64 {
+		return samples[0].Value.Float64()
+	}
+	return 0
 }
 
 // ─── Blocklist lifecycle ───────────────────────────────────────────────────
