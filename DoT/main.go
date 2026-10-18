@@ -167,6 +167,7 @@ func (r *resolver) setUpstream(upstream, serverName string) error {
 	r.upstreamMu.Unlock()
 	return nil
 }
+func (r *resolver) isBlocked(name string) bool {
 	name = normalizeDomain(name)
 	if name == "" {
 		return false
