@@ -34,3 +34,18 @@ func TestIsBlockedIncludesSubdomainsOnly(t *testing.T) {
 		}
 	}
 }
+
+func TestAddListToSetSupportsHostsAndAdblock(t *testing.T) {
+	got := map[string]struct{}{}
+	addListToSet(got, "0.0.0.0 ads.example tracker.example\n||metrics.example^\n127.0.0.1 localhost")
+	for _, domain := range []string{"ads.example", "tracker.example", "metrics.example", "localhost"} {
+		if _, ok := got[domain]; !ok { t.Errorf("expected %q in parsed list", domain) }
+	}
+}
+
+func TestParseBlocklistURLsRequiresHTTPSAndDeduplicates(t *testing.T) {
+	got := parseBlocklistURLs("https://example.com/list https://example.com/list;http://bad.example/list https://user:pass@example.org/list")
+	if len(got) != 1 || got[0] != "https://example.com/list" {
+		t.Fatalf("unexpected parsed URLs: %#v", got)
+	}
+}

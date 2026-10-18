@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/tls"
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -14,20 +15,27 @@ import (
 
 const (
 	defaultListenAddr = ":853"
-	defaultUpstream   = "1.1.1.1:853"
-	defaultTLSName    = "cloudflare-dns.com"
+	defaultUpstream = "1.1.1.1:853"
+	defaultTLSName = "cloudflare-dns.com"
+	defaultBlocklistRefresh = 6 * time.Hour
 )
 
 type resolver struct {
 	upstream string
-	blocked  map[string]struct{}
-	client   *dns.Client
+	upstreamTLSName string
+	client *dns.Client
+	blocked map[string]struct{}
+	blocklistURLs []string
+	refreshEvery time.Duration
+	sources map[string]*blocklistSourceState
+	lastRefresh time.Time
+	ready bool
 
-	// Dashboard state is shared between the DNS handler and HTTP handlers.
+	upstreamMu sync.RWMutex
 	stateMu sync.RWMutex
-	started  time.Time
-	stats    dashboardStats
-	logs     []queryLogEntry
+	started time.Time
+	stats dashboardStats
+	logs []queryLogEntry
 }
 
 func main() {
@@ -37,6 +45,11 @@ func main() {
 	upstream := env("UPSTREAM_DOT", defaultUpstream)
 	serverName := env("UPSTREAM_TLS_NAME", defaultTLSName)
 	dashboardAddr := env("DASHBOARD_ADDR", "127.0.0.1:8080")
+	refreshEvery, err := time.ParseDuration(env("BLOCKLIST_REFRESH", defaultBlocklistRefresh.String()))
+	if err != nil || refreshEvery < time.Minute {
+		log.Fatal("BLOCKLIST_REFRESH must be a duration of at least 1m, for example 6h")
+	}
+	blocklistURLs := parseBlocklistURLs(os.Getenv("BLOCKLIST_URLS"))
 
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
@@ -44,17 +57,18 @@ func main() {
 	}
 
 	r := &resolver{
-		upstream: upstream,
-		blocked:  parseBlocklist(os.Getenv("BLOCKLIST")),
-		started:  time.Now(),
-		client: &dns.Client{
-			Net:     "tcp-tls",
-			Timeout: 5 * time.Second,
-			TLSConfig: &tls.Config{
-				MinVersion: tls.VersionTLS12,
-				ServerName: serverName,
-			},
-		},
+		upstream: upstream, upstreamTLSName: serverName,
+		blocked: parseBlocklist(os.Getenv("BLOCKLIST")),
+		blocklistURLs: blocklistURLs, refreshEvery: refreshEvery,
+		sources: make(map[string]*blocklistSourceState), started: time.Now(),
+		client: newDoTClient(serverName),
+	}
+	for _, source := range blocklistURLs { r.sources[source] = &blocklistSourceState{} }
+	if len(blocklistURLs) > 0 {
+		go func() { r.initialLoad(); r.refreshLoop() }()
+	} else {
+		r.ready = true
+		log.Printf("BLOCKLIST_URLS empty; remote blocklist refresh disabled")
 	}
 
 	go r.serveDashboard(dashboardAddr, listenAddr, upstream)
@@ -111,11 +125,12 @@ func (r *resolver) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 
-	response, _, err := r.client.Exchange(req, r.upstream)
+	client, upstream, _ := r.getUpstream()
+	response, _, err := client.Exchange(req, upstream)
 	if err != nil || response == nil {
 		r.incrementError()
 		r.recordLog(queryLogEntry{Time: time.Now(), Domain: name, Type: qtype, Client: clientAddr, RCode: dns.RcodeToString[dns.RcodeServerFailure], Action: "ERROR"})
-		log.Printf("upstream failure domain=%s upstream=%s err=%v", name, r.upstream, err)
+		log.Printf("upstream failure domain=%s upstream=%s err=%v", name, upstream, err)
 		reply := new(dns.Msg)
 		reply.SetRcode(req, dns.RcodeServerFailure)
 		if writeErr := w.WriteMsg(reply); writeErr != nil {
@@ -131,7 +146,27 @@ func (r *resolver) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 	}
 }
 
-func (r *resolver) isBlocked(name string) bool {
+func newDoTClient(serverName string) *dns.Client {
+	return &dns.Client{Net: "tcp-tls", Timeout: 5 * time.Second,
+		TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12, ServerName: serverName}}
+}
+
+func (r *resolver) getUpstream() (*dns.Client, string, string) {
+	r.upstreamMu.RLock()
+	defer r.upstreamMu.RUnlock()
+	return r.client, r.upstream, r.upstreamTLSName
+}
+
+func (r *resolver) setUpstream(upstream, serverName string) error {
+	if _, _, err := net.SplitHostPort(upstream); err != nil { return err }
+	if strings.TrimSpace(serverName) == "" || strings.ContainsAny(serverName, "/: ") {
+		return fmt.Errorf("invalid TLS server name")
+	}
+	r.upstreamMu.Lock()
+	r.upstream, r.upstreamTLSName, r.client = upstream, serverName, newDoTClient(serverName)
+	r.upstreamMu.Unlock()
+	return nil
+}
 	name = normalizeDomain(name)
 	if name == "" {
 		return false

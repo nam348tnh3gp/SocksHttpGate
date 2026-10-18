@@ -28,10 +28,15 @@ type queryLogEntry struct {
 
 type statsResponse struct {
 	dashboardStats
-	UptimeSeconds int64  `json:"uptime_seconds"`
+	UptimeSeconds int64 `json:"uptime_seconds"`
 	ListenAddress string `json:"listen_address"`
-	Upstream      string `json:"upstream"`
-	BlockedDomains int   `json:"blocked_domains"`
+	Upstream string `json:"upstream"`
+	UpstreamTLSName string `json:"upstream_tls_name"`
+	BlockedDomains int `json:"blocked_domains"`
+	Ready bool `json:"ready"`
+	RefreshEvery string `json:"refresh_every"`
+	LastRefresh string `json:"last_refresh,omitempty"`
+	Sources map[string]*blocklistSourceState `json:"sources"`
 }
 
 func (r *resolver) incrementQuery() {
@@ -77,8 +82,13 @@ func (r *resolver) serveDashboard(addr, listenAddr, upstream string) {
 		}
 		r.stateMu.RLock()
 		blockedCount := len(r.blocked)
-		s := statsResponse{dashboardStats: r.stats, UptimeSeconds: int64(time.Since(r.started).Seconds()), ListenAddress: listenAddr, Upstream: upstream, BlockedDomains: blockedCount}
+		sources := make(map[string]*blocklistSourceState, len(r.sources))
+		for key, value := range r.sources { copyValue := *value; sources[key] = &copyValue }
+		lastRefresh := ""
+		if !r.lastRefresh.IsZero() { lastRefresh = r.lastRefresh.Format(time.RFC3339) }
+		s := statsResponse{dashboardStats: r.stats, UptimeSeconds: int64(time.Since(r.started).Seconds()), ListenAddress: listenAddr, BlockedDomains: blockedCount, Ready: r.ready, RefreshEvery: r.refreshEvery.String(), LastRefresh: lastRefresh, Sources: sources}
 		r.stateMu.RUnlock()
+		_, s.Upstream, s.UpstreamTLSName = r.getUpstream()
 		writeJSON(w, s)
 	})
 	mux.HandleFunc("/api/logs", func(w http.ResponseWriter, req *http.Request) {
@@ -93,6 +103,13 @@ func (r *resolver) serveDashboard(addr, listenAddr, upstream string) {
 			logs[i], logs[j] = logs[j], logs[i]
 		}
 		writeJSON(w, logs)
+	})
+	mux.HandleFunc("/api/upstream", func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodPost { http.Error(w, "method not allowed", http.StatusMethodNotAllowed); return }
+		var input struct { Upstream string `json:"upstream"`; TLSName string `json:"tls_name"` }
+		if err := json.NewDecoder(http.MaxBytesReader(w, req.Body, 4096)).Decode(&input); err != nil { http.Error(w, "invalid JSON body", http.StatusBadRequest); return }
+		if err := r.setUpstream(strings.TrimSpace(input.Upstream), strings.TrimSpace(input.TLSName)); err != nil { http.Error(w, "invalid upstream or TLS name", http.StatusBadRequest); return }
+		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("/api/blocklist", func(w http.ResponseWriter, req *http.Request) {
 		switch req.Method {
@@ -185,17 +202,18 @@ main{max-width:1100px;margin:auto;padding:24px 16px 48px}.head{display:flex;just
 <div class="card"><div class="label">Uptime</div><div class="num" id="uptime">0s</div></div>
 </div>
 <div class="grid"><section class="panel"><h2>Recent DNS queries</h2><div class="logs"><table><thead><tr><th>Time</th><th>Domain</th><th>Type</th><th>Result</th><th>Client</th></tr></thead><tbody id="logs"><tr><td colspan="5">Waiting for queries…</td></tr></tbody></table></div></section>
-<section class="panel"><h2>Server status</h2><div class="meta"><div>DoT listen: <b id="listen">—</b></div><div>Upstream: <b id="upstream">—</b></div><div>Blocked domains: <b id="domainCount">0</b></div><div>Last query: <b id="lastQuery">Never</b></div></div><h2 style="margin-top:24px">Blocklist manager</h2><form id="addForm"><input id="domainInput" placeholder="ads.example.com" autocomplete="off" required><button>Add</button></form><div id="domains" class="domains"></div></section></div>
+<section class="panel"><h2>Server status</h2><div class="meta"><div>DoT listen: <b id="listen">—</b></div><div>Upstream: <b id="upstream">—</b></div><div>TLS name: <b id="tlsName">—</b></div><div>Blocklist refresh: <b id="refreshEvery">—</b></div><div>Last refresh: <b id="lastRefresh">Never</b></div><div>Resolver ready: <b id="ready">No</b></div><div>Blocked domains: <b id="domainCount">0</b></div><div>Last query: <b id="lastQuery">Never</b></div></div><h2 style="margin-top:24px">Change upstream</h2><form id="upstreamForm"><input id="upstreamInput" placeholder="1.1.1.1:853" required><input id="tlsInput" placeholder="cloudflare-dns.com" required><button>Save</button></form><h2 style="margin-top:24px">Remote blocklist sources</h2><div id="sources" class="meta">No remote sources configured</div><h2 style="margin-top:24px">Blocklist manager</h2><form id="addForm"><input id="domainInput" placeholder="ads.example.com" autocomplete="off" required><button>Add</button></form><div id="domains" class="domains"></div></section></div>
 <div class="foot">Dashboard API has no authentication. Keep it bound to 127.0.0.1 and do not expose it publicly.</div>
 </main><script>
 const $=id=>document.getElementById(id);const fmt=n=>Number(n||0).toLocaleString();
 function duration(s){s=Math.max(0,Number(s)||0);if(s<60)return Math.floor(s)+'s';if(s<3600)return Math.floor(s/60)+'m '+Math.floor(s%60)+'s';if(s<86400)return Math.floor(s/3600)+'h '+Math.floor(s%3600/60)+'m';return Math.floor(s/86400)+'d '+Math.floor(s%86400/3600)+'h'}
 async function api(url,options){const res=await fetch(url,options);if(!res.ok)throw new Error(await res.text());if(res.status===204)return null;return res.json()}
-async function refresh(){try{const s=await api('/api/stats');$('queries').textContent=fmt(s.queries);$('blocked').textContent=fmt(s.blocked);$('errors').textContent=fmt(s.errors);$('uptime').textContent=duration(s.uptime_seconds);$('listen').textContent=s.listen_address;$('upstream').textContent=s.upstream;$('domainCount').textContent=fmt(s.blocked_domains);$('lastQuery').textContent=s.last_query?new Date(s.last_query).toLocaleString():'Never';
+async function refresh(){try{const s=await api('/api/stats');$('queries').textContent=fmt(s.queries);$('blocked').textContent=fmt(s.blocked);$('errors').textContent=fmt(s.errors);$('uptime').textContent=duration(s.uptime_seconds);$('listen').textContent=s.listen_address;$('upstream').textContent=s.upstream;$('tlsName').textContent=s.upstream_tls_name;$('upstreamInput').value=s.upstream;$('tlsInput').value=s.upstream_tls_name;$('refreshEvery').textContent=s.refresh_every;$('lastRefresh').textContent=s.last_refresh?new Date(s.last_refresh).toLocaleString():'Never';$('ready').textContent=s.ready?'Yes':'Loading';$('domainCount').textContent=fmt(s.blocked_domains);$('lastQuery').textContent=s.last_query?new Date(s.last_query).toLocaleString():'Never';$('sources').innerHTML=Object.keys(s.sources||{}).map(k=>{const v=s.sources[k];return '<div><b>'+esc(k)+'</b><br>Domains: '+fmt(v.domain_count)+' · Loads: '+fmt(v.total_loads)+' · Failures: '+fmt(v.failed_loads)+'<br>Last OK: '+esc(v.last_success||'Never')+' · Error: '+esc(v.last_error||'—')+'</div>'}).join('')||'No remote sources configured';
 const logs=await api('/api/logs');$('logs').innerHTML=logs.length?logs.slice(0,100).map(x=>'<tr><td>'+new Date(x.time).toLocaleTimeString()+'</td><td>'+esc(x.domain)+'</td><td>'+esc(x.type)+'</td><td><span class="tag '+esc(x.action)+'">'+esc(x.rcode||x.action)+'</span></td><td>'+esc(x.client)+'</td></tr>').join(''):'<tr><td colspan="5">No DNS queries yet</td></tr>';
 const b=await api('/api/blocklist');$('domains').innerHTML=b.domains.map(d=>'<span class="domain">'+esc(d)+'<button class="remove" data-domain="'+esc(d)+'" title="Remove">×</button></span>').join('')||'<span class="label">No blocked domains</span>';
 }catch(e){console.error(e)}}
 function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+$('upstreamForm').addEventListener('submit',async e=>{e.preventDefault();try{await api('/api/upstream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({upstream:$('upstreamInput').value.trim(),tls_name:$('tlsInput').value.trim()})});await refresh()}catch(err){alert('Could not update upstream: '+err.message)}});
 $('addForm').addEventListener('submit',async e=>{e.preventDefault();const domain=$('domainInput').value.trim();try{await api('/api/blocklist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'add',domain})});$('domainInput').value='';await refresh()}catch(err){alert('Could not add domain: '+err.message)}});
 $('domains').addEventListener('click',async e=>{const btn=e.target.closest('button[data-domain]');if(!btn)return;try{await api('/api/blocklist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'remove',domain:btn.dataset.domain})});await refresh()}catch(err){alert('Could not remove domain: '+err.message)}});
 refresh();setInterval(refresh,3000);
