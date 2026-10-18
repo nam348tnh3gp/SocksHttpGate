@@ -15,7 +15,9 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"runtime/metrics"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,43 +31,53 @@ const (
 	dohMediaType       = "application/dns-message"
 	maxBlocklistBytes  = 10 << 20
 	defaultRefreshTime = 6 * time.Hour
-	dashboardHTML      = `<!DOCTYPE html>
+	latencySampleMax   = 500
+	qpsWindowSec       = 60
+	domainCap          = 5000
+
+	dashboardHTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Go DoH Resolver</title>
 <style>
-:root{--bg:#0d1117;--panel:#161b22;--border:#30363d;--fg:#c9d1d9;--muted:#8b949e;--accent:#58a6ff;--ok:#3fb950;--warn:#d29922;--err:#f85149}
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;font-size:14px;line-height:1.5;padding:16px}
-h1{font-size:20px;margin-bottom:4px;display:flex;align-items:center;gap:10px}
-.sub{color:var(--muted);font-size:13px;margin-bottom:16px;font-family:ui-monospace,monospace}
+:root{--bg:#0d1117;--panel:#161b22;--border:#30363d;--fg:#c9d1d9;--muted:#8b949e;--accent:#58a6ff;--ok:#3fb950;--warn:#d29922;--err:#f85149;--pad:clamp(8px,2vw,16px);--gap:clamp(6px,1vw,12px);--radius:6px}
+*{box-sizing:border-box;margin:0;padding:0;min-width:0}
+html{overflow-x:hidden}
+body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;font-size:clamp(12px,1.6vw,14px);line-height:1.5;padding:var(--pad);overflow-x:hidden;max-width:100%}
+h1{font-size:clamp(15px,2.4vw,20px);margin-bottom:4px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+h2{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin:14px 0 6px;font-weight:600}
+.sub{color:var(--muted);font-size:clamp(11px,1.4vw,13px);margin-bottom:14px;font-family:ui-monospace,monospace;overflow-wrap:anywhere;word-break:break-word}
 .sub a{color:var(--accent);text-decoration:none}
-.section-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin:4px 0 8px;font-weight:600}
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin-bottom:16px}
-.card{background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:12px}
-.card .label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.5px}
-.card .value{font-size:22px;font-weight:600;margin-top:4px;font-family:ui-monospace,monospace}
-.upstream-card{background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:12px;margin-bottom:16px}
-.upstream-card .label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.5px}
-.upstream-card input{flex:1;background:#0d1117;border:1px solid var(--border);color:var(--fg);padding:8px 10px;border-radius:4px;font-family:ui-monospace,monospace;font-size:12px;outline:none}
-.upstream-card input:focus{border-color:var(--accent)}
-.upstream-card button{padding:8px 16px;background:var(--accent);color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:600;font-size:12px}
-.upstream-card button:disabled{opacity:.5;cursor:wait}
-.upstream-card button:hover:not(:disabled){background:#4090d0}
-.panels{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-@media(max-width:900px){.panels{grid-template-columns:1fr}}
-.panel{background:var(--panel);border:1px solid var(--border);border-radius:6px;overflow:hidden;display:flex;flex-direction:column;height:62vh}
-.panel-head{padding:8px 12px;border-bottom:1px solid var(--border);font-weight:600;font-size:13px;display:flex;justify-content:space-between;align-items:center;background:var(--panel)}
-.panel-body{overflow-y:auto;flex:1}
-table{width:100%;border-collapse:collapse;font-family:ui-monospace,monospace;font-size:12px}
-th{text-align:left;padding:6px 12px;color:var(--muted);font-weight:500;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--panel);font-size:11px;text-transform:uppercase;letter-spacing:.5px;z-index:1}
-td{padding:4px 12px;border-bottom:1px solid rgba(48,54,61,.5);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:280px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,130px),1fr));gap:var(--gap);margin-bottom:var(--gap)}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:clamp(8px,1.2vw,12px);min-width:0;overflow:hidden}
+.card .label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.5px;overflow-wrap:anywhere}
+.card .value{font-size:clamp(15px,2.6vw,22px);font-weight:600;margin-top:4px;font-family:ui-monospace,monospace;overflow-wrap:anywhere;word-break:break-word;line-height:1.2}
+.upstream-card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:clamp(8px,1.2vw,12px);margin-bottom:var(--gap);min-width:0;overflow:hidden}
+.upstream-card .label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.5px;overflow-wrap:anywhere}
+.upstream-row{display:flex;gap:8px;margin-top:6px;flex-wrap:wrap}
+.upstream-row input{flex:1 1 240px;min-width:0;background:#0d1117;border:1px solid var(--border);color:var(--fg);padding:8px 10px;border-radius:4px;font-family:ui-monospace,monospace;font-size:12px;outline:none}
+.upstream-row input:focus{border-color:var(--accent)}
+.upstream-row button{flex:0 0 auto;padding:8px 16px;background:var(--accent);color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:600;font-size:12px}
+.upstream-row button:disabled{opacity:.5;cursor:wait}
+.upstream-row button:hover:not(:disabled){background:#4090d0}
+#upstream-msg{font-size:11px;color:var(--muted);margin-top:6px;min-height:14px;overflow-wrap:anywhere;word-break:break-word}
+.panels{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,380px),1fr));gap:var(--gap)}
+.panel{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;display:flex;flex-direction:column;height:clamp(260px,42vh,500px);min-width:0}
+.panel-head{padding:8px 12px;border-bottom:1px solid var(--border);font-weight:600;font-size:clamp(11px,1.5vw,13px);display:flex;justify-content:space-between;align-items:center;background:var(--panel);gap:8px;flex-wrap:wrap;min-width:0}
+.panel-head > span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1 1 auto}
+.panel-head > div{flex:0 0 auto;display:flex;gap:8px;align-items:center;flex-wrap:nowrap}
+.panel-body{overflow:auto;flex:1 1 auto;min-height:0;-webkit-overflow-scrolling:touch}
+.table-wrap{width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch;min-width:0}
+table{width:100%;border-collapse:collapse;font-family:ui-monospace,monospace;font-size:clamp(11px,1.3vw,12px)}
+th{text-align:left;padding:6px 10px;color:var(--muted);font-weight:500;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--panel);font-size:11px;text-transform:uppercase;letter-spacing:.5px;z-index:1;white-space:nowrap}
+td{padding:4px 10px;border-bottom:1px solid rgba(48,54,61,.5);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:42vw}
+td.wrap{white-space:normal;word-break:break-word;overflow-wrap:anywhere;max-width:none}
 tr.blocked td{color:var(--err)}
 tr.ok td{color:var(--ok)}
 tr.err td{color:var(--warn)}
-.badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600}
+.badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600;white-space:nowrap}
 .badge.ready{background:rgba(63,185,80,.15);color:var(--ok)}
 .badge.loading{background:rgba(210,153,34,.15);color:var(--warn)}
 .badge.blocked{background:rgba(248,81,73,.15);color:var(--err)}
@@ -75,11 +87,31 @@ tr.err td{color:var(--warn)}
 .badge.info{background:rgba(88,166,255,.15);color:var(--accent)}
 .badge.warn{background:rgba(210,153,34,.15);color:var(--warn)}
 .badge.error{background:rgba(248,81,73,.15);color:var(--err)}
-.conn{font-size:11px}
+.badge.pending{background:rgba(139,148,158,.15);color:var(--muted)}
+.conn{font-size:11px;white-space:nowrap}
 .conn.on{color:var(--ok)}
 .conn.off{color:var(--err)}
-.dl-btn{display:inline-block;padding:2px 8px;border:1px solid var(--border);border-radius:4px;color:var(--accent);text-decoration:none;font-size:11px;font-weight:600;background:rgba(88,166,255,.08);transition:all .15s}
+.dl-btn{display:inline-block;padding:2px 8px;border:1px solid var(--border);border-radius:4px;color:var(--accent);text-decoration:none;font-size:11px;font-weight:600;background:rgba(88,166,255,.08);transition:all .15s;white-space:nowrap}
 .dl-btn:hover{background:rgba(88,166,255,.2);border-color:var(--accent)}
+.cfg-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr));gap:var(--gap);font-family:ui-monospace,monospace;font-size:12px}
+.cfg-item{background:var(--panel);border:1px solid var(--border);border-radius:4px;padding:6px 10px;min-width:0;overflow:hidden}
+.cfg-key{color:var(--muted);font-size:11px;overflow-wrap:anywhere}
+.cfg-val{color:var(--fg);overflow-wrap:anywhere;word-break:break-word}
+.bars{display:grid;gap:4px;font-family:ui-monospace,monospace;font-size:clamp(11px,1.3vw,12px)}
+.bar-row{display:grid;grid-template-columns:minmax(60px,110px) 1fr minmax(36px,60px);gap:8px;align-items:center;min-width:0}
+.bar-row > span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bar-row > span:last-child{text-align:right}
+.bar-track{background:#21262d;border-radius:3px;height:16px;overflow:hidden;position:relative;min-width:0}
+.bar-fill{background:linear-gradient(90deg,#388bfd,#58a6ff);height:100%;border-radius:3px}
+.bar-fill.blk{background:linear-gradient(90deg,#a13b3b,#f85149)}
+@media(max-width:600px){
+  body{padding:10px}
+  h1{font-size:15px}
+  .panel{height:clamp(240px,40vh,420px)}
+  th,td{padding:4px 8px}
+  td{max-width:60vw}
+  .bar-row{grid-template-columns:minmax(48px,70px) 1fr minmax(30px,50px)}
+}
 </style>
 </head>
 <body>
@@ -94,59 +126,89 @@ Endpoint: <a href="/dns-query">/dns-query</a>
 
 <div class="upstream-card">
   <div class="label">Upstream DoH <span style="text-transform:none;font-weight:400;letter-spacing:0">(runtime only — resets on restart)</span></div>
-  <div style="display:flex;gap:8px;margin-top:6px">
+  <div class="upstream-row">
     <input id="upstream-input" type="url" placeholder="https://dns.google/dns-query" spellcheck="false" autocomplete="off">
     <button id="upstream-btn" onclick="saveUpstream()">Save</button>
   </div>
-  <div id="upstream-msg" style="font-size:11px;color:var(--muted);margin-top:6px;min-height:14px"></div>
+  <div id="upstream-msg"></div>
 </div>
 
-<div class="section-label">Resolver</div>
+<h2>Resolver</h2>
 <div class="stats">
   <div class="card"><div class="label">Blocked domains</div><div class="value" id="st-blocked">-</div></div>
   <div class="card"><div class="label">Total queries</div><div class="value" id="st-total">-</div></div>
   <div class="card"><div class="label">Blocked</div><div class="value" id="st-bq" style="color:var(--err)">-</div></div>
   <div class="card"><div class="label">Passed</div><div class="value" id="st-pq" style="color:var(--ok)">-</div></div>
   <div class="card"><div class="label">Errors</div><div class="value" id="st-eq" style="color:var(--warn)">-</div></div>
-  <div class="card"><div class="label">Uptime</div><div class="value" id="st-uptime" style="font-size:16px">-</div></div>
+  <div class="card"><div class="label">Block rate</div><div class="value" id="st-rate">-</div></div>
+  <div class="card"><div class="label">Uptime</div><div class="value" id="st-uptime">-</div></div>
 </div>
 
-<div class="section-label">Runtime</div>
+<h2>Throughput &amp; Latency</h2>
 <div class="stats">
-  <div class="card"><div class="label">Memory (Alloc)</div><div class="value" id="st-mem" style="font-size:16px">-</div></div>
-  <div class="card"><div class="label">Heap</div><div class="value" id="st-heap" style="font-size:16px">-</div></div>
-  <div class="card"><div class="label">Sys memory</div><div class="value" id="st-sys" style="font-size:16px">-</div></div>
-  <div class="card"><div class="label">Goroutines</div><div class="value" id="st-goroutines">-</div></div>
-  <div class="card"><div class="label">CPU time</div><div class="value" id="st-cpu" style="font-size:16px">-</div></div>
-  <div class="card"><div class="label">GC runs / CPUs</div><div class="value" id="st-gc" style="font-size:16px">-</div></div>
+  <div class="card"><div class="label">QPS (last 1s)</div><div class="value" id="st-qps1">-</div></div>
+  <div class="card"><div class="label">QPS (60s avg)</div><div class="value" id="st-qps60">-</div></div>
+  <div class="card"><div class="label">QPS peak</div><div class="value" id="st-qpspeak">-</div></div>
+  <div class="card"><div class="label">Avg pass</div><div class="value" id="st-latp" style="color:var(--ok)">-</div></div>
+  <div class="card"><div class="label">Avg block</div><div class="value" id="st-latb" style="color:var(--err)">-</div></div>
+  <div class="card"><div class="label">p95 latency</div><div class="value" id="st-p95">-</div></div>
+  <div class="card"><div class="label">Bytes in / out</div><div class="value" id="st-bytes">-</div></div>
 </div>
 
+<h2>Query types</h2>
+<div class="card"><div class="bars" id="type-bars"><span style="color:var(--muted)">no data yet</span></div></div>
+
+<h2>Top domains</h2>
 <div class="panels">
+  <div class="panel"><div class="panel-head"><span>Top 10 hit</span></div>
+    <div class="panel-body"><table><thead><tr><th>#</th><th>Domain</th><th>Hits</th></tr></thead><tbody id="top-hit"><tr><td colspan="3" style="color:var(--muted)">no data</td></tr></tbody></table></div>
+  </div>
+  <div class="panel"><div class="panel-head"><span>Top 10 blocked</span></div>
+    <div class="panel-body"><table><thead><tr><th>#</th><th>Domain</th><th>Hits</th></tr></thead><tbody id="top-blk"><tr><td colspan="3" style="color:var(--muted)">no data</td></tr></tbody></table></div>
+  </div>
+</div>
+
+<h2>Blocklist sources</h2>
+<div class="card">
+  <div class="table-wrap">
+    <table><thead><tr><th>URL</th><th>Status</th><th>Last OK</th><th>Last Error</th><th>Domains</th><th>Loads</th></tr></thead>
+    <tbody id="src-body"><tr><td colspan="6" style="color:var(--muted)">no remote sources</td></tr></tbody></table>
+  </div>
+</div>
+
+<h2>Runtime</h2>
+<div class="stats">
+  <div class="card"><div class="label">Memory (Alloc)</div><div class="value" id="st-mem">-</div></div>
+  <div class="card"><div class="label">Heap</div><div class="value" id="st-heap">-</div></div>
+  <div class="card"><div class="label">Sys memory</div><div class="value" id="st-sys">-</div></div>
+  <div class="card"><div class="label">Goroutines</div><div class="value" id="st-goroutines">-</div></div>
+  <div class="card"><div class="label">CPU time</div><div class="value" id="st-cpu">-</div></div>
+  <div class="card"><div class="label">GC runs / CPUs</div><div class="value" id="st-gc">-</div></div>
+  <div class="card"><div class="label">GC pause total</div><div class="value" id="st-gcpause">-</div></div>
+  <div class="card"><div class="label">Next GC target</div><div class="value" id="st-nextgc">-</div></div>
+</div>
+
+<h2>Config</h2>
+<div class="cfg-grid" id="cfg-grid"><span style="color:var(--muted)">loading…</span></div>
+
+<div class="panels" style="margin-top:16px">
   <div class="panel">
-    <div class="panel-head">
-      <span>Query log (realtime)</span>
-      <div style="display:flex;gap:8px;align-items:center">
+    <div class="panel-head"><span>Query log (realtime)</span>
+      <div>
         <span style="font-size:11px;color:var(--muted)">events: <span id="qcount">0</span></span>
         <a href="/api/logs?type=query" download class="dl-btn">&#11015; CSV</a>
       </div>
     </div>
-    <div class="panel-body">
-      <table><thead><tr><th>Time</th><th>Domain</th><th>Type</th><th>Status</th><th>Latency</th></tr></thead>
-      <tbody id="qbody"></tbody></table>
-    </div>
+    <div class="panel-body"><table><thead><tr><th>Time</th><th>Domain</th><th>Type</th><th>Status</th><th>Latency</th></tr></thead><tbody id="qbody"></tbody></table></div>
   </div>
   <div class="panel">
-    <div class="panel-head">
-      <span>System log (incl. blocklist downloads)</span>
-      <div style="display:flex;gap:8px;align-items:center">
+    <div class="panel-head"><span>System log (incl. blocklist downloads)</span>
+      <div>
         <span style="font-size:11px;color:var(--muted)">events: <span id="lcount">0</span></span>
         <a href="/api/logs?type=system" download class="dl-btn">&#11015; TXT</a>
       </div>
     </div>
-    <div class="panel-body">
-      <table><thead><tr><th>Time</th><th>Level</th><th>Message</th></tr></thead>
-      <tbody id="lbody"></tbody></table>
-    </div>
+    <div class="panel-body"><table><thead><tr><th>Time</th><th>Level</th><th>Message</th></tr></thead><tbody id="lbody"></tbody></table></div>
   </div>
 </div>
 
@@ -159,12 +221,19 @@ Endpoint: <a href="/dns-query">/dns-query</a>
 
   function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
   function fmtTime(iso){try{return new Date(iso).toLocaleTimeString();}catch(e){return iso;}}
+  function fmtMs(v){return (v||0).toFixed(1)+' ms';}
+  function fmtBytes(b){b=b||0;if(b<1024)return b+' B';if(b<1048576)return (b/1024).toFixed(1)+' KiB';if(b<1073741824)return (b/1048576).toFixed(1)+' MiB';return (b/1073741824).toFixed(2)+' GiB';}
+  function fmtTimeUTC(iso){if(!iso)return 'never';try{return iso.replace('T',' ').split('.')[0]+' UTC';}catch(e){return iso;}}
 
   function addQuery(q){
     var tr=document.createElement('tr');
-    tr.className=q.status==='blocked'?'blocked':(q.status==='ok'?'ok':'err');
     var cls=q.status==='blocked'?'blocked':(q.status==='ok'?'ok':'err');
-    tr.innerHTML='<td>'+esc(fmtTime(q.time))+'</td><td>'+esc(q.domain)+'</td><td>'+esc(q.type||'A')+'</td><td><span class="badge '+cls+'">'+esc(q.status)+'</span></td><td>'+esc(q.latency_ms)+'ms</td>';
+    tr.className=cls;
+    tr.innerHTML='<td>'+esc(fmtTime(q.time))+'</td>'
+      +'<td title="'+esc(q.domain)+'">'+esc(q.domain)+'</td>'
+      +'<td>'+esc(q.type||'A')+'</td>'
+      +'<td><span class="badge '+cls+'">'+esc(q.status)+'</span></td>'
+      +'<td>'+esc(q.latency_ms)+'ms</td>';
     qbody.insertBefore(tr,qbody.firstChild);
     while(qbody.children.length>MAX)qbody.removeChild(qbody.lastChild);
     qcount++;document.getElementById('qcount').textContent=qcount;
@@ -172,10 +241,65 @@ Endpoint: <a href="/dns-query">/dns-query</a>
   function addLog(l){
     var tr=document.createElement('tr');
     var cls=l.level==='error'?'error':(l.level==='warn'?'warn':'info');
-    tr.innerHTML='<td>'+esc(fmtTime(l.time))+'</td><td><span class="badge '+cls+'">'+esc(l.level)+'</span></td><td style="white-space:normal">'+esc(l.message)+'</td>';
+    tr.innerHTML='<td>'+esc(fmtTime(l.time))+'</td>'
+      +'<td><span class="badge '+cls+'">'+esc(l.level)+'</span></td>'
+      +'<td class="wrap" title="'+esc(l.message)+'">'+esc(l.message)+'</td>';
     lbody.insertBefore(tr,lbody.firstChild);
     while(lbody.children.length>MAX)lbody.removeChild(lbody.lastChild);
     lcount++;document.getElementById('lcount').textContent=lcount;
+  }
+
+  function renderTypes(m){
+    var el=document.getElementById('type-bars');el.innerHTML='';
+    var keys=Object.keys(m||{});
+    if(!keys.length){el.innerHTML='<span style="color:var(--muted)">no data yet</span>';return;}
+    keys.sort(function(a,b){return m[b]-m[a];});
+    var max=m[keys[0]]||1;
+    keys.forEach(function(k){
+      var v=m[k];var pct=(v/max*100).toFixed(0);
+      var row=document.createElement('div');row.className='bar-row';
+      row.innerHTML='<span title="'+esc(k)+'">'+esc(k)+'</span><div class="bar-track"><div class="bar-fill" style="width:'+pct+'%"></div></div><span>'+v+'</span>';
+      el.appendChild(row);
+    });
+  }
+
+  function renderTop(tbodyId, arr){
+    var tb=document.getElementById(tbodyId);tb.innerHTML='';
+    if(!arr||!arr.length){tb.innerHTML='<tr><td colspan="3" style="color:var(--muted)">no data</td></tr>';return;}
+    arr.forEach(function(d,i){
+      var tr=document.createElement('tr');
+      tr.innerHTML='<td>'+(i+1)+'</td>'
+        +'<td title="'+esc(d.domain)+'">'+esc(d.domain)+'</td>'
+        +'<td>'+esc(d.count)+'</td>';
+      tb.appendChild(tr);
+    });
+  }
+
+  function renderSources(arr){
+    var tb=document.getElementById('src-body');tb.innerHTML='';
+    if(!arr||!arr.length){tb.innerHTML='<tr><td colspan="6" style="color:var(--muted)">no remote sources</td></tr>';return;}
+    arr.forEach(function(s){
+      var tr=document.createElement('tr');
+      var ok=s.last_success?'ok':'pending';
+      var err=s.last_error?s.last_error:'—';
+      tr.innerHTML='<td title="'+esc(s.url)+'">'+esc(s.url)+'</td>'
+        +'<td><span class="badge '+ok+'">'+(s.last_error?'error':'ok')+'</span></td>'
+        +'<td>'+esc(fmtTimeUTC(s.last_success))+'</td>'
+        +'<td style="color:'+(s.last_error?'var(--warn)':'var(--muted)')+'" title="'+esc(err)+'">'+esc(err)+'</td>'
+        +'<td>'+esc(s.domain_count)+'</td>'
+        +'<td>'+esc(s.total_loads)+' / '+esc(s.failed_loads)+'</td>';
+      tb.appendChild(tr);
+    });
+  }
+
+  function renderConfig(cfg){
+    var el=document.getElementById('cfg-grid');el.innerHTML='';
+    if(!cfg)return;
+    Object.keys(cfg).forEach(function(k){
+      var div=document.createElement('div');div.className='cfg-item';
+      div.innerHTML='<div class="cfg-key">'+esc(k)+'</div><div class="cfg-val">'+esc(cfg[k])+'</div>';
+      el.appendChild(div);
+    });
   }
 
   function refreshStats(){
@@ -185,41 +309,54 @@ Endpoint: <a href="/dns-query">/dns-query</a>
       document.getElementById('st-bq').textContent=s.total_blocked;
       document.getElementById('st-pq').textContent=s.total_passed;
       document.getElementById('st-eq').textContent=s.total_errors;
+      var rate=s.total_queries>0?(s.total_blocked*100/s.total_queries).toFixed(1)+'%':'—';
+      document.getElementById('st-rate').textContent=rate;
       document.getElementById('st-uptime').textContent=s.uptime;
-      document.getElementById('last-refresh').textContent=s.last_refresh?s.last_refresh.replace('T',' ').split('.')[0]+' UTC':'never';
+      document.getElementById('last-refresh').textContent=fmtTimeUTC(s.last_refresh);
       statusEl.textContent=s.ready?'READY':'LOADING';
       statusEl.className='badge '+(s.ready?'ready':'loading');
       if(s.sources&&s.sources.length)document.getElementById('sources-line').textContent=s.sources.length+' source(s)';
       else document.getElementById('sources-line').textContent='no remote sources';
       if(s.platform)document.getElementById('platform').textContent=s.platform+' / '+s.go_version;
+
+      document.getElementById('st-qps1').textContent=(s.qps_1s||0).toFixed(1);
+      document.getElementById('st-qps60').textContent=(s.qps_60s_avg||0).toFixed(2);
+      document.getElementById('st-qpspeak').textContent=s.qps_peak||0;
+      document.getElementById('st-latp').textContent=fmtMs(s.avg_latency_pass_ms);
+      document.getElementById('st-latb').textContent=fmtMs(s.avg_latency_block_ms);
+      document.getElementById('st-p95').textContent=fmtMs(s.p95_latency_ms);
+      document.getElementById('st-bytes').textContent=fmtBytes(s.bytes_in)+' / '+fmtBytes(s.bytes_out);
+
+      renderTypes(s.type_breakdown||{});
+      renderTop('top-hit', s.top_domains);
+      renderTop('top-blk', s.top_blocked);
+      renderSources(s.sources_status||[]);
+
       document.getElementById('st-mem').textContent=(s.mem_alloc_mb||0).toFixed(2)+' MB';
       document.getElementById('st-heap').textContent=(s.heap_mb||0).toFixed(2)+' MB';
       document.getElementById('st-sys').textContent=(s.mem_sys_mb||0).toFixed(2)+' MB';
       document.getElementById('st-goroutines').textContent=s.goroutines||0;
       document.getElementById('st-cpu').textContent=(s.cpu_seconds||0).toFixed(1)+' s';
       document.getElementById('st-gc').textContent=(s.num_gc||0)+' / '+(s.num_cpu||0);
+      document.getElementById('st-gcpause').textContent=(s.gc_pause_total_ms||0).toFixed(1)+' ms';
+      document.getElementById('st-nextgc').textContent=(s.gc_next_target_mb||0).toFixed(1)+' MB';
+
+      renderConfig(s.config);
+
       if(s.upstream && document.activeElement!==upInput && !upInput.value)upInput.value=s.upstream;
     }).catch(function(){});
   }
 
   window.saveUpstream=function(){
-    var u=upInput.value.trim();
-    if(!u)return;
+    var u=upInput.value.trim();if(!u)return;
     var msg=document.getElementById('upstream-msg');
     var btn=document.getElementById('upstream-btn');
-    msg.textContent='Saving...';msg.style.color='var(--muted)';
-    btn.disabled=true;
+    msg.textContent='Saving...';msg.style.color='var(--muted)';btn.disabled=true;
     fetch('/api/upstream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:u})})
       .then(function(r){return r.json().then(function(j){return {ok:r.ok,body:j};});})
       .then(function(x){
-        if(x.ok){
-          msg.textContent='✓ Upstream set to '+x.body.url;
-          msg.style.color='var(--ok)';
-          refreshStats();
-        }else{
-          msg.textContent='✗ '+(x.body.error||'save failed');
-          msg.style.color='var(--err)';
-        }
+        if(x.ok){msg.textContent='✓ Upstream set to '+x.body.url;msg.style.color='var(--ok)';refreshStats();}
+        else{msg.textContent='✗ '+(x.body.error||'save failed');msg.style.color='var(--err)';}
       })
       .catch(function(e){msg.textContent='✗ '+e.message;msg.style.color='var(--err)';})
       .finally(function(){btn.disabled=false;});
@@ -259,28 +396,61 @@ type QueryEntry struct {
 	LatencyMs int64     `json:"latency_ms"`
 }
 
+type DomainStat struct {
+	Domain string `json:"domain"`
+	Count  uint64 `json:"count"`
+}
+
+type SourceStatus struct {
+	URL         string `json:"url"`
+	LastSuccess string `json:"last_success,omitempty"`
+	LastError   string `json:"last_error,omitempty"`
+	DomainCount int    `json:"domain_count"`
+	TotalLoads  uint64 `json:"total_loads"`
+	FailedLoads uint64 `json:"failed_loads"`
+}
+
 type statsResponse struct {
-	Ready          bool     `json:"ready"`
-	BlockedDomains int      `json:"blocked_domains"`
-	Sources        []string `json:"sources"`
-	Upstream       string   `json:"upstream"`
-	RefreshEvery   string   `json:"refresh_every"`
-	LastRefresh    string   `json:"last_refresh"`
-	Uptime         string   `json:"uptime"`
-	TotalQueries   uint64   `json:"total_queries"`
-	TotalBlocked   uint64   `json:"total_blocked"`
-	TotalPassed    uint64   `json:"total_passed"`
-	TotalErrors    uint64   `json:"total_errors"`
+	Ready          bool           `json:"ready"`
+	BlockedDomains int            `json:"blocked_domains"`
+	Sources        []string       `json:"sources"`
+	SourcesStatus  []SourceStatus `json:"sources_status"`
+	Upstream       string         `json:"upstream"`
+	RefreshEvery   string         `json:"refresh_every"`
+	LastRefresh    string         `json:"last_refresh"`
+	Uptime         string         `json:"uptime"`
+	TotalQueries   uint64         `json:"total_queries"`
+	TotalBlocked   uint64         `json:"total_blocked"`
+	TotalPassed    uint64         `json:"total_passed"`
+	TotalErrors    uint64         `json:"total_errors"`
+	// Throughput & latency
+	QPS1s           float64 `json:"qps_1s"`
+	QPS60sAvg       float64 `json:"qps_60s_avg"`
+	QPSPeak         uint64  `json:"qps_peak"`
+	AvgLatencyPass  float64 `json:"avg_latency_pass_ms"`
+	AvgLatencyBlock float64 `json:"avg_latency_block_ms"`
+	P95LatencyMs    float64 `json:"p95_latency_ms"`
+	BytesIn         uint64  `json:"bytes_in"`
+	BytesOut        uint64  `json:"bytes_out"`
+	// Breakdown
+	TypeBreakdown map[string]uint64 `json:"type_breakdown"`
+	TopDomains    []DomainStat      `json:"top_domains"`
+	TopBlocked    []DomainStat      `json:"top_blocked"`
 	// Runtime
-	MemAllocMB float64 `json:"mem_alloc_mb"`
-	MemSysMB   float64 `json:"mem_sys_mb"`
-	HeapMB     float64 `json:"heap_mb"`
-	NumGC      uint32  `json:"num_gc"`
-	Goroutines int     `json:"goroutines"`
-	NumCPU     int     `json:"num_cpu"`
-	CPUSeconds float64 `json:"cpu_seconds"`
-	Platform   string  `json:"platform"`
-	GoVersion  string  `json:"go_version"`
+	MemAllocMB     float64 `json:"mem_alloc_mb"`
+	MemSysMB       float64 `json:"mem_sys_mb"`
+	HeapMB         float64 `json:"heap_mb"`
+	NumGC          uint32  `json:"num_gc"`
+	Goroutines     int     `json:"goroutines"`
+	NumCPU         int     `json:"num_cpu"`
+	CPUSeconds     float64 `json:"cpu_seconds"`
+	Platform       string  `json:"platform"`
+	GoVersion      string  `json:"go_version"`
+	GCPauseTotalMs float64 `json:"gc_pause_total_ms"`
+	GCPauseLastMs  float64 `json:"gc_pause_last_ms"`
+	GCNextTargetMB float64 `json:"gc_next_target_mb"`
+	// Config
+	Config map[string]string `json:"config"`
 }
 
 // ─── Ring buffer + realtime subscribers ────────────────────────────────────
@@ -343,7 +513,7 @@ func (r *ringBuffer[T]) Unsubscribe(ch chan T) {
 	}
 }
 
-// ─── Logging (stdout + ring for dashboard) ─────────────────────────────────
+// ─── Logging ───────────────────────────────────────────────────────────────
 
 var (
 	logRing   = newRing[LogEntry](300)
@@ -356,16 +526,21 @@ type dashLogger struct {
 	base *log.Logger
 }
 
-func (l *dashLogger) Infof(format string, args ...any)  { l.emit("info", format, args...) }
-func (l *dashLogger) Warnf(format string, args ...any)  { l.emit("warn", format, args...) }
-func (l *dashLogger) Errorf(format string, args ...any) { l.emit("error", format, args...) }
-func (l *dashLogger) emit(level, format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
+func (l *dashLogger) Infof(f string, a ...any)  { l.emit("info", f, a...) }
+func (l *dashLogger) Warnf(f string, a ...any)  { l.emit("warn", f, a...) }
+func (l *dashLogger) Errorf(f string, a ...any) { l.emit("error", f, a...) }
+func (l *dashLogger) emit(level, f string, a ...any) {
+	msg := fmt.Sprintf(f, a...)
 	l.base.Printf(msg)
 	l.ring.Add(LogEntry{Time: time.Now(), Level: level, Message: msg})
 }
 
 // ─── Server ────────────────────────────────────────────────────────────────
+
+type domainStat struct {
+	hits    atomic.Uint64
+	blocked atomic.Uint64
+}
 
 type server struct {
 	upstreamMu  sync.RWMutex
@@ -386,7 +561,42 @@ type server struct {
 	totalPassed  atomic.Uint64
 	totalErrors  atomic.Uint64
 
+	// Throughput
+	qpsCur    atomic.Uint64
+	qpsPeak   atomic.Uint64
+	qpsMu     sync.Mutex
+	qpsWindow [qpsWindowSec]uint64
+	qpsIdx    int
+
+	bytesIn  atomic.Uint64
+	bytesOut atomic.Uint64
+
+	// Latency
+	latMu      sync.Mutex
+	latSamples []int64
+	passSumUs  atomic.Uint64
+	passCount  atomic.Uint64
+	blockSumUs atomic.Uint64
+	blockCount atomic.Uint64
+
+	// Breakdown
+	typeCounts  sync.Map // string -> *atomic.Uint64
+	domainHits  sync.Map // string -> *domainStat
+	domainsSeen atomic.Int64
+
+	// Sources
+	sourcesMu sync.RWMutex
+	sources   map[string]*srcState
+
 	startTime time.Time
+}
+
+type srcState struct {
+	lastSuccess time.Time
+	lastError   string
+	domainCount int
+	totalLoads  uint64
+	failedLoads uint64
 }
 
 func (s *server) getUpstream() string {
@@ -407,7 +617,6 @@ func main() {
 	if !strings.HasPrefix(upstream, "https://") {
 		log.Fatal("UPSTREAM_DOH must be an https:// URL")
 	}
-
 	refreshEvery, err := time.ParseDuration(env("BLOCKLIST_REFRESH", defaultRefreshTime.String()))
 	if err != nil || refreshEvery < time.Minute {
 		log.Fatal("BLOCKLIST_REFRESH must be a duration of at least 1m, for example 6h")
@@ -420,8 +629,14 @@ func main() {
 		blocked:       parseBlocklist(os.Getenv("BLOCKLIST")),
 		blocklistURLs: parseURLs(os.Getenv("BLOCKLIST_URLS")),
 		refreshEvery:  refreshEvery,
+		sources:       map[string]*srcState{},
 		startTime:     time.Now(),
 	}
+	for _, u := range s.blocklistURLs {
+		s.sources[u] = &srcState{}
+	}
+
+	go s.qpsLoop()
 
 	if len(s.blocklistURLs) > 0 {
 		go func() {
@@ -430,9 +645,9 @@ func main() {
 		}()
 	} else {
 		if raw := strings.TrimSpace(os.Getenv("BLOCKLIST_URLS")); raw != "" {
-			dlog.Errorf("BLOCKLIST_URLS is set to %q but no valid HTTPS URL was parsed — check for typos, quotes, or non-https scheme", raw)
+			dlog.Errorf("BLOCKLIST_URLS is set to %q but no valid HTTPS URL was parsed", raw)
 		} else {
-			dlog.Warnf("BLOCKLIST_URLS is empty or unset — remote blocklist download disabled; only hardcoded defaults + BLOCKLIST will be used")
+			dlog.Warnf("BLOCKLIST_URLS is empty or unset — remote blocklist download disabled")
 		}
 		s.ready.Store(true)
 	}
@@ -450,6 +665,21 @@ func main() {
 	dlog.Infof("HTTP listening on %s; upstream=%s; remote sources=%d; refresh=%s; platform=%s/%s; go=%s",
 		addr, upstream, len(s.blocklistURLs), s.refreshEvery, runtime.GOOS, runtime.GOARCH, runtime.Version())
 	log.Fatal(http.ListenAndServe(addr, securityHeaders(mux)))
+}
+
+func (s *server) qpsLoop() {
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for range t.C {
+		cur := s.qpsCur.Swap(0)
+		if p := s.qpsPeak.Load(); cur > p {
+			s.qpsPeak.Store(cur)
+		}
+		s.qpsMu.Lock()
+		s.qpsWindow[s.qpsIdx] = cur
+		s.qpsIdx = (s.qpsIdx + 1) % qpsWindowSec
+		s.qpsMu.Unlock()
+	}
 }
 
 // ─── Handlers ──────────────────────────────────────────────────────────────
@@ -475,39 +705,161 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleAPIStats(w http.ResponseWriter, r *http.Request) {
-	blocked := s.blockedCount()
 	bq := s.totalBlocked.Load()
 	pq := s.totalPassed.Load()
 	eq := s.totalErrors.Load()
+
 	var lr string
 	if t := s.lastRefresh.Load(); t > 0 {
 		lr = time.Unix(t, 0).UTC().Format(time.RFC3339)
 	}
 
+	// QPS
+	s.qpsMu.Lock()
+	last1s := s.qpsWindow[(s.qpsIdx-1+qpsWindowSec)%qpsWindowSec]
+	var sum uint64
+	for _, v := range s.qpsWindow {
+		sum += v
+	}
+	s.qpsMu.Unlock()
+	avg60 := float64(sum) / float64(qpsWindowSec)
+
+	// Latency
+	s.latMu.Lock()
+	samples := append([]int64(nil), s.latSamples...)
+	s.latMu.Unlock()
+	var p95 float64
+	if len(samples) > 0 {
+		cp := append([]int64(nil), samples...)
+		sort.Slice(cp, func(i, j int) bool { return cp[i] < cp[j] })
+		idx := int(float64(len(cp)-1) * 0.95)
+		p95 = float64(cp[idx])
+	}
+	var avgPass, avgBlock float64
+	if c := s.passCount.Load(); c > 0 {
+		avgPass = float64(s.passSumUs.Load()) / float64(c) / 1000.0
+	}
+	if c := s.blockCount.Load(); c > 0 {
+		avgBlock = float64(s.blockSumUs.Load()) / float64(c) / 1000.0
+	}
+
+	// Type breakdown
+	typeMap := map[string]uint64{}
+	s.typeCounts.Range(func(k, v any) bool {
+		typeMap[k.(string)] = v.(*atomic.Uint64).Load()
+		return true
+	})
+
+	// Top domains
+	type kv struct {
+		d DomainStat
+	}
+	var topHit, topBlk []DomainStat
+	s.domainHits.Range(func(k, v any) bool {
+		ds := v.(*domainStat)
+		h := ds.hits.Load()
+		b := ds.blocked.Load()
+		if h > 0 {
+			topHit = append(topHit, DomainStat{Domain: k.(string), Count: h})
+		}
+		if b > 0 {
+			topBlk = append(topBlk, DomainStat{Domain: k.(string), Count: b})
+		}
+		return true
+	})
+	sort.Slice(topHit, func(i, j int) bool { return topHit[i].Count > topHit[j].Count })
+	sort.Slice(topBlk, func(i, j int) bool { return topBlk[i].Count > topBlk[j].Count })
+	if len(topHit) > 10 {
+		topHit = topHit[:10]
+	}
+	if len(topBlk) > 10 {
+		topBlk = topBlk[:10]
+	}
+
+	// Sources
+	s.sourcesMu.RLock()
+	srcStatuses := make([]SourceStatus, 0, len(s.sources))
+	for _, u := range s.blocklistURLs {
+		st := s.sources[u]
+		if st == nil {
+			st = &srcState{}
+		}
+		ss := SourceStatus{
+			URL:         u,
+			DomainCount: st.domainCount,
+			TotalLoads:  st.totalLoads,
+			FailedLoads: st.failedLoads,
+			LastError:   st.lastError,
+		}
+		if !st.lastSuccess.IsZero() {
+			ss.LastSuccess = st.lastSuccess.UTC().Format(time.RFC3339)
+		}
+		srcStatuses = append(srcStatuses, ss)
+	}
+	s.sourcesMu.RUnlock()
+
+	// Runtime
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
+	var lastPauseMs float64
+	if m.NumGC > 0 {
+		lastPauseMs = float64(m.PauseNs[(m.NumGC+255)%256]) / 1e6
+	}
+
+	// Config
+	gogc := os.Getenv("GOGC")
+	if gogc == "" {
+		gogc = "100 (default)"
+	}
+	cfg := map[string]string{
+		"PORT":              env("PORT", "8080"),
+		"UPSTREAM_DOH":      s.getUpstream(),
+		"BLOCKLIST_URLS":    strings.Join(s.blocklistURLs, ", "),
+		"BLOCKLIST_REFRESH": s.refreshEvery.String(),
+		"BLOCKLIST":         os.Getenv("BLOCKLIST"),
+		"GOGC":              gogc,
+		"GOOS/GOARCH":       runtime.GOOS + "/" + runtime.GOARCH,
+		"GO_VERSION":        runtime.Version(),
+		"START_TIME":        s.startTime.UTC().Format(time.RFC3339),
+	}
 
 	st := statsResponse{
-		Ready:          s.ready.Load(),
-		BlockedDomains: blocked,
-		Sources:        s.blocklistURLs,
-		Upstream:       s.getUpstream(),
-		RefreshEvery:   s.refreshEvery.String(),
-		LastRefresh:    lr,
-		Uptime:         time.Since(s.startTime).Truncate(time.Second).String(),
-		TotalQueries:   bq + pq + eq,
-		TotalBlocked:   bq,
-		TotalPassed:    pq,
-		TotalErrors:    eq,
-		MemAllocMB:     float64(m.Alloc) / (1024 * 1024),
-		MemSysMB:       float64(m.Sys) / (1024 * 1024),
-		HeapMB:         float64(m.HeapAlloc) / (1024 * 1024),
-		NumGC:          m.NumGC,
-		Goroutines:     runtime.NumGoroutine(),
-		NumCPU:         runtime.NumCPU(),
-		CPUSeconds:     readCPUSeconds(),
-		Platform:       runtime.GOOS + "/" + runtime.GOARCH,
-		GoVersion:      runtime.Version(),
+		Ready:           s.ready.Load(),
+		BlockedDomains:  s.blockedCount(),
+		Sources:         s.blocklistURLs,
+		SourcesStatus:   srcStatuses,
+		Upstream:        s.getUpstream(),
+		RefreshEvery:    s.refreshEvery.String(),
+		LastRefresh:     lr,
+		Uptime:          time.Since(s.startTime).Truncate(time.Second).String(),
+		TotalQueries:    bq + pq + eq,
+		TotalBlocked:    bq,
+		TotalPassed:     pq,
+		TotalErrors:     eq,
+		QPS1s:           float64(last1s),
+		QPS60sAvg:       avg60,
+		QPSPeak:         s.qpsPeak.Load(),
+		AvgLatencyPass:  avgPass,
+		AvgLatencyBlock: avgBlock,
+		P95LatencyMs:    p95,
+		BytesIn:         s.bytesIn.Load(),
+		BytesOut:        s.bytesOut.Load(),
+		TypeBreakdown:   typeMap,
+		TopDomains:      topHit,
+		TopBlocked:      topBlk,
+		MemAllocMB:      float64(m.Alloc) / (1024 * 1024),
+		MemSysMB:        float64(m.Sys) / (1024 * 1024),
+		HeapMB:          float64(m.HeapAlloc) / (1024 * 1024),
+		NumGC:           m.NumGC,
+		Goroutines:      runtime.NumGoroutine(),
+		NumCPU:          runtime.NumCPU(),
+		CPUSeconds:      readCPUSeconds(),
+		Platform:        runtime.GOOS + "/" + runtime.GOARCH,
+		GoVersion:       runtime.Version(),
+		GCPauseTotalMs:  float64(m.PauseTotalNs) / 1e6,
+		GCPauseLastMs:   lastPauseMs,
+		GCNextTargetMB:  float64(m.NextGC) / (1024 * 1024),
+		Config:          cfg,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
@@ -564,7 +916,6 @@ func (s *server) handleLogDownload(w http.ResponseWriter, r *http.Request) {
 	typ := r.URL.Query().Get("type")
 	var body []byte
 	var filename, ctype string
-
 	switch typ {
 	case "query":
 		entries := applyLimit(r.URL.Query().Get("limit"), queryRing.Snapshot())
@@ -572,8 +923,7 @@ func (s *server) handleLogDownload(w http.ResponseWriter, r *http.Request) {
 		b.WriteString("time,domain,type,status,latency_ms\n")
 		for _, e := range entries {
 			b.WriteString(fmt.Sprintf("%s,%s,%s,%s,%d\n",
-				e.Time.UTC().Format(time.RFC3339),
-				csvEscape(e.Domain), e.Type, e.Status, e.LatencyMs))
+				e.Time.UTC().Format(time.RFC3339), csvEscape(e.Domain), e.Type, e.Status, e.LatencyMs))
 		}
 		body = []byte(b.String())
 		filename = "query-log-" + time.Now().UTC().Format("20060102-150405") + ".csv"
@@ -592,7 +942,6 @@ func (s *server) handleLogDownload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "type must be 'query' or 'system'", http.StatusBadRequest)
 		return
 	}
-
 	w.Header().Set("Content-Type", ctype)
 	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
@@ -650,7 +999,6 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 	hb := time.NewTicker(20 * time.Second)
 	defer hb.Stop()
-
 	for {
 		select {
 		case <-r.Context().Done():
@@ -678,7 +1026,6 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "resolver is still loading blocklist", http.StatusServiceUnavailable)
 		return
 	}
-
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		w.Header().Set("Allow", "GET, POST")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -708,17 +1055,21 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.bytesIn.Add(uint64(len(packet)))
+
 	msg := new(dns.Msg)
 	if err := msg.Unpack(packet); err != nil || len(msg.Question) == 0 {
 		http.Error(w, "malformed DNS message", http.StatusBadRequest)
 		return
 	}
-
 	qName := msg.Question[0].Name
 	qType := dns.TypeToString[msg.Question[0].Qtype]
 	if qType == "" {
 		qType = fmt.Sprintf("TYPE%d", msg.Question[0].Qtype)
 	}
+
+	s.qpsCur.Add(1)
+	s.bumpType(qType)
 
 	if s.isBlocked(qName) {
 		reply := new(dns.Msg)
@@ -731,7 +1082,11 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.totalBlocked.Add(1)
-		s.recordQuery(qName, qType, true, "blocked", time.Since(started))
+		s.bytesOut.Add(uint64(len(out)))
+		elapsed := time.Since(started)
+		s.recordLatency(elapsed, true)
+		s.bumpDomain(qName, true)
+		s.recordQuery(qName, qType, true, "blocked", elapsed)
 		writeDNS(w, out)
 		return
 	}
@@ -792,7 +1147,11 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.totalPassed.Add(1)
-	s.recordQuery(qName, qType, false, "ok", time.Since(started))
+	s.bytesOut.Add(uint64(len(out)))
+	elapsed := time.Since(started)
+	s.recordLatency(elapsed, false)
+	s.bumpDomain(qName, false)
+	s.recordQuery(qName, qType, false, "ok", elapsed)
 	writeDNS(w, out)
 }
 
@@ -805,6 +1164,53 @@ func (s *server) recordQuery(name, qtype string, blocked bool, status string, la
 		Status:    status,
 		LatencyMs: latency.Milliseconds(),
 	})
+}
+
+func (s *server) recordLatency(d time.Duration, blocked bool) {
+	us := d.Microseconds()
+	if blocked {
+		s.blockSumUs.Add(uint64(us))
+		s.blockCount.Add(1)
+	} else {
+		s.passSumUs.Add(uint64(us))
+		s.passCount.Add(1)
+	}
+	s.latMu.Lock()
+	if len(s.latSamples) >= latencySampleMax {
+		copy(s.latSamples, s.latSamples[1:])
+		s.latSamples[len(s.latSamples)-1] = d.Milliseconds()
+	} else {
+		s.latSamples = append(s.latSamples, d.Milliseconds())
+	}
+	s.latMu.Unlock()
+}
+
+func (s *server) bumpType(t string) {
+	v, _ := s.typeCounts.LoadOrStore(t, new(atomic.Uint64))
+	v.(*atomic.Uint64).Add(1)
+}
+
+func (s *server) bumpDomain(name string, blocked bool) {
+	name = normalizeDomain(name)
+	if name == "" {
+		return
+	}
+	v, ok := s.domainHits.Load(name)
+	if !ok {
+		if s.domainsSeen.Load() >= domainCap {
+			return
+		}
+		ns := &domainStat{}
+		v, ok = s.domainHits.LoadOrStore(name, ns)
+		if !ok {
+			s.domainsSeen.Add(1)
+		}
+	}
+	ds := v.(*domainStat)
+	ds.hits.Add(1)
+	if blocked {
+		ds.blocked.Add(1)
+	}
 }
 
 func writeDNS(w http.ResponseWriter, packet []byte) {
@@ -838,15 +1244,8 @@ func (s *server) blockedCount() int {
 
 // ─── Runtime stats — cross-platform ────────────────────────────────────────
 
-// readCPUSeconds trả về tổng CPU time (user + sys) của process, tính bằng giây.
-// Dùng runtime/metrics nên hoạt động trên MỌI nền tảng Go hỗ trợ:
-// Linux, macOS, Windows, FreeBSD, OpenBSD, NetBSD, DragonFly, Solaris, AIX.
-//
-// Trước đây đọc /proc/self/stat (chỉ có trên Linux) → trả 0 trên macOS/Windows.
 func readCPUSeconds() float64 {
-	samples := []metrics.Sample{
-		{Name: "/cpu/classes/total:cpu-seconds"},
-	}
+	samples := []metrics.Sample{{Name: "/cpu/classes/total:cpu-seconds"}}
 	metrics.Read(samples)
 	if samples[0].Value.Kind() == metrics.KindFloat64 {
 		return samples[0].Value.Float64()
@@ -893,13 +1292,31 @@ func (s *server) refreshBlocklists() bool {
 	successful := 0
 
 	for _, source := range s.blocklistURLs {
+		s.sourcesMu.Lock()
+		st := s.sources[source]
+		if st == nil {
+			st = &srcState{}
+			s.sources[source] = st
+		}
+		st.totalLoads++
+		s.sourcesMu.Unlock()
+
 		count, err := s.fetchBlocklist(source, next)
 		if err != nil {
+			s.sourcesMu.Lock()
+			st.lastError = err.Error()
+			st.failedLoads++
+			s.sourcesMu.Unlock()
 			dlog.Warnf("blocklist: %s: %v", source, err)
 			continue
 		}
 		if count > 0 {
 			successful++
+			s.sourcesMu.Lock()
+			st.lastSuccess = time.Now()
+			st.lastError = ""
+			st.domainCount = count
+			s.sourcesMu.Unlock()
 			dlog.Infof("blocklist: loaded %d domains from %s", count, source)
 		} else {
 			dlog.Warnf("blocklist: no domains parsed from %s; keeping other entries", source)
@@ -938,7 +1355,6 @@ func (s *server) fetchBlocklist(source string, dst map[string]struct{}) (int, er
 	if resp.StatusCode != http.StatusOK {
 		return 0, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBlocklistBytes+1))
 	if err != nil {
 		return 0, fmt.Errorf("read failed: %w", err)
@@ -946,7 +1362,6 @@ func (s *server) fetchBlocklist(source string, dst map[string]struct{}) (int, er
 	if len(data) > maxBlocklistBytes {
 		return 0, fmt.Errorf("response exceeds %d bytes", maxBlocklistBytes)
 	}
-
 	return addListToSet(dst, string(data)), nil
 }
 
@@ -1028,12 +1443,8 @@ func parseURLs(raw string) []string {
 func parseBlocklist(raw string) map[string]struct{} {
 	out := map[string]struct{}{}
 	defaults := []string{
-		"doubleclick.net",
-		"googlesyndication.com",
-		"googleadservices.com",
-		"adnxs.com",
-		"adservice.google.com",
-		"tracking.example.invalid",
+		"doubleclick.net", "googlesyndication.com", "googleadservices.com",
+		"adnxs.com", "adservice.google.com", "tracking.example.invalid",
 	}
 	for _, d := range defaults {
 		out[normalizeDomain(d)] = struct{}{}
@@ -1077,3 +1488,5 @@ func env(key, fallback string) string {
 	}
 	return fallback
 }
+
+var _ = debug.SetGCPercent // giữ import runtime/debug (có thể dùng mở rộng sau)
