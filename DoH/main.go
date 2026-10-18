@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -25,22 +26,282 @@ const (
 	dohMediaType       = "application/dns-message"
 	maxBlocklistBytes  = 10 << 20
 	defaultRefreshTime = 6 * time.Hour
+	dashboardHTML      = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Go DoH Resolver</title>
+<style>
+:root{--bg:#0d1117;--panel:#161b22;--border:#30363d;--fg:#c9d1d9;--muted:#8b949e;--accent:#58a6ff;--ok:#3fb950;--warn:#d29922;--err:#f85149}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;font-size:14px;line-height:1.5;padding:16px}
+h1{font-size:20px;margin-bottom:4px;display:flex;align-items:center;gap:10px}
+.sub{color:var(--muted);font-size:13px;margin-bottom:16px;font-family:ui-monospace,monospace}
+.sub a{color:var(--accent);text-decoration:none}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin-bottom:16px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:12px}
+.card .label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+.card .value{font-size:22px;font-weight:600;margin-top:4px;font-family:ui-monospace,monospace}
+.panels{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media(max-width:900px){.panels{grid-template-columns:1fr}}
+.panel{background:var(--panel);border:1px solid var(--border);border-radius:6px;overflow:hidden;display:flex;flex-direction:column;height:62vh}
+.panel-head{padding:8px 12px;border-bottom:1px solid var(--border);font-weight:600;font-size:13px;display:flex;justify-content:space-between;align-items:center;background:var(--panel)}
+.panel-body{overflow-y:auto;flex:1}
+table{width:100%;border-collapse:collapse;font-family:ui-monospace,monospace;font-size:12px}
+th{text-align:left;padding:6px 12px;color:var(--muted);font-weight:500;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--panel);font-size:11px;text-transform:uppercase;letter-spacing:.5px;z-index:1}
+td{padding:4px 12px;border-bottom:1px solid rgba(48,54,61,.5);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:280px}
+tr.blocked td{color:var(--err)}
+tr.ok td{color:var(--ok)}
+tr.err td{color:var(--warn)}
+.badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600}
+.badge.ready{background:rgba(63,185,80,.15);color:var(--ok)}
+.badge.loading{background:rgba(210,153,34,.15);color:var(--warn)}
+.badge.blocked{background:rgba(248,81,73,.15);color:var(--err)}
+.badge.ok{background:rgba(63,185,80,.15);color:var(--ok)}
+.badge.err{background:rgba(210,153,34,.15);color:var(--warn)}
+.badge.upstream_error{background:rgba(210,153,34,.15);color:var(--warn)}
+.badge.info{background:rgba(88,166,255,.15);color:var(--accent)}
+.badge.warn{background:rgba(210,153,34,.15);color:var(--warn)}
+.badge.error{background:rgba(248,81,73,.15);color:var(--err)}
+.conn{font-size:11px}
+.conn.on{color:var(--ok)}
+.conn.off{color:var(--err)}
+</style>
+</head>
+<body>
+<h1>Go DoH Resolver <span id="status" class="badge loading">LOADING</span></h1>
+<div class="sub">
+Endpoint: <a href="/dns-query">/dns-query</a>
+· <span id="conn" class="conn off">● disconnected</span>
+· Last refresh: <span id="last-refresh">never</span>
+· <span id="sources-line">no remote sources</span>
+</div>
+
+<div class="stats">
+  <div class="card"><div class="label">Blocked domains</div><div class="value" id="st-blocked">-</div></div>
+  <div class="card"><div class="label">Total queries</div><div class="value" id="st-total">-</div></div>
+  <div class="card"><div class="label">Blocked</div><div class="value" id="st-bq" style="color:var(--err)">-</div></div>
+  <div class="card"><div class="label">Passed</div><div class="value" id="st-pq" style="color:var(--ok)">-</div></div>
+  <div class="card"><div class="label">Errors</div><div class="value" id="st-eq" style="color:var(--warn)">-</div></div>
+  <div class="card"><div class="label">Uptime</div><div class="value" id="st-uptime" style="font-size:16px">-</div></div>
+</div>
+
+<div class="panels">
+  <div class="panel">
+    <div class="panel-head">
+      <span>Query log (realtime)</span>
+      <span style="font-size:11px;color:var(--muted)">events: <span id="qcount">0</span></span>
+    </div>
+    <div class="panel-body">
+      <table><thead><tr><th>Time</th><th>Domain</th><th>Type</th><th>Status</th><th>Latency</th></tr></thead>
+      <tbody id="qbody"></tbody></table>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="panel-head">
+      <span>System log (incl. blocklist downloads)</span>
+      <span style="font-size:11px;color:var(--muted)">events: <span id="lcount">0</span></span>
+    </div>
+    <div class="panel-body">
+      <table><thead><tr><th>Time</th><th>Level</th><th>Message</th></tr></thead>
+      <tbody id="lbody"></tbody></table>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  var qbody=document.getElementById('qbody'),lbody=document.getElementById('lbody');
+  var conn=document.getElementById('conn'),statusEl=document.getElementById('status');
+  var qcount=0,lcount=0,MAX=200;
+
+  function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+  function fmtTime(iso){try{return new Date(iso).toLocaleTimeString();}catch(e){return iso;}}
+
+  function addQuery(q){
+    var tr=document.createElement('tr');
+    tr.className=q.status==='blocked'?'blocked':(q.status==='ok'?'ok':'err');
+    var cls=q.status==='blocked'?'blocked':(q.status==='ok'?'ok':'err');
+    tr.innerHTML='<td>'+esc(fmtTime(q.time))+'</td><td>'+esc(q.domain)+'</td><td>'+esc(q.type||'A')+'</td><td><span class="badge '+cls+'">'+esc(q.status)+'</span></td><td>'+esc(q.latency_ms)+'ms</td>';
+    qbody.insertBefore(tr,qbody.firstChild);
+    while(qbody.children.length>MAX)qbody.removeChild(qbody.lastChild);
+    qcount++;document.getElementById('qcount').textContent=qcount;
+  }
+  function addLog(l){
+    var tr=document.createElement('tr');
+    var cls=l.level==='error'?'error':(l.level==='warn'?'warn':'info');
+    tr.innerHTML='<td>'+esc(fmtTime(l.time))+'</td><td><span class="badge '+cls+'">'+esc(l.level)+'</span></td><td style="white-space:normal">'+esc(l.message)+'</td>';
+    lbody.insertBefore(tr,lbody.firstChild);
+    while(lbody.children.length>MAX)lbody.removeChild(lbody.lastChild);
+    lcount++;document.getElementById('lcount').textContent=lcount;
+  }
+
+  function refreshStats(){
+    fetch('/api/stats').then(function(r){return r.json();}).then(function(s){
+      document.getElementById('st-blocked').textContent=s.blocked_domains;
+      document.getElementById('st-total').textContent=s.total_queries;
+      document.getElementById('st-bq').textContent=s.total_blocked;
+      document.getElementById('st-pq').textContent=s.total_passed;
+      document.getElementById('st-eq').textContent=s.total_errors;
+      document.getElementById('st-uptime').textContent=s.uptime;
+      document.getElementById('last-refresh').textContent=s.last_refresh?s.last_refresh.replace('T',' ').split('.')[0]+' UTC':'never';
+      statusEl.textContent=s.ready?'READY':'LOADING';
+      statusEl.className='badge '+(s.ready?'ready':'loading');
+      if(s.sources&&s.sources.length)document.getElementById('sources-line').textContent=s.sources.length+' source(s)';
+      else document.getElementById('sources-line').textContent='no remote sources';
+    }).catch(function(){});
+  }
+
+  function connect(){
+    var es=new EventSource('/events');
+    es.onopen=function(){conn.textContent='● connected';conn.className='conn on';};
+    es.onerror=function(){conn.textContent='● reconnecting...';conn.className='conn off';};
+    es.addEventListener('query',function(e){try{addQuery(JSON.parse(e.data));}catch(err){}});
+    es.addEventListener('log',function(e){try{addLog(JSON.parse(e.data));}catch(err){}});
+  }
+
+  refreshStats();
+  setInterval(refreshStats,3000);
+  connect();
+})();
+</script>
+</body>
+</html>`
 )
+
+// ─── Data types ────────────────────────────────────────────────────────────
+
+type LogEntry struct {
+	Time    time.Time `json:"time"`
+	Level   string    `json:"level"`
+	Message string    `json:"message"`
+}
+
+type QueryEntry struct {
+	Time      time.Time `json:"time"`
+	Domain    string    `json:"domain"`
+	Type      string    `json:"type"`
+	Blocked   bool      `json:"blocked"`
+	Status    string    `json:"status"`
+	LatencyMs int64     `json:"latency_ms"`
+}
+
+type statsResponse struct {
+	Ready          bool     `json:"ready"`
+	BlockedDomains int      `json:"blocked_domains"`
+	Sources        []string `json:"sources"`
+	RefreshEvery   string   `json:"refresh_every"`
+	LastRefresh    string   `json:"last_refresh"`
+	Uptime         string   `json:"uptime"`
+	TotalQueries   uint64   `json:"total_queries"`
+	TotalBlocked   uint64   `json:"total_blocked"`
+	TotalPassed    uint64   `json:"total_passed"`
+	TotalErrors    uint64   `json:"total_errors"`
+}
+
+// ─── Ring buffer + realtime subscribers ────────────────────────────────────
+
+type ringBuffer[T any] struct {
+	mu   sync.Mutex
+	buf  []T
+	head int
+	max  int
+	subs []chan T
+}
+
+func newRing[T any](max int) *ringBuffer[T] { return &ringBuffer[T]{buf: make([]T, 0, max), max: max} }
+
+func (r *ringBuffer[T]) Add(v T) {
+	r.mu.Lock()
+	if len(r.buf) < r.max {
+		r.buf = append(r.buf, v)
+	} else {
+		r.buf[r.head] = v
+		r.head = (r.head + 1) % r.max
+	}
+	subs := append([]chan T(nil), r.subs...)
+	r.mu.Unlock()
+	for _, ch := range subs {
+		select {
+		case ch <- v:
+		default:
+		}
+	}
+}
+
+func (r *ringBuffer[T]) Snapshot() []T {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]T, 0, len(r.buf))
+	if len(r.buf) < r.max {
+		out = append(out, r.buf...)
+	} else {
+		out = append(out, r.buf[r.head:]...)
+		out = append(out, r.buf[:r.head]...)
+	}
+	return out
+}
+
+func (r *ringBuffer[T]) Subscribe(ch chan T) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.subs = append(r.subs, ch)
+}
+
+func (r *ringBuffer[T]) Unsubscribe(ch chan T) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i, s := range r.subs {
+		if s == ch {
+			r.subs = append(r.subs[:i], r.subs[i+1:]...)
+			return
+		}
+	}
+}
+
+// ─── Logging (stdout + ring for dashboard) ─────────────────────────────────
+
+var (
+	logRing   = newRing[LogEntry](300)
+	queryRing = newRing[QueryEntry](500)
+	dlog      = &dashLogger{ring: logRing, base: log.New(os.Stdout, "", log.LstdFlags)}
+)
+
+type dashLogger struct {
+	ring *ringBuffer[LogEntry]
+	base *log.Logger
+}
+
+func (l *dashLogger) Infof(format string, args ...any)  { l.emit("info", format, args...) }
+func (l *dashLogger) Warnf(format string, args ...any)  { l.emit("warn", format, args...) }
+func (l *dashLogger) Errorf(format string, args ...any) { l.emit("error", format, args...) }
+func (l *dashLogger) emit(level, format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	l.base.Printf(msg)
+	l.ring.Add(LogEntry{Time: time.Now(), Level: level, Message: msg})
+}
+
+// ─── Server ────────────────────────────────────────────────────────────────
 
 type server struct {
 	upstreamURL string
-	client      *http.Client // cho DNS query (timeout ngắn)
-	blockClient *http.Client // cho tải blocklist (timeout dài)
+	client      *http.Client
+	blockClient *http.Client
 
 	blockMu sync.RWMutex
 	blocked map[string]struct{}
 
 	blocklistURLs []string
 	refreshEvery  time.Duration
+	ready         atomic.Bool
+	lastRefresh   atomic.Int64
 
-	// ready = true khi blocklist remote đã tải xong lần đầu.
-	// /dns-query trả 503 cho đến lúc đó.
-	ready atomic.Bool
+	totalBlocked atomic.Uint64
+	totalPassed  atomic.Uint64
+	totalErrors  atomic.Uint64
+
+	startTime time.Time
 }
 
 func main() {
@@ -62,46 +323,43 @@ func main() {
 		blocked:       parseBlocklist(os.Getenv("BLOCKLIST")),
 		blocklistURLs: parseURLs(os.Getenv("BLOCKLIST_URLS")),
 		refreshEvery:  refreshEvery,
+		startTime:     time.Now(),
 	}
 
-	// 1) Tải blocklist trong nền. /dns-query trả 503 cho đến khi xong.
 	if len(s.blocklistURLs) > 0 {
 		go func() {
-			s.initialLoad() // block tới khi tải xong (retry với backoff)
-			s.refreshLoop() // sau đó refresh định kỳ
+			s.initialLoad()
+			s.refreshLoop()
 		}()
 	} else {
 		s.ready.Store(true)
 	}
 
-	// 2) HTTP server bật ngay → /health trả 200 → Render không kill.
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleRoot)
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/dns-query", s.handleDoH)
+	mux.HandleFunc("/events", s.handleEvents)
+	mux.HandleFunc("/api/stats", s.handleAPIStats)
 
 	addr := ":" + port
-	log.Printf("HTTP listening on %s; upstream=%s; remote sources=%d; refresh=%s",
+	dlog.Infof("HTTP listening on %s; upstream=%s; remote sources=%d; refresh=%s",
 		addr, upstream, len(s.blocklistURLs), s.refreshEvery)
 	log.Fatal(http.ListenAndServe(addr, securityHeaders(mux)))
 }
+
+// ─── Handlers ──────────────────────────────────────────────────────────────
 
 func (s *server) handleRoot(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
 		return
 	}
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	status := "loading"
-	if s.ready.Load() {
-		status = "ready"
-	}
-	fmt.Fprintf(w, "Go DoH resolver\nEndpoint: /dns-query\nHealth: /health\nStatus: %s\nBlocked: %d\n",
-		status, s.blockedCount())
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	_, _ = io.WriteString(w, dashboardHTML)
 }
 
-// /health LUÔN trả 200 khi HTTP đã lên — Render dựa vào đây để coi deploy là healthy.
-// Nếu trả non-200 trong lúc tải blocklist, Render sẽ kill service → đây chính là bug cũ.
 func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
@@ -112,8 +370,87 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *server) handleAPIStats(w http.ResponseWriter, r *http.Request) {
+	blocked := s.blockedCount()
+	bq := s.totalBlocked.Load()
+	pq := s.totalPassed.Load()
+	eq := s.totalErrors.Load()
+	var lr string
+	if t := s.lastRefresh.Load(); t > 0 {
+		lr = time.Unix(t, 0).UTC().Format(time.RFC3339)
+	}
+	st := statsResponse{
+		Ready:          s.ready.Load(),
+		BlockedDomains: blocked,
+		Sources:        s.blocklistURLs,
+		RefreshEvery:   s.refreshEvery.String(),
+		LastRefresh:    lr,
+		Uptime:         time.Since(s.startTime).Truncate(time.Second).String(),
+		TotalQueries:   bq + pq + eq,
+		TotalBlocked:   bq,
+		TotalPassed:    pq,
+		TotalErrors:    eq,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(st)
+}
+
+func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+
+	// Replay history so dashboard shows state on first connect.
+	for _, e := range logRing.Snapshot() {
+		data, _ := json.Marshal(e)
+		fmt.Fprintf(w, "event: log\ndata: %s\n\n", data)
+	}
+	for _, e := range queryRing.Snapshot() {
+		data, _ := json.Marshal(e)
+		fmt.Fprintf(w, "event: query\ndata: %s\n\n", data)
+	}
+	flusher.Flush()
+
+	logCh := make(chan LogEntry, 64)
+	queryCh := make(chan QueryEntry, 64)
+	logRing.Subscribe(logCh)
+	queryRing.Subscribe(queryCh)
+	defer logRing.Unsubscribe(logCh)
+	defer queryRing.Unsubscribe(queryCh)
+
+	hb := time.NewTicker(20 * time.Second)
+	defer hb.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case e := <-logCh:
+			data, _ := json.Marshal(e)
+			fmt.Fprintf(w, "event: log\ndata: %s\n\n", data)
+			flusher.Flush()
+		case e := <-queryCh:
+			data, _ := json.Marshal(e)
+			fmt.Fprintf(w, "event: query\ndata: %s\n\n", data)
+			flusher.Flush()
+		case <-hb.C:
+			fmt.Fprint(w, ": ping\n\n")
+			flusher.Flush()
+		}
+	}
+}
+
 func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
-	// Chưa tải xong blocklist → từ chối phục vụ DNS.
+	started := time.Now()
+
 	if !s.ready.Load() {
 		w.Header().Set("Retry-After", "10")
 		http.Error(w, "resolver is still loading blocklist", http.StatusServiceUnavailable)
@@ -143,9 +480,6 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		packet, err = io.ReadAll(http.MaxBytesReader(w, r.Body, 65535))
-	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
 	}
 	if err != nil || len(packet) < 12 || len(packet) > 65535 {
 		http.Error(w, "invalid DNS message", http.StatusBadRequest)
@@ -158,7 +492,13 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.isBlocked(msg.Question[0].Name) {
+	qName := msg.Question[0].Name
+	qType := dns.TypeToString[msg.Question[0].Qtype]
+	if qType == "" {
+		qType = fmt.Sprintf("TYPE%d", msg.Question[0].Qtype)
+	}
+
+	if s.isBlocked(qName) {
 		reply := new(dns.Msg)
 		reply.SetReply(msg)
 		reply.Authoritative = true
@@ -168,6 +508,8 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "could not encode DNS response", http.StatusInternalServerError)
 			return
 		}
+		s.totalBlocked.Add(1)
+		s.recordQuery(qName, qType, true, "blocked", time.Since(started))
 		writeDNS(w, out)
 		return
 	}
@@ -175,6 +517,9 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.upstreamURL, bytes.NewReader(packet))
 	if err != nil {
+		s.totalErrors.Add(1)
+		s.recordQuery(qName, qType, false, "upstream_error", time.Since(started))
+		dlog.Errorf("upstream: request create failed: %v", err)
 		http.Error(w, "could not create upstream request", http.StatusInternalServerError)
 		return
 	}
@@ -183,31 +528,60 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := s.client.Do(req)
 	if err != nil {
+		s.totalErrors.Add(1)
+		s.recordQuery(qName, qType, false, "upstream_error", time.Since(started))
+		dlog.Warnf("upstream: %v (domain=%s)", err, qName)
 		http.Error(w, "DNS upstream unavailable", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		s.totalErrors.Add(1)
+		s.recordQuery(qName, qType, false, "upstream_error", time.Since(started))
+		dlog.Warnf("upstream: HTTP %d (domain=%s body=%q)", resp.StatusCode, qName, body)
 		http.Error(w, fmt.Sprintf("DNS upstream returned HTTP %d", resp.StatusCode), http.StatusBadGateway)
 		return
 	}
 	respCT := strings.ToLower(strings.TrimSpace(strings.Split(resp.Header.Get("Content-Type"), ";")[0]))
 	if respCT != dohMediaType {
+		s.totalErrors.Add(1)
+		s.recordQuery(qName, qType, false, "upstream_error", time.Since(started))
+		dlog.Warnf("upstream: unexpected content type %q (domain=%s)", resp.Header.Get("Content-Type"), qName)
 		http.Error(w, "DNS upstream returned an unexpected content type", http.StatusBadGateway)
 		return
 	}
 	out, err := io.ReadAll(io.LimitReader(resp.Body, 65536))
 	if err != nil || len(out) < 12 || len(out) > 65535 {
+		s.totalErrors.Add(1)
+		s.recordQuery(qName, qType, false, "upstream_error", time.Since(started))
+		dlog.Warnf("upstream: invalid body len=%d err=%v (domain=%s)", len(out), err, qName)
 		http.Error(w, "invalid DNS response from upstream", http.StatusBadGateway)
 		return
 	}
 	check := new(dns.Msg)
 	if err := check.Unpack(out); err != nil || !check.Response {
+		s.totalErrors.Add(1)
+		s.recordQuery(qName, qType, false, "upstream_error", time.Since(started))
+		dlog.Warnf("upstream: unpack failed err=%v (domain=%s)", err, qName)
 		http.Error(w, "malformed DNS response from upstream", http.StatusBadGateway)
 		return
 	}
+	s.totalPassed.Add(1)
+	s.recordQuery(qName, qType, false, "ok", time.Since(started))
 	writeDNS(w, out)
+}
+
+func (s *server) recordQuery(name, qtype string, blocked bool, status string, latency time.Duration) {
+	queryRing.Add(QueryEntry{
+		Time:      time.Now(),
+		Domain:    normalizeDomain(name),
+		Type:      qtype,
+		Blocked:   blocked,
+		Status:    status,
+		LatencyMs: latency.Milliseconds(),
+	})
 }
 
 func writeDNS(w http.ResponseWriter, packet []byte) {
@@ -239,17 +613,17 @@ func (s *server) blockedCount() int {
 	return len(s.blocked)
 }
 
-// initialLoad chạy trong nền: retry với exponential backoff cho đến khi ít nhất
-// một URL HTTPS tải thành công. Xong mới set ready=true để mở /dns-query.
+// ─── Blocklist lifecycle ───────────────────────────────────────────────────
+
 func (s *server) initialLoad() {
 	backoff := 2 * time.Second
 	for {
 		if s.refreshBlocklists() {
 			s.ready.Store(true)
-			log.Printf("blocklist: initial load complete; active blocked domains=%d", s.blockedCount())
+			dlog.Infof("blocklist: initial load complete; active blocked domains=%d", s.blockedCount())
 			return
 		}
-		log.Printf("blocklist: initial load failed; retrying in %s", backoff)
+		dlog.Warnf("blocklist: initial load failed; retrying in %s", backoff)
 		time.Sleep(backoff)
 		if backoff < 2*time.Minute {
 			backoff *= 2
@@ -257,7 +631,6 @@ func (s *server) initialLoad() {
 	}
 }
 
-// refreshLoop chỉ chạy sau khi initialLoad thành công.
 func (s *server) refreshLoop() {
 	backoff := time.Minute
 	for {
@@ -265,7 +638,7 @@ func (s *server) refreshLoop() {
 			backoff = time.Minute
 			time.Sleep(s.refreshEvery)
 		} else {
-			log.Printf("blocklist: refresh failed; retrying in %s", backoff)
+			dlog.Warnf("blocklist: refresh failed; retrying in %s", backoff)
 			time.Sleep(backoff)
 			if backoff < 30*time.Minute {
 				backoff *= 2
@@ -274,8 +647,6 @@ func (s *server) refreshLoop() {
 	}
 }
 
-// refreshBlocklists trả true nếu có ít nhất một nguồn remote tải thành công
-// (hoặc không có URL nào được cấu hình). Không đụng s.blocked nếu fail.
 func (s *server) refreshBlocklists() bool {
 	next := parseBlocklist(os.Getenv("BLOCKLIST"))
 	successful := 0
@@ -283,30 +654,30 @@ func (s *server) refreshBlocklists() bool {
 	for _, source := range s.blocklistURLs {
 		count, err := s.fetchBlocklist(source, next)
 		if err != nil {
-			log.Printf("blocklist: %s: %v", source, err)
+			dlog.Warnf("blocklist: %s: %v", source, err)
 			continue
 		}
 		if count > 0 {
 			successful++
-			log.Printf("blocklist: loaded %d domains from %s", count, source)
+			dlog.Infof("blocklist: loaded %d domains from %s", count, source)
 		} else {
-			log.Printf("blocklist: no domains parsed from %s; keeping other entries", source)
+			dlog.Warnf("blocklist: no domains parsed from %s; keeping other entries", source)
 		}
 	}
 
 	if successful == 0 && len(s.blocklistURLs) > 0 {
-		log.Printf("blocklist: no remote source loaded successfully; keeping current list")
+		dlog.Warnf("blocklist: no remote source loaded successfully; keeping current list")
 		return false
 	}
 
 	s.blockMu.Lock()
 	s.blocked = next
 	s.blockMu.Unlock()
-	log.Printf("blocklist: active blocked domains=%d", len(next))
+	s.lastRefresh.Store(time.Now().Unix())
+	dlog.Infof("blocklist: active blocked domains=%d", len(next))
 	return true
 }
 
-// fetchBlocklist tải một nguồn và thêm domain vào dst. Trả về số domain parse được.
 func (s *server) fetchBlocklist(source string, dst map[string]struct{}) (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -338,8 +709,8 @@ func (s *server) fetchBlocklist(source string, dst map[string]struct{}) (int, er
 	return addListToSet(dst, string(data)), nil
 }
 
-// addListToSet đếm TẤT CẢ domain parse được (không phải chỉ domain mới),
-// để một nguồn trùng với defaults không bị coi là "no domains parsed".
+// ─── Parsing helpers ───────────────────────────────────────────────────────
+
 func addListToSet(dst map[string]struct{}, raw string) int {
 	count := 0
 	scanner := bufio.NewScanner(strings.NewReader(raw))
@@ -356,9 +727,6 @@ func addListToSet(dst map[string]struct{}, raw string) int {
 		if len(fields) == 0 {
 			continue
 		}
-
-		// Hỗ trợ hosts file (0.0.0.0 domain), danh sách domain thuần,
-		// và dòng Adblock kiểu ||domain^.
 		if net.ParseIP(fields[0]) != nil {
 			fields = fields[1:]
 		}
@@ -405,7 +773,7 @@ func parseURLs(raw string) []string {
 		u := strings.TrimSpace(strings.Trim(part, `"'`))
 		parsed, err := url.Parse(u)
 		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil {
-			log.Printf("blocklist: ignoring invalid/non-HTTPS URL %q", u)
+			dlog.Warnf("blocklist: ignoring invalid/non-HTTPS URL %q", u)
 			continue
 		}
 		if _, ok := seen[u]; !ok {
