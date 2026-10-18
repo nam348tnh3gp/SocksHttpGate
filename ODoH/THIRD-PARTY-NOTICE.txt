@@ -1,0 +1,7 @@
+This package is a launcher and documentation only. It fetches third-party source at runtime:
+- https://github.com/cloudflare/odoh-server-go
+- https://github.com/cloudflare/odoh-client-go
+
+The server reference implementation is archived/legacy and has a publicly reported SSRF concern. Do not deploy it publicly or use it for real DNS traffic.
+
+Review the upstream repositories and licenses before use. No third-party source is bundled here.
