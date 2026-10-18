@@ -19,11 +19,12 @@
 ![SOCKS5](https://img.shields.io/badge/SOCKS5-Proxy-2563EB?style=for-the-badge)
 ![HTTP Proxy](https://img.shields.io/badge/HTTP-Proxy-0EA5E9?style=for-the-badge)
 ![DNS over HTTPS](https://img.shields.io/badge/DNS-over_HTTPS-16A34A?style=for-the-badge)
+![DNS over TLS](https://img.shields.io/badge/DNS-over_TLS-0F766E?style=for-the-badge)
 ![GitHub](https://img.shields.io/badge/Hosted_on-GitHub-181717?style=for-the-badge&logo=github&logoColor=white)
 
 SocksHttpGate is a multi-language proxy suite with implementations in Python, Go, C, JavaScript, Java, Kotlin, Ruby, and Elixir. The implementations provide SOCKS5 and HTTP proxy functionality, with additional capabilities such as authentication, connection statistics, access rules, upstream proxies, and a management dashboard depending on the implementation and its configuration.
 
-The repository also contains a **separate Go-based DNS-over-HTTPS (DoH) resolver**. The proxy programs do not automatically send their DNS lookups through this DoH service; their DNS behavior depends on each implementation and the host runtime/system configuration.
+The repository also contains separate Go-based DNS resolvers: **DNS-over-HTTPS (DoH)** in `DoH/` and **DNS-over-TLS (DoT)** in `DoT/`. DoT can be used with Android Private DNS when deployed on a host that supports inbound TCP port 853 and has a valid TLS certificate. The proxy programs do not automatically send their DNS lookups through this DoH service; their DNS behavior depends on each implementation and the host runtime/system configuration.
 
 > **Compatibility note:** The language ports are separate programs, and their options, dependencies, and feature parity can differ. Check the relevant source directory before deploying.
 
@@ -40,6 +41,7 @@ The repository also contains a **separate Go-based DNS-over-HTTPS (DoH) resolver
 | `RubycodeBeta/proxy.rb` | Ruby proxy |
 | `ElixircodeBeta/proxy.exs` | Elixir proxy |
 | `DoH/main.go` | Standalone Go DoH resolver |
+| `DoT/main.go` | Standalone Go DoT resolver for Android Private DNS |
 
 ## Features
 
@@ -52,6 +54,7 @@ Features vary by language port, but the suite includes implementations with the 
 - **Access controls** — allow/deny address rules and connection limits in supported implementations.
 - **Operational safeguards** — connection timeouts, cleanup, and authentication-failure handling where implemented.
 - **Standalone DoH resolver** — DNS-over-HTTPS endpoint, statistics, query/system logs, and configurable upstream DoH URL.
+- **Standalone DoT resolver** — DNS-over-TLS over TCP 853, upstream TLS verification, and domain blocklist support for Android Private DNS.
 - **Multiple runtimes** — choose the implementation that best matches your operating system and installed toolchain.
 
 ## Requirements
@@ -69,6 +72,7 @@ Install the runtime and build tools for the implementation you plan to use.
 | Ruby | Ruby compatible with the source |
 | Elixir | Elixir and Erlang/OTP compatible with the source |
 | DoH | Go toolchain and the dependencies declared by the DoH module |
+| DoT | Go 1.23+, the dependencies declared in `DoT/go.mod`, and a valid TLS certificate/key |
 
 The examples below use the Python implementation. Other ports may use different flags and build commands; consult their source files and any accompanying project files.
 
@@ -146,6 +150,12 @@ The service provides these routes in the current implementation:
 The DNS endpoint supports standard DoH request formats implemented by the service. For exact request headers, methods, environment variables, and deployment commands, refer to `DoH/main.go` and the files in `DoH/`.
 
 **Important:** changing the DoH upstream through the runtime endpoint is documented by the service as a runtime-only change; it resets when the process restarts unless separately configured in the deployment environment.
+
+## Standalone DNS-over-TLS (DoT)
+
+The Go DoT resolver in `DoT/` is independent of the DoH service and the proxy implementations. It listens on TCP port 853 by default, verifies TLS certificates for its upstream resolver, and can return NXDOMAIN for domains configured in `BLOCKLIST`. Set `TLS_CERT_FILE`, `TLS_KEY_FILE`, `UPSTREAM_DOT`, and `UPSTREAM_TLS_NAME` as documented in [`DoT/README.md`](DoT/README.md).
+
+**Deployment requirement:** the host must allow inbound TCP port 853 and serve a valid certificate for the hostname entered in Android Private DNS. Render Web Services do not normally expose arbitrary raw TCP port 853, so use a VPS or a platform that explicitly supports TCP ingress. Do not commit production private keys to the repository.
 
 ## Configuration
 
