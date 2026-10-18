@@ -20,6 +20,7 @@ Standalone DNS-over-TLS forwarder for Android Private DNS. This service is separ
 | `UPSTREAM_DOT` | `1.1.1.1:853` | Upstream DoT host and port |
 | `UPSTREAM_TLS_NAME` | `cloudflare-dns.com` | TLS hostname used to verify the upstream |
 | `BLOCKLIST` | built-in entries | Extra domains separated by commas, spaces, semicolons, or newlines |
+| `DASHBOARD_ADDR` | `127.0.0.1:8080` | Local web dashboard listen address |
 
 The upstream TLS hostname must match the provider configured in `UPSTREAM_DOT`. For another provider, change both values accordingly. Do not disable TLS verification.
 
@@ -39,6 +40,12 @@ go run .
 ```
 
 Install Go 1.23 or newer and run `go mod download` first if needed. The certificate and private key must be readable by the service account. Never commit private keys or production certificates to Git.
+
+## Web dashboard
+
+The dashboard starts alongside the DNS listener at `http://127.0.0.1:8080` by default. It displays live query counters, uptime, upstream/listener details, recent DNS logs, and lets you add/remove blocklist domains at runtime. The blocklist changes are in-memory only and reset when the process restarts. JSON endpoints are `/api/stats`, `/api/logs`, and `/api/blocklist` (GET; POST to `/api/blocklist` with `{"action":"add","domain":"ads.example"}` or `{"action":"remove","domain":"ads.example"}`).
+
+**Security:** the dashboard API has no authentication, so keep `DASHBOARD_ADDR` on `127.0.0.1` unless you place it behind a trusted authenticated reverse proxy. Do not expose it to the public internet.
 
 ## Docker
 

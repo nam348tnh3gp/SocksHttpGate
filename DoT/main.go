@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/miekg/dns"
@@ -21,6 +22,12 @@ type resolver struct {
 	upstream string
 	blocked  map[string]struct{}
 	client   *dns.Client
+
+	// Dashboard state is shared between the DNS handler and HTTP handlers.
+	stateMu sync.RWMutex
+	started  time.Time
+	stats    dashboardStats
+	logs     []queryLogEntry
 }
 
 func main() {
@@ -29,6 +36,7 @@ func main() {
 	keyFile := env("TLS_KEY_FILE", "key.pem")
 	upstream := env("UPSTREAM_DOT", defaultUpstream)
 	serverName := env("UPSTREAM_TLS_NAME", defaultTLSName)
+	dashboardAddr := env("DASHBOARD_ADDR", "127.0.0.1:8080")
 
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
@@ -38,6 +46,7 @@ func main() {
 	r := &resolver{
 		upstream: upstream,
 		blocked:  parseBlocklist(os.Getenv("BLOCKLIST")),
+		started:  time.Now(),
 		client: &dns.Client{
 			Net:     "tcp-tls",
 			Timeout: 5 * time.Second,
@@ -48,6 +57,7 @@ func main() {
 		},
 	}
 
+	go r.serveDashboard(dashboardAddr, listenAddr, upstream)
 	mux := dns.NewServeMux()
 	mux.HandleFunc(".", r.handleDNS)
 
@@ -60,8 +70,7 @@ func main() {
 		WriteTimeout: 10 * time.Second,
 	}
 
-	log.Printf("DoT listening on %s; upstream=%s; blocked_domains=%d",
-		listenAddr, upstream, len(r.blocked))
+	log.Printf("DoT listening on %s; upstream=%s; blocked_domains=%d", listenAddr, upstream, len(r.blocked))
 	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("DoT server stopped: %v", err)
 	}
@@ -86,13 +95,16 @@ func (r *resolver) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 	if qtype == "" {
 		qtype = "UNKNOWN"
 	}
+	clientAddr := w.RemoteAddr().String()
+	r.incrementQuery()
 
 	if r.isBlocked(name) {
 		reply := new(dns.Msg)
 		reply.SetReply(req)
 		reply.Authoritative = true
 		reply.Rcode = dns.RcodeNameError
-		log.Printf("BLOCK domain=%s type=%s client=%s", name, qtype, w.RemoteAddr())
+		r.recordLog(queryLogEntry{Time: time.Now(), Domain: name, Type: qtype, Client: clientAddr, RCode: dns.RcodeToString[dns.RcodeNameError], Action: "BLOCK"})
+		log.Printf("BLOCK domain=%s type=%s client=%s", name, qtype, clientAddr)
 		if err := w.WriteMsg(reply); err != nil {
 			log.Printf("write blocked response: %v", err)
 		}
@@ -101,6 +113,8 @@ func (r *resolver) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 
 	response, _, err := r.client.Exchange(req, r.upstream)
 	if err != nil || response == nil {
+		r.incrementError()
+		r.recordLog(queryLogEntry{Time: time.Now(), Domain: name, Type: qtype, Client: clientAddr, RCode: dns.RcodeToString[dns.RcodeServerFailure], Action: "ERROR"})
 		log.Printf("upstream failure domain=%s upstream=%s err=%v", name, r.upstream, err)
 		reply := new(dns.Msg)
 		reply.SetRcode(req, dns.RcodeServerFailure)
@@ -110,8 +124,8 @@ func (r *resolver) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 
-	log.Printf("QUERY domain=%s type=%s client=%s rcode=%s",
-		name, qtype, w.RemoteAddr(), dns.RcodeToString[response.Rcode])
+	r.recordLog(queryLogEntry{Time: time.Now(), Domain: name, Type: qtype, Client: clientAddr, RCode: dns.RcodeToString[response.Rcode], Action: "QUERY"})
+	log.Printf("QUERY domain=%s type=%s client=%s rcode=%s", name, qtype, clientAddr, dns.RcodeToString[response.Rcode])
 	if err := w.WriteMsg(response); err != nil {
 		log.Printf("write DNS response: %v", err)
 	}
@@ -122,6 +136,8 @@ func (r *resolver) isBlocked(name string) bool {
 	if name == "" {
 		return false
 	}
+	r.stateMu.RLock()
+	defer r.stateMu.RUnlock()
 	for domain := range r.blocked {
 		if name == domain || strings.HasSuffix(name, "."+domain) {
 			return true
@@ -145,10 +161,7 @@ func parseBlocklist(raw string) map[string]struct{} {
 		return c == ',' || c == ';' || c == '\n' || c == '\r' || c == ' ' || c == '\t'
 	}) {
 		domain := normalizeDomain(item)
-		if domain == "" || net.ParseIP(domain) != nil || strings.ContainsAny(domain, "/:*") {
-			continue
-		}
-		if _, ok := dns.IsDomainName(domain + "."); !ok {
+		if !validBlockDomain(domain) {
 			continue
 		}
 		blocked[domain] = struct{}{}
@@ -161,6 +174,14 @@ func normalizeDomain(domain string) string {
 	domain = strings.TrimSuffix(domain, ".")
 	domain = strings.TrimPrefix(domain, "*.")
 	return domain
+}
+
+func validBlockDomain(domain string) bool {
+	if domain == "" || net.ParseIP(domain) != nil || strings.ContainsAny(domain, "/:*") {
+		return false
+	}
+	_, ok := dns.IsDomainName(domain + ".")
+	return ok
 }
 
 func env(key, fallback string) string {

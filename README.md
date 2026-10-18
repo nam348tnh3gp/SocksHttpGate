@@ -42,6 +42,7 @@ The repository also contains separate Go-based DNS resolvers: **DNS-over-HTTPS (
 | `ElixircodeBeta/proxy.exs` | Elixir proxy |
 | `DoH/main.go` | Standalone Go DoH resolver |
 | `DoT/main.go` | Standalone Go DoT resolver for Android Private DNS |
+| `DoT/dashboard.go` | Local DoT web dashboard and runtime blocklist API |
 
 ## Features
 
@@ -153,7 +154,7 @@ The DNS endpoint supports standard DoH request formats implemented by the servic
 
 ## Standalone DNS-over-TLS (DoT)
 
-The Go DoT resolver in `DoT/` is independent of the DoH service and the proxy implementations. It listens on TCP port 853 by default, verifies TLS certificates for its upstream resolver, and can return NXDOMAIN for domains configured in `BLOCKLIST`. Set `TLS_CERT_FILE`, `TLS_KEY_FILE`, `UPSTREAM_DOT`, and `UPSTREAM_TLS_NAME` as documented in [`DoT/README.md`](DoT/README.md).
+The Go DoT resolver in `DoT/` is independent of the DoH service and the proxy implementations. It listens on TCP port 853 by default, verifies TLS certificates for its upstream resolver, and can return NXDOMAIN for domains configured in `BLOCKLIST`. A local web dashboard on `127.0.0.1:8080` provides live stats, query logs, and runtime blocklist management. Set `TLS_CERT_FILE`, `TLS_KEY_FILE`, `UPSTREAM_DOT`, `UPSTREAM_TLS_NAME`, and `DASHBOARD_ADDR` as documented in [`DoT/README.md`](DoT/README.md).
 
 **Deployment requirement:** the host must allow inbound TCP port 853 and serve a valid certificate for the hostname entered in Android Private DNS. Render Web Services do not normally expose arbitrary raw TCP port 853, so use a VPS or a platform that explicitly supports TCP ingress. Do not commit production private keys to the repository.
 
