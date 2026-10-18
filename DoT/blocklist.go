@@ -128,7 +128,8 @@ func addListToSet(dst map[string]struct{}, raw string) int {
 		for _, field := range fields {
 			domain := normalizeListEntry(field)
 			if domain == "" || !validBlockDomain(domain) { continue }
-			if _, exists := dst[domain]; !exists { dst[domain] = struct{}{}; count++ }
+			if _, exists := dst[domain]; !exists { dst[domain] = struct{}{} }
+			count++
 		}
 	}
 	return count

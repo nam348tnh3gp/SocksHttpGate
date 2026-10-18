@@ -84,7 +84,7 @@ func main() {
 		WriteTimeout: 10 * time.Second,
 	}
 
-	log.Printf("DoT listening on %s; upstream=%s; blocked_domains=%d", listenAddr, upstream, len(r.blocked))
+	log.Printf("DoT listening on %s; upstream=%s; blocked_domains=%d", listenAddr, upstream, r.blockedCount())
 	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("DoT server stopped: %v", err)
 	}
