@@ -104,6 +104,7 @@ tr.err td{color:var(--warn)}
 .bar-track{background:#21262d;border-radius:3px;height:16px;overflow:hidden;position:relative;min-width:0}
 .bar-fill{background:linear-gradient(90deg,#388bfd,#58a6ff);height:100%;border-radius:3px}
 .bar-fill.blk{background:linear-gradient(90deg,#a13b3b,#f85149)}
+.panel[style*="height:auto"]{height:auto;max-height:none}
 @media(max-width:600px){
   body{padding:10px}
   h1{font-size:15px}
@@ -153,6 +154,37 @@ Endpoint: <a href="/dns-query">/dns-query</a>
   <div class="card"><div class="label">Avg block</div><div class="value" id="st-latb" style="color:var(--err)">-</div></div>
   <div class="card"><div class="label">p95 latency</div><div class="value" id="st-p95">-</div></div>
   <div class="card"><div class="label">Bytes in / out</div><div class="value" id="st-bytes">-</div></div>
+</div>
+
+<h2>Response codes &amp; errors</h2>
+<div class="panels">
+  <div class="panel" style="height:auto"><div class="panel-head"><span>Response codes</span></div>
+    <div class="card" style="margin:0;border:none;border-radius:0"><div class="bars" id="resp-bars"><span style="color:var(--muted)">no data</span></div></div>
+  </div>
+  <div class="panel" style="height:auto"><div class="panel-head"><span>Error reasons</span></div>
+    <div class="card" style="margin:0;border:none;border-radius:0"><div class="bars" id="err-bars"><span style="color:var(--muted)">no data</span></div></div>
+  </div>
+</div>
+
+<h2>Upstream health</h2>
+<div class="stats">
+  <div class="card"><div class="label">Last OK</div><div class="value" id="up-lastok" style="font-size:13px">-</div></div>
+  <div class="card"><div class="label">Last error</div><div class="value" id="up-lasterr" style="font-size:13px">-</div></div>
+  <div class="card"><div class="label">Consecutive fails</div><div class="value" id="up-consec">-</div></div>
+  <div class="card"><div class="label">OK / Fail</div><div class="value" id="up-count" style="font-size:13px">-</div></div>
+  <div class="card"><div class="label">Upstream avg</div><div class="value" id="up-avg" style="font-size:16px">-</div></div>
+  <div class="card"><div class="label">Upstream p95</div><div class="value" id="up-p95" style="font-size:16px">-</div></div>
+  <div class="card"><div class="label">Last error msg</div><div class="value" id="up-errmsg" style="font-size:11px;word-break:break-all">-</div></div>
+</div>
+
+<h2>Traffic analysis</h2>
+<div class="panels">
+  <div class="panel" style="height:auto"><div class="panel-head"><span>Top 10 clients</span></div>
+    <div class="card" style="margin:0;border:none;border-radius:0"><div class="bars" id="cli-bars"><span style="color:var(--muted)">no data</span></div></div>
+  </div>
+  <div class="panel" style="height:auto"><div class="panel-head"><span>QPS history (60 min)</span><span id="qps-sizes" style="font-size:11px;color:var(--muted)">+0 / -0</span></div>
+    <div class="card" style="margin:0;border:none;border-radius:0"><div id="qps-hist" style="display:flex;gap:1px;align-items:flex-end;height:90px;min-height:90px"><span style="color:var(--muted)">no data</span></div></div>
+  </div>
 </div>
 
 <h2>Query types</h2>
@@ -292,6 +324,36 @@ Endpoint: <a href="/dns-query">/dns-query</a>
     });
   }
 
+  function renderKVBar(elId, arr){
+    var el=document.getElementById(elId);el.innerHTML='';
+    if(!arr||!arr.length){el.innerHTML='<span style="color:var(--muted)">no data</span>';return;}
+    var max=arr[0].count||1;
+    arr.forEach(function(kv){
+      var row=document.createElement('div');row.className='bar-row';
+      var pct=(kv.count/max*100).toFixed(0);
+      row.innerHTML='<span title="'+esc(kv.name)+'">'+esc(kv.name)+'</span>'
+        +'<div class="bar-track"><div class="bar-fill" style="width:'+pct+'%"></div></div>'
+        +'<span>'+kv.count+'</span>';
+      el.appendChild(row);
+    });
+  }
+
+  function renderQPSHistory(arr){
+    var el=document.getElementById('qps-hist');el.innerHTML='';
+    if(!arr||!arr.length){el.innerHTML='<span style="color:var(--muted)">no data</span>';return;}
+    var max=0;
+    arr.forEach(function(v){if(v>max)max=v;});
+    if(max===0)max=1;
+    arr.forEach(function(v,i){
+      var pct=v/max*100;
+      var bar=document.createElement('div');
+      var color=v>0?'linear-gradient(180deg,#58a6ff,#388bfd)':'#21262d';
+      bar.style.cssText='flex:1;background:'+color+';border-radius:1px 1px 0 0;min-width:2px;height:'+Math.max(pct,2)+'%';
+      bar.title=(59-i)+'m ago: '+v+' queries';
+      el.appendChild(bar);
+    });
+  }
+
   function renderConfig(cfg){
     var el=document.getElementById('cfg-grid');el.innerHTML='';
     if(!cfg)return;
@@ -331,6 +393,19 @@ Endpoint: <a href="/dns-query">/dns-query</a>
       renderTop('top-hit', s.top_domains);
       renderTop('top-blk', s.top_blocked);
       renderSources(s.sources_status||[]);
+      renderKVBar('resp-bars', s.resp_codes||[]);
+      renderKVBar('err-bars', s.err_reasons||[]);
+      renderKVBar('cli-bars', s.top_clients||[]);
+      renderQPSHistory(s.qps_minute||[]);
+      var uh=s.upstream_health||{};
+      document.getElementById('up-lastok').textContent=uh.last_ok?fmtTimeUTC(uh.last_ok):'never';
+      document.getElementById('up-lasterr').textContent=uh.last_error?fmtTimeUTC(uh.last_error):'never';
+      document.getElementById('up-consec').textContent=uh.consecutive_fails||0;
+      document.getElementById('up-count').textContent=(uh.total_ok||0)+' / '+(uh.total_fail||0);
+      document.getElementById('up-avg').textContent=fmtMs(uh.avg_latency_ms);
+      document.getElementById('up-p95').textContent=fmtMs(uh.p95_latency_ms);
+      document.getElementById('up-errmsg').textContent=uh.last_error_msg||'—';
+      document.getElementById('qps-sizes').textContent='+'+s.size_added+' / -'+s.size_removed;
 
       document.getElementById('st-mem').textContent=(s.mem_alloc_mb||0).toFixed(2)+' MB';
       document.getElementById('st-heap').textContent=(s.heap_mb||0).toFixed(2)+' MB';
