@@ -67,6 +67,8 @@ tr.err td{color:var(--warn)}
 .conn{font-size:11px}
 .conn.on{color:var(--ok)}
 .conn.off{color:var(--err)}
+.dl-btn{display:inline-block;padding:2px 8px;border:1px solid var(--border);border-radius:4px;color:var(--accent);text-decoration:none;font-size:11px;font-weight:600;background:rgba(88,166,255,.08);transition:all .15s}
+.dl-btn:hover{background:rgba(88,166,255,.2);border-color:var(--accent)}
 </style>
 </head>
 <body>
@@ -91,7 +93,10 @@ Endpoint: <a href="/dns-query">/dns-query</a>
   <div class="panel">
     <div class="panel-head">
       <span>Query log (realtime)</span>
-      <span style="font-size:11px;color:var(--muted)">events: <span id="qcount">0</span></span>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span style="font-size:11px;color:var(--muted)">events: <span id="qcount">0</span></span>
+        <a href="/api/logs?type=query" download class="dl-btn">&#11015; CSV</a>
+      </div>
     </div>
     <div class="panel-body">
       <table><thead><tr><th>Time</th><th>Domain</th><th>Type</th><th>Status</th><th>Latency</th></tr></thead>
@@ -101,7 +106,10 @@ Endpoint: <a href="/dns-query">/dns-query</a>
   <div class="panel">
     <div class="panel-head">
       <span>System log (incl. blocklist downloads)</span>
-      <span style="font-size:11px;color:var(--muted)">events: <span id="lcount">0</span></span>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span style="font-size:11px;color:var(--muted)">events: <span id="lcount">0</span></span>
+        <a href="/api/logs?type=system" download class="dl-btn">&#11015; TXT</a>
+      </div>
     </div>
     <div class="panel-body">
       <table><thead><tr><th>Time</th><th>Level</th><th>Message</th></tr></thead>
@@ -341,6 +349,7 @@ func main() {
 	mux.HandleFunc("/dns-query", s.handleDoH)
 	mux.HandleFunc("/events", s.handleEvents)
 	mux.HandleFunc("/api/stats", s.handleAPIStats)
+	mux.HandleFunc("/api/logs", s.handleLogDownload)
 
 	addr := ":" + port
 	dlog.Infof("HTTP listening on %s; upstream=%s; remote sources=%d; refresh=%s",
@@ -394,6 +403,53 @@ func (s *server) handleAPIStats(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	_ = json.NewEncoder(w).Encode(st)
+}
+
+func (s *server) handleLogDownload(w http.ResponseWriter, r *http.Request) {
+	typ := r.URL.Query().Get("type")
+	var body []byte
+	var filename, ctype string
+
+	switch typ {
+	case "query":
+		entries := queryRing.Snapshot()
+		var b strings.Builder
+		b.WriteString("time,domain,type,status,latency_ms\n")
+		for _, e := range entries {
+			b.WriteString(fmt.Sprintf("%s,%s,%s,%s,%d\n",
+				e.Time.UTC().Format(time.RFC3339),
+				csvEscape(e.Domain), e.Type, e.Status, e.LatencyMs))
+		}
+		body = []byte(b.String())
+		filename = "query-log-" + time.Now().UTC().Format("20060102-150405") + ".csv"
+		ctype = "text/csv; charset=utf-8"
+	case "system":
+		entries := logRing.Snapshot()
+		var b strings.Builder
+		for _, e := range entries {
+			b.WriteString(fmt.Sprintf("%s [%s] %s\n",
+				e.Time.UTC().Format(time.RFC3339), e.Level, e.Message))
+		}
+		body = []byte(b.String())
+		filename = "system-log-" + time.Now().UTC().Format("20060102-150405") + ".txt"
+		ctype = "text/plain; charset=utf-8"
+	default:
+		http.Error(w, "type must be 'query' or 'system'", http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", ctype)
+	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
+
+func csvEscape(s string) string {
+	if strings.ContainsAny(s, ",\"\n\r") {
+		return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+	}
+	return s
 }
 
 func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
