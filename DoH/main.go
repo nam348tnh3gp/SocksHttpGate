@@ -401,6 +401,22 @@ type DomainStat struct {
 	Count  uint64 `json:"count"`
 }
 
+type KV struct {
+	Name  string `json:"name"`
+	Count uint64 `json:"count"`
+}
+
+type UpstreamHealth struct {
+	LastOK       string  `json:"last_ok"`
+	LastError    string  `json:"last_error"`
+	LastErrorMsg string  `json:"last_error_msg"`
+	ConsecFails  uint64  `json:"consecutive_fails"`
+	TotalOK      uint64  `json:"total_ok"`
+	TotalFail    uint64  `json:"total_fail"`
+	AvgLatencyMs float64 `json:"avg_latency_ms"`
+	P95LatencyMs float64 `json:"p95_latency_ms"`
+}
+
 type SourceStatus struct {
 	URL         string `json:"url"`
 	LastSuccess string `json:"last_success,omitempty"`
@@ -451,6 +467,14 @@ type statsResponse struct {
 	GCNextTargetMB float64 `json:"gc_next_target_mb"`
 	// Config
 	Config map[string]string `json:"config"`
+	// Extended
+	RespCodes    []KV           `json:"resp_codes"`
+	ErrReasons   []KV           `json:"err_reasons"`
+	TopClients   []KV           `json:"top_clients"`
+	UpstreamHlth UpstreamHealth `json:"upstream_health"`
+	QPSMinute    []uint64       `json:"qps_minute"`
+	SizeAdded    int64          `json:"size_added"`
+	SizeRemoved  int64          `json:"size_removed"`
 }
 
 // ─── Ring buffer + realtime subscribers ────────────────────────────────────
@@ -588,6 +612,35 @@ type server struct {
 	sourcesMu sync.RWMutex
 	sources   map[string]*srcState
 
+	// Extended
+	respMu    sync.Mutex
+	respCodes map[string]uint64
+
+	errMu      sync.Mutex
+	errReasons map[string]uint64
+
+	cliMu   sync.Mutex
+	clients map[string]uint64
+
+	upMu          sync.Mutex
+	upLastOK      time.Time
+	upLastErr     time.Time
+	upLastErrMsg  string
+	upConsecFails uint64
+	upTotalOK     uint64
+	upTotalFail   uint64
+	upSumUs       uint64
+	upLatSamples  []int64
+
+	qpsMinuteRing [60]uint64
+	qpsMinuteIdx  int
+	qpsMinuteAcc  uint64
+	qpsMinuteCnt  int
+
+	lastSize    atomic.Int64
+	sizeAdded   atomic.Int64
+	sizeRemoved atomic.Int64
+
 	startTime time.Time
 }
 
@@ -609,6 +662,93 @@ func (s *server) setUpstream(u string) {
 	s.upstreamMu.Lock()
 	s.upstreamURL = u
 	s.upstreamMu.Unlock()
+}
+
+func (s *server) bumpResp(code string) {
+	s.respMu.Lock()
+	s.respCodes[code]++
+	s.respMu.Unlock()
+}
+
+func (s *server) bumpErrReason(reason string) {
+	s.errMu.Lock()
+	s.errReasons[reason]++
+	s.errMu.Unlock()
+}
+
+func (s *server) bumpClient(ip string) {
+	if ip == "" {
+		return
+	}
+	s.cliMu.Lock()
+	s.clients[ip]++
+	s.cliMu.Unlock()
+}
+
+func (s *server) recordUpstreamOK(latency time.Duration) {
+	s.upMu.Lock()
+	s.upLastOK = time.Now()
+	s.upTotalOK++
+	s.upConsecFails = 0
+	us := latency.Microseconds()
+	s.upSumUs += uint64(us)
+	if len(s.upLatSamples) >= 500 {
+		copy(s.upLatSamples, s.upLatSamples[1:])
+		s.upLatSamples[len(s.upLatSamples)-1] = latency.Milliseconds()
+	} else {
+		s.upLatSamples = append(s.upLatSamples, latency.Milliseconds())
+	}
+	s.upMu.Unlock()
+}
+
+func (s *server) recordUpstreamFail(reason string) {
+	s.upMu.Lock()
+	s.upLastErr = time.Now()
+	s.upLastErrMsg = reason
+	s.upTotalFail++
+	s.upConsecFails++
+	s.upMu.Unlock()
+}
+
+func classifyUpstreamErr(err error, statusCode int) string {
+	if err != nil {
+		msg := strings.ToLower(err.Error())
+		switch {
+		case strings.Contains(msg, "deadline exceeded") || strings.Contains(msg, "timeout"):
+			return "timeout"
+		case strings.Contains(msg, "connection refused"):
+			return "conn_refused"
+		case strings.Contains(msg, "no such host") || strings.Contains(msg, "server misbehaving"):
+			return "dns_lookup"
+		case strings.Contains(msg, "tls") || strings.Contains(msg, "certificate"):
+			return "tls"
+		case strings.Contains(msg, "connection reset"):
+			return "conn_reset"
+		case strings.Contains(msg, "eof"):
+			return "eof"
+		}
+		return "network"
+	}
+	if statusCode > 0 {
+		return fmt.Sprintf("http_%d", statusCode)
+	}
+	return "unknown"
+}
+
+func clientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if i := strings.Index(xff, ","); i > 0 {
+			return strings.TrimSpace(xff[:i])
+		}
+		return strings.TrimSpace(xff)
+	}
+	if xr := r.Header.Get("X-Real-IP"); xr != "" {
+		return strings.TrimSpace(xr)
+	}
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	return r.RemoteAddr
 }
 
 func main() {
@@ -635,6 +775,9 @@ func main() {
 	for _, u := range s.blocklistURLs {
 		s.sources[u] = &srcState{}
 	}
+	s.respCodes = map[string]uint64{}
+	s.errReasons = map[string]uint64{}
+	s.clients = map[string]uint64{}
 
 	go s.qpsLoop()
 
@@ -679,6 +822,14 @@ func (s *server) qpsLoop() {
 		s.qpsMu.Lock()
 		s.qpsWindow[s.qpsIdx] = cur
 		s.qpsIdx = (s.qpsIdx + 1) % qpsWindowSec
+		s.qpsMinuteAcc += cur
+		s.qpsMinuteCnt++
+		if s.qpsMinuteCnt >= 60 {
+			s.qpsMinuteRing[s.qpsMinuteIdx] = s.qpsMinuteAcc
+			s.qpsMinuteIdx = (s.qpsMinuteIdx + 1) % 60
+			s.qpsMinuteAcc = 0
+			s.qpsMinuteCnt = 0
+		}
 		s.qpsMu.Unlock()
 	}
 }
@@ -804,6 +955,66 @@ func (s *server) handleAPIStats(w http.ResponseWriter, r *http.Request) {
 		lastPauseMs = float64(m.PauseNs[(m.NumGC+255)%256]) / 1e6
 	}
 
+	// Extended: response codes
+	s.respMu.Lock()
+	rcList := make([]KV, 0, len(s.respCodes))
+	for k, v := range s.respCodes {
+		rcList = append(rcList, KV{Name: k, Count: v})
+	}
+	s.respMu.Unlock()
+	sort.Slice(rcList, func(i, j int) bool { return rcList[i].Count > rcList[j].Count })
+
+	// Extended: error reasons
+	s.errMu.Lock()
+	erList := make([]KV, 0, len(s.errReasons))
+	for k, v := range s.errReasons {
+		erList = append(erList, KV{Name: k, Count: v})
+	}
+	s.errMu.Unlock()
+	sort.Slice(erList, func(i, j int) bool { return erList[i].Count > erList[j].Count })
+
+	// Extended: top clients
+	s.cliMu.Lock()
+	cliList := make([]KV, 0, len(s.clients))
+	for k, v := range s.clients {
+		cliList = append(cliList, KV{Name: k, Count: v})
+	}
+	s.cliMu.Unlock()
+	sort.Slice(cliList, func(i, j int) bool { return cliList[i].Count > cliList[j].Count })
+	if len(cliList) > 10 {
+		cliList = cliList[:10]
+	}
+
+	// Extended: upstream health
+	s.upMu.Lock()
+	upHealth := UpstreamHealth{
+		TotalOK:      s.upTotalOK,
+		TotalFail:    s.upTotalFail,
+		ConsecFails:  s.upConsecFails,
+		LastErrorMsg: s.upLastErrMsg,
+	}
+	if !s.upLastOK.IsZero() {
+		upHealth.LastOK = s.upLastOK.UTC().Format(time.RFC3339)
+	}
+	if !s.upLastErr.IsZero() {
+		upHealth.LastError = s.upLastErr.UTC().Format(time.RFC3339)
+	}
+	if n := uint64(len(s.upLatSamples)); n > 0 {
+		upHealth.AvgLatencyMs = float64(s.upSumUs) / float64(n) / 1000.0
+		cp := append([]int64(nil), s.upLatSamples...)
+		sort.Slice(cp, func(i, j int) bool { return cp[i] < cp[j] })
+		upHealth.P95LatencyMs = float64(cp[int(float64(len(cp)-1)*0.95)])
+	}
+	s.upMu.Unlock()
+
+	// Extended: QPS per minute
+	s.qpsMu.Lock()
+	qpsMinute := make([]uint64, 60)
+	for i := 0; i < 60; i++ {
+		qpsMinute[i] = s.qpsMinuteRing[(s.qpsMinuteIdx+i)%60]
+	}
+	s.qpsMu.Unlock()
+
 	// Config
 	gogc := os.Getenv("GOGC")
 	if gogc == "" {
@@ -858,6 +1069,13 @@ func (s *server) handleAPIStats(w http.ResponseWriter, r *http.Request) {
 		GCPauseLastMs:   lastPauseMs,
 		GCNextTargetMB:  float64(m.NextGC) / (1024 * 1024),
 		Config:          cfg,
+		RespCodes:       rcList,
+		ErrReasons:      erList,
+		TopClients:      cliList,
+		UpstreamHlth:    upHealth,
+		QPSMinute:       qpsMinute,
+		SizeAdded:       s.sizeAdded.Load(),
+		SizeRemoved:     s.sizeRemoved.Load(),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
@@ -1092,6 +1310,8 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		}
 		s.totalBlocked.Add(1)
 		s.bytesOut.Add(uint64(len(out)))
+		s.bumpResp("NXDOMAIN")
+		s.bumpClient(clientIP(r))
 		elapsed := time.Since(started)
 		s.recordLatency(elapsed, true)
 		s.bumpDomain(qName, true)
@@ -1101,6 +1321,7 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 	}
 
 	upstream := s.getUpstream()
+	upstreamStart := time.Now()
 	ctx := r.Context()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, upstream, bytes.NewReader(packet))
 	if err != nil {
@@ -1118,6 +1339,11 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		s.totalErrors.Add(1)
 		s.recordQuery(qName, qType, false, "upstream_error", time.Since(started))
 		dlog.Warnf("upstream: %v (domain=%s upstream=%s)", err, qName, upstream)
+		reason := classifyUpstreamErr(err, 0)
+		s.bumpErrReason(reason)
+		s.bumpResp("UPSTREAM_FAIL")
+		s.bumpClient(clientIP(r))
+		s.recordUpstreamFail(reason + ": " + err.Error())
 		http.Error(w, "DNS upstream unavailable", http.StatusBadGateway)
 		return
 	}
@@ -1128,6 +1354,11 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		s.totalErrors.Add(1)
 		s.recordQuery(qName, qType, false, "upstream_error", time.Since(started))
 		dlog.Warnf("upstream: HTTP %d (domain=%s body=%q)", resp.StatusCode, qName, body)
+		reason := classifyUpstreamErr(nil, resp.StatusCode)
+		s.bumpErrReason(reason)
+		s.bumpResp("UPSTREAM_FAIL")
+		s.bumpClient(clientIP(r))
+		s.recordUpstreamFail(reason)
 		http.Error(w, fmt.Sprintf("DNS upstream returned HTTP %d", resp.StatusCode), http.StatusBadGateway)
 		return
 	}
@@ -1136,6 +1367,10 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		s.totalErrors.Add(1)
 		s.recordQuery(qName, qType, false, "upstream_error", time.Since(started))
 		dlog.Warnf("upstream: unexpected content type %q (domain=%s)", resp.Header.Get("Content-Type"), qName)
+		s.bumpErrReason("content_type")
+		s.bumpResp("UPSTREAM_FAIL")
+		s.bumpClient(clientIP(r))
+		s.recordUpstreamFail("content_type: " + resp.Header.Get("Content-Type"))
 		http.Error(w, "DNS upstream returned an unexpected content type", http.StatusBadGateway)
 		return
 	}
@@ -1144,6 +1379,10 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		s.totalErrors.Add(1)
 		s.recordQuery(qName, qType, false, "upstream_error", time.Since(started))
 		dlog.Warnf("upstream: invalid body len=%d err=%v (domain=%s)", len(out), err, qName)
+		s.bumpErrReason("invalid_body")
+		s.bumpResp("UPSTREAM_FAIL")
+		s.bumpClient(clientIP(r))
+		s.recordUpstreamFail("invalid_body")
 		http.Error(w, "invalid DNS response from upstream", http.StatusBadGateway)
 		return
 	}
@@ -1152,11 +1391,18 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		s.totalErrors.Add(1)
 		s.recordQuery(qName, qType, false, "upstream_error", time.Since(started))
 		dlog.Warnf("upstream: unpack failed err=%v (domain=%s)", err, qName)
+		s.bumpErrReason("unpack")
+		s.bumpResp("UPSTREAM_FAIL")
+		s.bumpClient(clientIP(r))
+		s.recordUpstreamFail("unpack")
 		http.Error(w, "malformed DNS response from upstream", http.StatusBadGateway)
 		return
 	}
 	s.totalPassed.Add(1)
 	s.bytesOut.Add(uint64(len(out)))
+	s.bumpResp(dns.RcodeToString[check.Rcode])
+	s.bumpClient(clientIP(r))
+	s.recordUpstreamOK(time.Since(upstreamStart))
 	elapsed := time.Since(started)
 	s.recordLatency(elapsed, false)
 	s.bumpDomain(qName, false)
@@ -1338,8 +1584,18 @@ func (s *server) refreshBlocklists() bool {
 	}
 
 	s.blockMu.Lock()
+	prevSize := int64(len(s.blocked))
 	s.blocked = next
+	newSize := int64(len(next))
 	s.blockMu.Unlock()
+	if prevSize > 0 && newSize != prevSize {
+		if d := newSize - prevSize; d > 0 {
+			s.sizeAdded.Add(d)
+		} else {
+			s.sizeRemoved.Add(-d)
+		}
+	}
+	s.lastSize.Store(newSize)
 	s.lastRefresh.Store(time.Now().Unix())
 	dlog.Infof("blocklist: active blocked domains=%d", len(next))
 	// Trả bộ nhớ về OS sau refresh — tránh peak memory khi parse list lớn.
