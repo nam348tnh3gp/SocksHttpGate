@@ -186,35 +186,195 @@ func writeJSON(w http.ResponseWriter, value any) {
 }
 
 const dashboardHTML = `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark">
 <title>SocksHttpGate DoT Dashboard</title>
 <style>
-:root{color-scheme:dark;--bg:#0b1020;--panel:#121a2e;--line:#25334d;--muted:#91a2c0;--text:#e8efff;--accent:#56d6c2;--red:#ff7185}
-*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at top,#142744,var(--bg) 60%);font:15px system-ui,sans-serif;color:var(--text)}
-main{max-width:1100px;margin:auto;padding:24px 16px 48px}.head{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap}h1{font-size:clamp(24px,5vw,36px);margin:0}h1 span{color:var(--accent)}p{color:var(--muted)}.pill{border:1px solid #28675f;color:var(--accent);border-radius:99px;padding:7px 12px;font-size:12px}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:24px 0}.card,.panel{background:rgba(18,26,46,.94);border:1px solid var(--line);border-radius:16px;padding:18px}.label{color:var(--muted);font-size:13px}.num{font-size:30px;font-weight:750;margin-top:8px;overflow-wrap:anywhere}.grid{display:grid;grid-template-columns:1.3fr 1fr;gap:14px}.panel h2{font-size:17px;margin:0 0 14px}.meta{display:grid;gap:9px;color:var(--muted);font-size:13px}.meta b{color:var(--text);overflow-wrap:anywhere}.logs{overflow:auto;max-height:420px}table{width:100%;border-collapse:collapse;font-size:12px;white-space:nowrap}th,td{text-align:left;padding:10px 8px;border-bottom:1px solid var(--line)}th{color:var(--muted);font-weight:600}.tag{padding:3px 7px;border-radius:7px;background:#1b3446;color:var(--accent)}.tag.BLOCK,.tag.ERROR{color:var(--red);background:#3a2235}form{display:flex;gap:8px;margin-bottom:12px}input{min-width:0;flex:1;background:#0b1325;color:var(--text);border:1px solid var(--line);border-radius:9px;padding:11px}button{background:var(--accent);color:#07151c;border:0;border-radius:9px;padding:10px 13px;font-weight:700;cursor:pointer}button.remove{background:#3a2235;color:#ff9baa}.domains{display:flex;gap:7px;flex-wrap:wrap}.domain{display:flex;align-items:center;gap:8px;background:#1a263c;border:1px solid var(--line);border-radius:9px;padding:6px 8px;font-size:12px;overflow-wrap:anywhere}.domain button{font-size:11px;padding:4px 6px}.foot{margin-top:20px;color:var(--muted);font-size:12px}@media(max-width:760px){.grid{grid-template-columns:1fr}.num{font-size:26px}}
-</style></head><body><main>
-<div class="head"><div><h1>SocksHttpGate <span>DoT</span></h1><p>DNS-over-TLS resolver control panel</p></div><div class="pill">● LIVE · refresh 3s</div></div>
-<div class="cards">
-<div class="card"><div class="label">Total queries</div><div class="num" id="queries">0</div></div>
-<div class="card"><div class="label">Blocked</div><div class="num" id="blocked">0</div></div>
-<div class="card"><div class="label">Upstream errors</div><div class="num" id="errors">0</div></div>
-<div class="card"><div class="label">Uptime</div><div class="num" id="uptime">0s</div></div>
+:root{--bg:#0d1117;--panel:#161b22;--border:#30363d;--fg:#c9d1d9;--muted:#8b949e;--accent:#58a6ff;--ok:#3fb950;--warn:#d29922;--err:#f85149;--pad:clamp(8px,2vw,16px);--gap:clamp(6px,1vw,12px);--radius:8px}
+*{box-sizing:border-box;margin:0;padding:0;min-width:0}
+html{overflow-x:hidden;max-width:100%}
+body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;font-size:clamp(12px,1.6vw,14px);line-height:1.5;padding:var(--pad);overflow-x:hidden;max-width:100%}
+main{width:100%;max-width:1500px;margin:0 auto}
+h1{font-size:clamp(16px,2.5vw,22px);display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+h1 .brand{color:var(--accent)}
+h2{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;margin:16px 0 7px;font-weight:700}
+p,.muted{color:var(--muted)}
+.header{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:5px}
+.subtitle{font-size:clamp(11px,1.4vw,13px);color:var(--muted);overflow-wrap:anywhere}
+.status{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border:1px solid var(--border);border-radius:999px;font-size:11px;white-space:nowrap}
+.status.on{color:var(--ok);border-color:rgba(63,185,80,.4)}.status.off{color:var(--err);border-color:rgba(248,81,73,.4)}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,130px),1fr));gap:var(--gap)}
+.card,.panel{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);min-width:0;overflow:hidden}
+.card{padding:clamp(9px,1.3vw,14px)}
+.label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.45px;overflow-wrap:anywhere}
+.value{font-size:clamp(17px,2.5vw,23px);font-weight:700;margin-top:4px;font-family:ui-monospace,SFMono-Regular,monospace;line-height:1.25;overflow-wrap:anywhere;word-break:break-word}
+.layout{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,360px),1fr));gap:var(--gap)}
+.panel{display:flex;flex-direction:column}
+.panel-head{padding:9px 12px;border-bottom:1px solid var(--border);font-weight:650;display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.panel-body{padding:clamp(9px,1.3vw,14px);min-width:0}
+.meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,190px),1fr));gap:8px}
+.meta-item{background:#0d1117;border:1px solid var(--border);border-radius:6px;padding:8px 10px;min-width:0}
+.meta-item .key{color:var(--muted);font-size:11px;margin-bottom:3px}
+.meta-item .val{overflow-wrap:anywhere;word-break:break-word;font-family:ui-monospace,SFMono-Regular,monospace;font-size:12px}
+.form-row{display:flex;gap:8px;flex-wrap:wrap;width:100%;margin-top:8px}
+input,button{font:inherit}
+input{flex:1 1 180px;width:100%;min-width:0;background:#0d1117;border:1px solid var(--border);color:var(--fg);padding:9px 10px;border-radius:5px;outline:none}
+input:focus{border-color:var(--accent)}
+button{flex:0 0 auto;padding:9px 14px;border:1px solid transparent;border-radius:5px;background:var(--accent);color:#07111d;font-weight:700;cursor:pointer}
+button:hover{filter:brightness(1.08)}button:disabled{opacity:.55;cursor:wait}
+button.secondary{background:#21262d;border-color:var(--border);color:var(--fg)}
+button.danger{background:rgba(248,81,73,.13);border-color:rgba(248,81,73,.35);color:#ff8182}
+.message{margin-top:7px;font-size:11px;color:var(--muted);overflow-wrap:anywhere;word-break:break-word;min-height:16px}
+.table-wrap{width:100%;max-width:100%;overflow-x:auto;overscroll-behavior-x:contain;-webkit-overflow-scrolling:touch}
+table{width:100%;border-collapse:collapse;font-family:ui-monospace,SFMono-Regular,monospace;font-size:clamp(11px,1.3vw,12px)}
+th{text-align:left;padding:7px 9px;color:var(--muted);font-weight:600;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--panel);font-size:10px;text-transform:uppercase;letter-spacing:.4px;white-space:nowrap;z-index:1}
+td{padding:7px 9px;border-bottom:1px solid rgba(48,54,61,.55);white-space:nowrap;max-width:45vw;overflow:hidden;text-overflow:ellipsis}
+td.wrap{white-space:normal;overflow-wrap:anywhere;word-break:break-word;max-width:none}
+tr:last-child td{border-bottom:0}
+.logs{max-height:430px;overflow:auto;min-width:0;-webkit-overflow-scrolling:touch}
+.tag{display:inline-block;padding:2px 7px;border-radius:999px;font-size:10px;font-weight:700;white-space:nowrap;background:rgba(88,166,255,.13);color:var(--accent)}
+.tag.BLOCK,.tag.ERROR{background:rgba(248,81,73,.14);color:var(--err)}
+.tag.QUERY,.tag.NOERROR{background:rgba(63,185,80,.13);color:var(--ok)}
+.tag.SERVFAIL,.tag.NXDOMAIN{background:rgba(210,153,34,.13);color:var(--warn)}
+.domains{display:flex;gap:6px;flex-wrap:wrap;align-items:flex-start}
+.domain{display:flex;align-items:center;gap:7px;max-width:100%;background:#0d1117;border:1px solid var(--border);border-radius:5px;padding:5px 7px;font-size:11px}
+.domain-name{overflow-wrap:anywhere;word-break:break-word}
+.domain button{padding:2px 6px;font-size:11px}
+.source{padding:8px 0;border-bottom:1px solid var(--border);overflow-wrap:anywhere;word-break:break-word}
+.source:last-child{border-bottom:0}
+.source-url{font-family:ui-monospace,monospace;font-size:11px;color:var(--fg);overflow-wrap:anywhere;word-break:break-all}
+.source-detail{font-size:11px;color:var(--muted);margin-top:3px;overflow-wrap:anywhere}
+.footer{margin-top:16px;padding-top:10px;border-top:1px solid var(--border);color:var(--muted);font-size:11px;overflow-wrap:anywhere}
+@media(max-width:600px){body{padding:9px}.panel-head{padding:8px 9px}.panel-body{padding:9px}.value{font-size:clamp(16px,5vw,21px)}th,td{padding:6px 7px}td{max-width:58vw}.form-row button{padding:9px 11px}}
+@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
+</style>
+</head>
+<body><main>
+<header class="header">
+  <div><h1>SocksHttpGate <span class="brand">DoT</span> <span id="status" class="status off">● CONNECTING</span></h1><div class="subtitle">DNS-over-TLS resolver · Live dashboard · refresh every 3 seconds</div></div>
+  <div class="status" id="connection">● waiting for API</div>
+</header>
+
+<h2>Resolver overview</h2>
+<section class="stats">
+  <div class="card"><div class="label">Total queries</div><div class="value" id="queries">0</div></div>
+  <div class="card"><div class="label">Blocked queries</div><div class="value" id="blocked" style="color:var(--err)">0</div></div>
+  <div class="card"><div class="label">Upstream errors</div><div class="value" id="errors" style="color:var(--warn)">0</div></div>
+  <div class="card"><div class="label">Blocked domains</div><div class="value" id="domainCount">0</div></div>
+  <div class="card"><div class="label">Uptime</div><div class="value" id="uptime">0s</div></div>
+</section>
+
+<h2>Resolver configuration</h2>
+<div class="layout">
+  <section class="panel">
+    <div class="panel-head"><span>Server status</span><span id="readyBadge" class="tag">STARTING</span></div>
+    <div class="panel-body"><div class="meta">
+      <div class="meta-item"><div class="key">DoT listen address</div><div class="val" id="listen">—</div></div>
+      <div class="meta-item"><div class="key">Upstream endpoint</div><div class="val" id="upstream">—</div></div>
+      <div class="meta-item"><div class="key">Upstream TLS hostname</div><div class="val" id="tlsName">—</div></div>
+      <div class="meta-item"><div class="key">Blocklist refresh interval</div><div class="val" id="refreshEvery">—</div></div>
+      <div class="meta-item"><div class="key">Last blocklist refresh</div><div class="val" id="lastRefresh">Never</div></div>
+      <div class="meta-item"><div class="key">Last DNS query</div><div class="val" id="lastQuery">Never</div></div>
+    </div></div>
+  </section>
+  <section class="panel">
+    <div class="panel-head">Change upstream DoT</div>
+    <div class="panel-body">
+      <form id="upstreamForm">
+        <div class="form-row"><input id="upstreamInput" placeholder="1.1.1.1:853" aria-label="Upstream host and port" required></div>
+        <div class="form-row"><input id="tlsInput" placeholder="cloudflare-dns.com" aria-label="Upstream TLS hostname" required></div>
+        <div class="form-row"><button id="upstreamBtn" type="submit">Save upstream</button><button id="resetUpstream" type="button" class="secondary">Reload current</button></div>
+      </form>
+      <div class="message" id="upstreamMsg">Changes apply at runtime and reset when the resolver restarts.</div>
+    </div>
+  </section>
 </div>
-<div class="grid"><section class="panel"><h2>Recent DNS queries</h2><div class="logs"><table><thead><tr><th>Time</th><th>Domain</th><th>Type</th><th>Result</th><th>Client</th></tr></thead><tbody id="logs"><tr><td colspan="5">Waiting for queries…</td></tr></tbody></table></div></section>
-<section class="panel"><h2>Server status</h2><div class="meta"><div>DoT listen: <b id="listen">—</b></div><div>Upstream: <b id="upstream">—</b></div><div>TLS name: <b id="tlsName">—</b></div><div>Blocklist refresh: <b id="refreshEvery">—</b></div><div>Last refresh: <b id="lastRefresh">Never</b></div><div>Resolver ready: <b id="ready">No</b></div><div>Blocked domains: <b id="domainCount">0</b></div><div>Last query: <b id="lastQuery">Never</b></div></div><h2 style="margin-top:24px">Change upstream</h2><form id="upstreamForm"><input id="upstreamInput" placeholder="1.1.1.1:853" required><input id="tlsInput" placeholder="cloudflare-dns.com" required><button>Save</button></form><h2 style="margin-top:24px">Remote blocklist sources</h2><div id="sources" class="meta">No remote sources configured</div><h2 style="margin-top:24px">Blocklist manager</h2><form id="addForm"><input id="domainInput" placeholder="ads.example.com" autocomplete="off" required><button>Add</button></form><div id="domains" class="domains"></div></section></div>
-<div class="foot">Dashboard API has no authentication. Keep it bound to 127.0.0.1 and do not expose it publicly.</div>
-</main><script>
-const $=id=>document.getElementById(id);const fmt=n=>Number(n||0).toLocaleString();
-function duration(s){s=Math.max(0,Number(s)||0);if(s<60)return Math.floor(s)+'s';if(s<3600)return Math.floor(s/60)+'m '+Math.floor(s%60)+'s';if(s<86400)return Math.floor(s/3600)+'h '+Math.floor(s%3600/60)+'m';return Math.floor(s/86400)+'d '+Math.floor(s%86400/3600)+'h'}
-async function api(url,options){const res=await fetch(url,options);if(!res.ok)throw new Error(await res.text());if(res.status===204)return null;return res.json()}
-async function refresh(){try{const s=await api('/api/stats');$('queries').textContent=fmt(s.queries);$('blocked').textContent=fmt(s.blocked);$('errors').textContent=fmt(s.errors);$('uptime').textContent=duration(s.uptime_seconds);$('listen').textContent=s.listen_address;$('upstream').textContent=s.upstream;$('tlsName').textContent=s.upstream_tls_name;$('upstreamInput').value=s.upstream;$('tlsInput').value=s.upstream_tls_name;$('refreshEvery').textContent=s.refresh_every;$('lastRefresh').textContent=s.last_refresh?new Date(s.last_refresh).toLocaleString():'Never';$('ready').textContent=s.ready?'Yes':'Loading';$('domainCount').textContent=fmt(s.blocked_domains);$('lastQuery').textContent=s.last_query?new Date(s.last_query).toLocaleString():'Never';$('sources').innerHTML=Object.keys(s.sources||{}).map(k=>{const v=s.sources[k];return '<div><b>'+esc(k)+'</b><br>Domains: '+fmt(v.domain_count)+' · Loads: '+fmt(v.total_loads)+' · Failures: '+fmt(v.failed_loads)+'<br>Last OK: '+esc(v.last_success||'Never')+' · Error: '+esc(v.last_error||'—')+'</div>'}).join('')||'No remote sources configured';
-const logs=await api('/api/logs');$('logs').innerHTML=logs.length?logs.slice(0,100).map(x=>'<tr><td>'+new Date(x.time).toLocaleTimeString()+'</td><td>'+esc(x.domain)+'</td><td>'+esc(x.type)+'</td><td><span class="tag '+esc(x.action)+'">'+esc(x.rcode||x.action)+'</span></td><td>'+esc(x.client)+'</td></tr>').join(''):'<tr><td colspan="5">No DNS queries yet</td></tr>';
-const b=await api('/api/blocklist');$('domains').innerHTML=b.domains.map(d=>'<span class="domain">'+esc(d)+'<button class="remove" data-domain="'+esc(d)+'" title="Remove">×</button></span>').join('')||'<span class="label">No blocked domains</span>';
-}catch(e){console.error(e)}}
-function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-$('upstreamForm').addEventListener('submit',async e=>{e.preventDefault();try{await api('/api/upstream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({upstream:$('upstreamInput').value.trim(),tls_name:$('tlsInput').value.trim()})});await refresh()}catch(err){alert('Could not update upstream: '+err.message)}});
-$('addForm').addEventListener('submit',async e=>{e.preventDefault();const domain=$('domainInput').value.trim();try{await api('/api/blocklist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'add',domain})});$('domainInput').value='';await refresh()}catch(err){alert('Could not add domain: '+err.message)}});
-$('domains').addEventListener('click',async e=>{const btn=e.target.closest('button[data-domain]');if(!btn)return;try{await api('/api/blocklist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'remove',domain:btn.dataset.domain})});await refresh()}catch(err){alert('Could not remove domain: '+err.message)}});
+
+<h2>Blocklist management</h2>
+<div class="layout">
+  <section class="panel">
+    <div class="panel-head">Add blocked domain</div>
+    <div class="panel-body">
+      <form id="addForm"><div class="form-row"><input id="domainInput" placeholder="ads.example.com" autocomplete="off" spellcheck="false" aria-label="Domain to block" required><button id="addBtn" type="submit">Add domain</button></div></form>
+      <div class="message" id="blockMsg">Changes are in memory and will reset when the resolver restarts unless configured through BLOCKLIST.</div>
+    </div>
+  </section>
+  <section class="panel">
+    <div class="panel-head"><span>Remote blocklist sources</span><span id="sourceCount" class="tag">0 sources</span></div>
+    <div class="panel-body" id="sources"><div class="muted">No remote sources configured.</div></div>
+  </section>
+</div>
+<div class="card" style="margin-top:var(--gap)">
+  <div class="panel-head" style="padding:0 0 9px;border-bottom:1px solid var(--border);margin-bottom:9px"><span>Blocked domains</span><span class="muted" id="domainSummary">Loading…</span></div>
+  <div id="domains" class="domains"><span class="muted">Loading blocklist…</span></div>
+</div>
+
+<h2>Live DNS query log</h2>
+<section class="panel">
+  <div class="panel-head"><span>Recent DNS queries</span><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><span class="muted" id="logCount">0 events</span><button type="button" class="secondary" id="refreshNow">Refresh</button></div></div>
+  <div class="logs table-wrap"><table><thead><tr><th>Time</th><th>Domain</th><th>Type</th><th>Result</th><th>Action</th><th>Client</th></tr></thead><tbody id="logs"><tr><td colspan="6" class="wrap">Waiting for queries…</td></tr></tbody></table></div>
+</section>
+<footer class="footer">Dashboard API has no authentication. Keep it bound to 127.0.0.1 and do not expose it publicly. DNS query logs are held in memory and limited to the latest 200 entries.</footer>
+</main>
+<script>
+(function(){
+const $=id=>document.getElementById(id);
+const fmt=n=>Number(n||0).toLocaleString();
+function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function duration(s){s=Math.max(0,Number(s)||0);if(s<60)return Math.floor(s)+'s';if(s<3600)return Math.floor(s/60)+'m '+Math.floor(s%60)+'s';if(s<86400)return Math.floor(s/3600)+'h '+Math.floor(s%3600/60)+'m';return Math.floor(s/86400)+'d '+Math.floor(s%86400/3600)+'h';}
+function date(v){if(!v)return 'Never';const d=new Date(v);return isNaN(d.getTime())?String(v):d.toLocaleString();}
+async function api(url,options){const res=await fetch(url,options);if(!res.ok){let msg='HTTP '+res.status;try{msg=await res.text()||msg}catch(e){}throw new Error(msg)}if(res.status===204)return null;return res.json();}
+function setMessage(id,msg,isError){$(id).textContent=msg;$(id).style.color=isError?'var(--err)':'var(--muted)';}
+async function loadStats(){
+ const s=await api('/api/stats');
+ $('queries').textContent=fmt(s.queries);$('blocked').textContent=fmt(s.blocked);$('errors').textContent=fmt(s.errors);$('domainCount').textContent=fmt(s.blocked_domains);$('uptime').textContent=duration(s.uptime_seconds);
+ $('listen').textContent=s.listen_address||'—';$('upstream').textContent=s.upstream||'—';$('tlsName').textContent=s.upstream_tls_name||'—';$('refreshEvery').textContent=s.refresh_every||'—';$('lastRefresh').textContent=date(s.last_refresh);$('lastQuery').textContent=date(s.last_query);
+ $('readyBadge').textContent=s.ready?'READY':'LOADING';$('readyBadge').style.color=s.ready?'var(--ok)':'var(--warn)';
+ if(document.activeElement!==$('upstreamInput'))$('upstreamInput').value=s.upstream||'';
+ if(document.activeElement!==$('tlsInput'))$('tlsInput').value=s.upstream_tls_name||'';
+ const entries=Object.entries(s.sources||{});$('sourceCount').textContent=entries.length+' source'+(entries.length===1?'':'s');
+ $('sources').innerHTML=entries.length?entries.map(([url,v])=>'<div class="source"><div class="source-url">'+esc(url)+'</div><div class="source-detail">Domains: '+fmt(v.domain_count)+' · Loads: '+fmt(v.total_loads)+' · Failures: '+fmt(v.failed_loads)+'</div><div class="source-detail">Last success: '+esc(date(v.last_success))+'</div>'+(v.last_error?'<div class="source-detail" style="color:var(--warn)">Last error: '+esc(v.last_error)+'</div>':'')+'</div>').join(''):'<div class="muted">No remote sources configured.</div>';
+}
+async function loadLogs(){
+ const logs=await api('/api/logs');
+ $('logCount').textContent=logs.length+' events';
+ $('logs').innerHTML=logs.length?logs.slice(0,200).map(x=>'<tr><td>'+esc(new Date(x.time).toLocaleTimeString())+'</td><td title="'+esc(x.domain)+'">'+esc(x.domain)+'</td><td>'+esc(x.type)+'</td><td><span class="tag '+esc(x.rcode)+'">'+esc(x.rcode||'—')+'</span></td><td><span class="tag '+esc(x.action)+'">'+esc(x.action)+'</span></td><td title="'+esc(x.client)+'">'+esc(x.client)+'</td></tr>').join(''):'<tr><td colspan="6" class="wrap muted">No DNS queries yet.</td></tr>';
+}
+async function loadBlocklist(){
+ const b=await api('/api/blocklist');const domains=b.domains||[];
+ $('domainSummary').textContent=fmt(domains.length)+' domains';
+ $('domains').innerHTML=domains.length?domains.map(d=>'<span class="domain"><span class="domain-name">'+esc(d)+'</span><button type="button" class="danger" data-domain="'+esc(d)+'" aria-label="Remove '+esc(d)+'">×</button></span>').join(''):'<span class="muted">No blocked domains.</span>';
+}
+async function refresh(){
+ try{
+  await loadStats();$('status').textContent='● ONLINE';$('status').className='status on';$('connection').textContent='● API connected';$('connection').style.color='var(--ok)';
+ }catch(e){$('status').textContent='● API ERROR';$('status').className='status off';$('connection').textContent='● '+e.message;$('connection').style.color='var(--err)';return}
+ try{await loadLogs()}catch(e){console.error('logs:',e)}
+ try{await loadBlocklist()}catch(e){console.error('blocklist:',e)}
+}
+$('upstreamForm').addEventListener('submit',async e=>{
+ e.preventDefault();const btn=$('upstreamBtn');btn.disabled=true;setMessage('upstreamMsg','Saving upstream…',false);
+ try{await api('/api/upstream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({upstream:$('upstreamInput').value.trim(),tls_name:$('tlsInput').value.trim()})});setMessage('upstreamMsg','Upstream updated successfully. Changes are runtime-only.',false);await refresh()}
+ catch(err){setMessage('upstreamMsg','Could not update upstream: '+err.message,true)}
+ finally{btn.disabled=false}
+});
+$('resetUpstream').addEventListener('click',async()=>{try{await loadStats();setMessage('upstreamMsg','Fields reloaded from the running resolver.',false)}catch(e){setMessage('upstreamMsg','Could not reload settings: '+e.message,true)}});
+$('addForm').addEventListener('submit',async e=>{
+ e.preventDefault();const btn=$('addBtn'),domain=$('domainInput').value.trim();btn.disabled=true;
+ try{await api('/api/blocklist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'add',domain})});$('domainInput').value='';setMessage('blockMsg','Added '+domain,false);await loadBlocklist();await loadStats()}
+ catch(err){setMessage('blockMsg','Could not add domain: '+err.message,true)}
+ finally{btn.disabled=false}
+});
+$('domains').addEventListener('click',async e=>{
+ const btn=e.target.closest('button[data-domain]');if(!btn)return;btn.disabled=true;
+ try{await api('/api/blocklist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'remove',domain:btn.dataset.domain})});setMessage('blockMsg','Removed '+btn.dataset.domain,false);await loadBlocklist();await loadStats()}
+ catch(err){setMessage('blockMsg','Could not remove domain: '+err.message,true)}
+});
+$('refreshNow').addEventListener('click',refresh);
 refresh();setInterval(refresh,3000);
-</script></body></html>`
+})();
+</script>
+</body></html>
