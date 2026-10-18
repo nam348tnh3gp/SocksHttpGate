@@ -653,7 +653,8 @@ public class Proxy {
     static volatile List<Cidr> ALLOWED_CIDRS = new ArrayList<>();
     static volatile List<Cidr> DENIED_CIDRS = new ArrayList<>();
 
-    static volatile List<String[]> UPSTREAM_PROXIES = new ArrayList<>();
+    // === FIX v6.3.7: lưu spec string (không phải [host,port]) để giữ scheme ===
+    static volatile List<String> UPSTREAM_PROXIES = new ArrayList<>();
     static final AtomicInteger UPSTREAM_IDX = new AtomicInteger();
     static final ConcurrentHashMap<String, Boolean> UPSTREAM_HEALTH = new ConcurrentHashMap<>();
     static final Object UPSTREAM_LOCK = new Object();
@@ -866,22 +867,241 @@ public class Proxy {
         } catch (Exception e) { return null; }
     }
 
+    static class UpstreamInfo {
+        String  spec;
+        String  type;
+        String  host;
+        int     port;
+        boolean tls;
+    }
+
+    static UpstreamInfo parseUpstreamSpec(String spec) {
+        if (spec == null) return null;
+        String s = spec.trim();
+        if (s.isEmpty()) return null;
+        String lower = s.toLowerCase();
+
+        UpstreamInfo ui = new UpstreamInfo();
+        ui.spec = s;
+        ui.type = "http";
+        ui.tls  = false;
+        String rest;
+        int defaultPort = 0;
+
+        if (lower.startsWith("socks5s://")) {
+            ui.type = "socks5"; ui.tls = true;
+            rest = s.substring(10).trim(); defaultPort = 443;
+        } else if (lower.startsWith("socks5://")) {
+            ui.type = "socks5"; ui.tls = false;
+            rest = s.substring(9).trim();  defaultPort = 1080;
+        } else if (lower.startsWith("https://")) {
+            ui.type = "http";   ui.tls = true;
+            rest = s.substring(8).trim();  defaultPort = 443;
+        } else if (lower.startsWith("http://")) {
+            ui.type = "http";   ui.tls = false;
+            rest = s.substring(7).trim();  defaultPort = 80;
+        } else {
+            rest = s;
+            defaultPort = 0;
+        }
+        if (rest.isEmpty()) return null;
+
+        if (rest.startsWith("[")) {
+            int end = rest.indexOf(']');
+            if (end < 0) return null;
+            ui.host = rest.substring(1, end);
+            String after = rest.substring(end + 1);
+            if (after.startsWith(":")) {
+                try { ui.port = Integer.parseInt(after.substring(1)); }
+                catch (NumberFormatException e) { return null; }
+            } else if (after.isEmpty() && defaultPort > 0) {
+                ui.port = defaultPort;
+            } else return null;
+        } else {
+            int idx = rest.lastIndexOf(':');
+            if (idx < 0) {
+                if (defaultPort > 0) { ui.host = rest; ui.port = defaultPort; }
+                else return null;
+            } else {
+                ui.host = rest.substring(0, idx);
+                try { ui.port = Integer.parseInt(rest.substring(idx + 1)); }
+                catch (NumberFormatException e) { return null; }
+            }
+        }
+        if (ui.host == null || ui.host.isEmpty() || ui.port < 1 || ui.port > 65535) return null;
+        return ui;
+    }
+
+    static Socket wrapTls(Socket raw, String serverHost) throws IOException {
+        int oldTimeout = raw.getSoTimeout();
+        raw.setSoTimeout(CONN_TIMEOUT_MS);
+        try {
+            javax.net.ssl.SSLSocketFactory factory =
+                (javax.net.ssl.SSLSocketFactory) javax.net.ssl.SSLSocketFactory.getDefault();
+            javax.net.ssl.SSLSocket ssl = (javax.net.ssl.SSLSocket) factory.createSocket(
+                raw, serverHost, raw.getPort(), true);
+            ssl.setUseClientMode(true);
+            ssl.setSoTimeout(CONN_TIMEOUT_MS);
+            ssl.startHandshake();
+            ssl.setSoTimeout(oldTimeout);
+            return ssl;
+        } catch (IOException e) {
+            try { raw.close(); } catch (Exception ignored) {}
+            throw e;
+        }
+    }
+
+    static void readExactInto(InputStream in, byte[] buf, int n) throws IOException {
+        int got = 0;
+        while (got < n) {
+            int r = in.read(buf, got, n - got);
+            if (r < 0) throw new IOException("EOF after " + got + "/" + n + " bytes");
+            got += r;
+        }
+    }
+
+    static void upstreamHandshakeHttp(Socket conn, String host, int port) throws IOException {
+        conn.setSoTimeout(CONN_TIMEOUT_MS);
+        try {
+            String target = (host.contains(":") && !host.startsWith("["))
+                ? "[" + host + "]:" + port
+                : host + ":" + port;
+            String req = "CONNECT " + target + " HTTP/1.1\r\nHost: " + target + "\r\n\r\n";
+            OutputStream out = conn.getOutputStream();
+            out.write(req.getBytes(StandardCharsets.ISO_8859_1));
+            out.flush();
+
+            InputStream in = conn.getInputStream();
+            StringBuilder sb = new StringBuilder();
+            while (true) {
+                int b = in.read();
+                if (b < 0) throw new IOException("EOF reading CONNECT status");
+                if (b == '\n') break;
+                if (b != '\r') sb.append((char) b);
+                if (sb.length() > 8192) throw new IOException("status line too long");
+            }
+            String statusLine = sb.toString();
+            if (!statusLine.startsWith("HTTP/1.")) {
+                throw new IOException("bad status line: " + statusLine);
+            }
+            String[] parts = statusLine.split("\\s+", 3);
+            if (parts.length < 2 || parts[1].length() != 3 || parts[1].charAt(0) != '2') {
+                throw new IOException("CONNECT rejected: " + statusLine);
+            }
+            for (int i = 0; i <= 128; i++) {
+                StringBuilder hl = new StringBuilder();
+                while (true) {
+                    int b = in.read();
+                    if (b < 0) throw new IOException("EOF reading headers");
+                    if (b == '\n') break;
+                    if (b != '\r') hl.append((char) b);
+                    if (hl.length() > 8192) throw new IOException("header line too long");
+                }
+                if (hl.length() == 0) break;
+                if (i == 128) throw new IOException("too many response headers");
+            }
+        } finally {
+            try { conn.setSoTimeout(0); } catch (Exception ignored) {}
+        }
+    }
+
+    static void upstreamHandshakeSocks5(Socket conn, String host, int port) throws IOException {
+        conn.setSoTimeout(CONN_TIMEOUT_MS);
+        try {
+            OutputStream out = conn.getOutputStream();
+            InputStream in = conn.getInputStream();
+
+            out.write(new byte[]{5, 1, 0});
+            out.flush();
+            byte[] resp = new byte[2];
+            readExactInto(in, resp, 2);
+            if ((resp[0] & 0xff) != 5)
+                throw new IOException("bad greeting ver " + (resp[0] & 0xff));
+            if ((resp[1] & 0xff) != 0)
+                throw new IOException("upstream requires auth (method 0x" + Integer.toHexString(resp[1] & 0xff) + ")");
+
+            ByteArrayOutputStream req = new ByteArrayOutputStream();
+            req.write(5); req.write(1); req.write(0);
+            InetAddress addr = null;
+            try { addr = InetAddress.getByName(host); } catch (Exception ignored) {}
+            if (addr != null && addr.getAddress().length == 4) {
+                req.write(1); req.write(addr.getAddress());
+            } else if (addr != null && addr.getAddress().length == 16) {
+                req.write(4); req.write(addr.getAddress());
+            } else {
+                byte[] hb = host.getBytes(StandardCharsets.US_ASCII);
+                if (hb.length == 0 || hb.length > 255)
+                    throw new IOException("hostname length " + hb.length);
+                req.write(3); req.write(hb.length); req.write(hb);
+            }
+            req.write((port >> 8) & 0xff);
+            req.write(port & 0xff);
+            out.write(req.toByteArray());
+            out.flush();
+
+            byte[] hdr = new byte[4];
+            readExactInto(in, hdr, 4);
+            if ((hdr[0] & 0xff) != 5)
+                throw new IOException("bad reply ver " + (hdr[0] & 0xff));
+            if ((hdr[1] & 0xff) != 0)
+                throw new IOException("CONNECT fail rep=0x" + Integer.toHexString(hdr[1] & 0xff));
+            int atyp = hdr[3] & 0xff;
+            int alen;
+            if (atyp == 1) alen = 4;
+            else if (atyp == 4) alen = 16;
+            else if (atyp == 3) {
+                byte[] lb = new byte[1];
+                readExactInto(in, lb, 1);
+                alen = lb[0] & 0xff;
+            } else throw new IOException("bad atyp " + atyp);
+            byte[] junk = new byte[alen + 2];
+            readExactInto(in, junk, alen + 2);
+        } finally {
+            try { conn.setSoTimeout(0); } catch (Exception ignored) {}
+        }
+    }
+
     static Socket connectTarget(String host, int port) {
-        List<String[]> ups = UPSTREAM_PROXIES;
+        List<String> ups = UPSTREAM_PROXIES;
         int start = UPSTREAM_IDX.get();
         if (!ups.isEmpty()) {
             int total = ups.size();
             int aliveN = 0;
-            for (String[] u : ups) if (UPSTREAM_HEALTH.getOrDefault(u[0] + ":" + u[1], true)) aliveN++;
+            for (String spec : ups)
+                if (UPSTREAM_HEALTH.getOrDefault(spec, true)) aliveN++;
+
             for (int i = 0; i < total; i++) {
                 int idx = (start + i) % total;
-                String[] u = ups.get(idx);
-                String key = u[0] + ":" + u[1];
-                if (aliveN > 0 && !UPSTREAM_HEALTH.getOrDefault(key, true)) continue;
-                UPSTREAM_IDX.set((idx + 1) % total);
-                Socket s = tryConnect(u[0], Integer.parseInt(u[1]), CONN_TIMEOUT_MS);
-                if (s != null) { UPSTREAM_HEALTH.put(key, true); return s; }
-                UPSTREAM_HEALTH.put(key, false);
+                String spec = ups.get(idx);
+                if (aliveN > 0 && !UPSTREAM_HEALTH.getOrDefault(spec, true)) continue;
+
+                UpstreamInfo ui = parseUpstreamSpec(spec);
+                if (ui == null) continue;
+
+                Socket raw = null;
+                Socket conn = null;
+                try {
+                    raw = new Socket();
+                    raw.connect(new InetSocketAddress(ui.host, ui.port), CONN_TIMEOUT_MS);
+                    raw.setKeepAlive(true);
+                    conn = raw;
+                    if (ui.tls) conn = wrapTls(raw, ui.host);
+
+                    if ("socks5".equals(ui.type)) {
+                        upstreamHandshakeSocks5(conn, host, port);
+                    } else {
+                        upstreamHandshakeHttp(conn, host, port);
+                    }
+
+                    UPSTREAM_IDX.set((idx + 1) % total);
+                    UPSTREAM_HEALTH.put(spec, true);
+                    return conn;
+                } catch (Exception e) {
+                    logWarn("Upstream " + spec + " fail: " + e.getMessage());
+                    if (conn != null) { try { conn.close(); } catch (Exception ignored) {} }
+                    else if (raw != null) { try { raw.close(); } catch (Exception ignored) {} }
+                    UPSTREAM_HEALTH.put(spec, false);
+                }
             }
         }
         List<InetSocketAddress> addrs = resolveTarget(host, port);
@@ -2188,12 +2408,11 @@ setInterval(refreshAudit,15000);
 
         List<Object> ups = new ArrayList<>();
         List<Object> upsStatus = new ArrayList<>();
-        for (String[] u : UPSTREAM_PROXIES) {
-            String key = u[0] + ":" + u[1];
-            ups.add(key);
+        for (String spec : UPSTREAM_PROXIES) {
+            ups.add(spec);
             Map<String,Object> sm = new LinkedHashMap<>();
-            sm.put("addr", key);
-            sm.put("alive", UPSTREAM_HEALTH.getOrDefault(key, true));
+            sm.put("addr", spec);
+            sm.put("alive", UPSTREAM_HEALTH.getOrDefault(spec, true));
             upsStatus.add(sm);
         }
         Map<String,Object> up = new LinkedHashMap<>();
@@ -2299,18 +2518,17 @@ setInterval(refreshAudit,15000);
             ALLOWED_CIDRS = na;
             DENIED_CIDRS = nd;
 
-            List<String[]> newUp = new ArrayList<>();
-            for (String it : nc.upstreamProxies) {
-                if (it == null) continue;
-                int idx = it.lastIndexOf(':');
-                if (idx < 0) continue;
-                try {
-                    newUp.add(new String[]{it.substring(0, idx), it.substring(idx + 1)});
-                } catch (Exception ignored) {}
-            }
+            List<String> newUp = nc.upstreamProxies == null
+                ? new ArrayList<>()
+                : new ArrayList<>(nc.upstreamProxies);
             synchronized (UPSTREAM_LOCK) {
                 UPSTREAM_PROXIES = newUp;
                 if (UPSTREAM_IDX.get() >= newUp.size()) UPSTREAM_IDX.set(0);
+                for (String spec : newUp) {
+                    if (parseUpstreamSpec(spec) == null) {
+                        logWarn("Reload: upstream spec không hợp lệ sẽ bị bỏ qua: " + spec);
+                    }
+                }
             }
 
             synchronized (CFG_LOCK) { CFG = nc; }
@@ -2870,18 +3088,25 @@ setInterval(refreshAudit,15000);
             }
         });
 
-        // Upstream health checker
         Thread.ofVirtual().start(() -> {
             while (!SHUTDOWN) {
                 try { Thread.sleep(15000); } catch (InterruptedException e) { break; }
                 if (SHUTDOWN) break;
-                for (String[] u : UPSTREAM_PROXIES) {
-                    String key = u[0] + ":" + u[1];
+                List<String> ups = UPSTREAM_PROXIES;
+                for (String spec : ups) {
+                    UpstreamInfo ui = parseUpstreamSpec(spec);
+                    if (ui == null) { UPSTREAM_HEALTH.put(spec, false); continue; }
+                    Socket raw = null;
                     try {
-                        Socket s = tryConnect(u[0], Integer.parseInt(u[1]), 3000);
-                        if (s != null) { s.close(); UPSTREAM_HEALTH.put(key, true); }
-                        else UPSTREAM_HEALTH.put(key, false);
-                    } catch (Exception e) { UPSTREAM_HEALTH.put(key, false); }
+                        raw = new Socket();
+                        raw.connect(new InetSocketAddress(ui.host, ui.port), 3000);
+                        if (ui.tls) wrapTls(raw, ui.host);
+                        UPSTREAM_HEALTH.put(spec, true);
+                    } catch (Exception e) {
+                        UPSTREAM_HEALTH.put(spec, false);
+                    } finally {
+                        if (raw != null) try { raw.close(); } catch (Exception ignored) {}
+                    }
                 }
             }
         });
@@ -3009,12 +3234,13 @@ setInterval(refreshAudit,15000);
         ALLOWED_CIDRS = Ssrf.parseCidrs(CFG.allowList);
         DENIED_CIDRS = Ssrf.parseCidrs(CFG.denyList);
 
-        List<String[]> ups = new ArrayList<>();
-        for (String it : CFG.upstreamProxies) {
-            if (it == null) continue;
-            int idx = it.lastIndexOf(':');
-            if (idx < 0) continue;
-            ups.add(new String[]{it.substring(0, idx), it.substring(idx + 1)});
+        List<String> ups = CFG.upstreamProxies == null
+            ? new ArrayList<>()
+            : new ArrayList<>(CFG.upstreamProxies);
+        for (String spec : ups) {
+            if (parseUpstreamSpec(spec) == null) {
+                logWarn("Upstream spec không hợp lệ (sẽ bị bỏ qua mỗi request): " + spec);
+            }
         }
         UPSTREAM_PROXIES = ups;
 

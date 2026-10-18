@@ -490,6 +490,192 @@ function currentPeriod() {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// FIX v6.3.7: UPSTREAM SPEC + TLS WRAP + HANDSHAKE HELPERS
+// ═══════════════════════════════════════════════════════════════════════════
+// Hỗ trợ spec:
+//   "host:port"                 → http plaintext
+//   "http://host:port"          → http plaintext
+//   "https://host[:port]"       → http TLS (mặc định 443)
+//   "socks5://host[:port]"      → socks5 plaintext (mặc định 1080)
+//   "socks5s://host[:port]"     → socks5 TLS (mặc định 443)
+//   "[v6]:port" / "[v6]"        → IPv6
+function parseUpstreamSpec(spec) {
+  if (!spec) return null;
+  const s = String(spec).trim();
+  if (!s) return null;
+  const lower = s.toLowerCase();
+  let type = 'http', tls_on = false, rest, defaultPort = 0;
+
+  if (lower.startsWith('socks5s://')) {
+    type = 'socks5'; tls_on = true;
+    rest = s.slice(10).trim(); defaultPort = 443;
+  } else if (lower.startsWith('socks5://')) {
+    type = 'socks5'; tls_on = false;
+    rest = s.slice(9).trim();  defaultPort = 1080;
+  } else if (lower.startsWith('https://')) {
+    type = 'http';   tls_on = true;
+    rest = s.slice(8).trim();  defaultPort = 443;
+  } else if (lower.startsWith('http://')) {
+    type = 'http';   tls_on = false;
+    rest = s.slice(7).trim();  defaultPort = 80;
+  } else {
+    rest = s;
+    defaultPort = 0;
+  }
+  if (!rest) return null;
+
+  let host, port;
+  if (rest.startsWith('[')) {
+    const end = rest.indexOf(']');
+    if (end < 0) return null;
+    host = rest.slice(1, end);
+    const after = rest.slice(end + 1);
+    if (after.startsWith(':')) {
+      port = parseInt(after.slice(1), 10);
+      if (isNaN(port)) return null;
+    } else if (!after && defaultPort > 0) {
+      port = defaultPort;
+    } else return null;
+  } else {
+    const idx = rest.lastIndexOf(':');
+    if (idx < 0) {
+      if (defaultPort > 0) { host = rest; port = defaultPort; }
+      else return null;
+    } else {
+      host = rest.slice(0, idx);
+      port = parseInt(rest.slice(idx + 1), 10);
+      if (isNaN(port)) return null;
+    }
+  }
+  if (!host || port < 1 || port > 65535) return null;
+  return { spec: s, type, tls: tls_on, host, port };
+}
+
+function validateUpstreams(specs) {
+  const bad = [];
+  for (const s of (specs || [])) {
+    if (!parseUpstreamSpec(s)) bad.push(s);
+  }
+  if (bad.length) {
+    log(`[WARN] Upstream spec không hợp lệ (sẽ bị bỏ qua mỗi request): ${bad.join(', ')} — dạng đúng: host:port, http://host:port, https://host:port, socks5://host:port, socks5s://host:port`);
+  }
+}
+
+// TLS wrap cho upstream https:// / socks5s:// (Cloudflare Workers, CDN proxy 443).
+// SNI = hostname của Worker, không phải IP. Node mặc định trust cert Cloudflare
+// (Google Trust / Let's Encrypt) nên không cần disable verify.
+function tlsWrap(rawSocket, serverHost) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let tlsSocket;
+    try {
+      tlsSocket = tls.connect({
+        socket: rawSocket,
+        servername: net.isIP(serverHost) ? undefined : serverHost,
+        rejectUnauthorized: true,
+        minVersion: 'TLSv1.2',
+      }, () => {
+        if (settled) return;
+        settled = true;
+        resolve(tlsSocket);
+      });
+    } catch (e) {
+      reject(e); return;
+    }
+    tlsSocket.once('error', (e) => {
+      if (settled) return;
+      settled = true;
+      try { tlsSocket.destroy(); } catch {}
+      reject(e);
+    });
+  });
+}
+
+function writeAsync(sock, buf) {
+  return new Promise((resolve, reject) => {
+    sock.write(buf, (err) => err ? reject(err) : resolve());
+  });
+}
+
+// SOCKS5 no-auth + CONNECT. Trả về leftover Buffer (thường rỗng — SOCKS5 reply
+// đúng kích thước định trước, không có byte dư).
+async function handshakeSocks5(conn, host, port) {
+  const reader = new BufReader(conn);
+  try {
+    await writeAsync(conn, Buffer.from([5, 1, 0]));
+    const resp = await reader.readN(2);
+    if (resp[0] !== 5) throw new Error(`bad greeting ver ${resp[0]}`);
+    if (resp[1] !== 0) throw new Error(`upstream requires auth (method 0x${resp[1].toString(16)})`);
+
+    const req = [5, 1, 0];
+    if (net.isIPv4(host)) {
+      const v4 = ipv4ToBuf(host);
+      if (!v4) throw new Error('bad IPv4');
+      req.push(1, v4[0], v4[1], v4[2], v4[3]);
+    } else if (net.isIPv6(host)) {
+      const v6 = ipv6ToBuf(host);
+      if (!v6) throw new Error('bad IPv6');
+      req.push(4);
+      for (let i = 0; i < 16; i++) req.push(v6[i]);
+    } else {
+      const hb = Buffer.from(host, 'ascii');
+      if (hb.length === 0 || hb.length > 255) throw new Error(`hostname length ${hb.length}`);
+      req.push(3, hb.length);
+      for (const b of hb) req.push(b);
+    }
+    req.push((port >> 8) & 0xff, port & 0xff);
+    await writeAsync(conn, Buffer.from(req));
+
+    const hdr = await reader.readN(4);
+    if (hdr[0] !== 5) throw new Error(`bad reply ver ${hdr[0]}`);
+    if (hdr[1] !== 0) throw new Error(`CONNECT fail rep=0x${hdr[1].toString(16)}`);
+    const atyp = hdr[3];
+    let alen;
+    if (atyp === 1) alen = 4;
+    else if (atyp === 4) alen = 16;
+    else if (atyp === 3) {
+      const lb = await reader.readN(1);
+      alen = lb[0];
+    } else throw new Error(`bad atyp ${atyp}`);
+    await reader.readN(alen + 2);
+    return reader.detach();
+  } catch (e) {
+    reader.detach();
+    throw e;
+  }
+}
+
+// HTTP CONNECT handshake. Đọc status line + headers. Trả về leftover Buffer
+// (nếu upstream gửi thêm data ngay sau 200 OK — cực hiếm, nhưng phải giữ).
+async function handshakeHttp(conn, host, port) {
+  const reader = new BufReader(conn);
+  try {
+    const target = (host.includes(':') && !host.startsWith('['))
+      ? `[${host}]:${port}` : `${host}:${port}`;
+    const req = `CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n\r\n`;
+    await writeAsync(conn, Buffer.from(req, 'latin1'));
+
+    const statusLine = await reader.readLine(8192);
+    if (!statusLine.startsWith('HTTP/1.')) {
+      throw new Error(`bad status line: ${statusLine}`);
+    }
+    const parts = statusLine.split(/\s+/);
+    if (parts.length < 2 || parts[1].length !== 3 || parts[1][0] !== '2') {
+      throw new Error(`CONNECT rejected: ${statusLine}`);
+    }
+    for (let i = 0; i <= 128; i++) {
+      const h = await reader.readLine(8192);
+      if (h === '') break;
+      if (i === 128) throw new Error('too many response headers');
+    }
+    return reader.detach();
+  } catch (e) {
+    reader.detach();
+    throw e;
+  }
+}
+
 // =============================================================================
 //  STATE CHUNG (được khởi tạo ở cả 2 role, nhưng chỉ dùng ở role tương ứng)
 // =============================================================================
@@ -646,39 +832,92 @@ function setUpstreamHealth(addr, alive) {
     else log(`[WARN] Upstream ${addr} CHẾT (không kết nối được)`);
   }
 }
+// === FIX v6.3.7: parse spec + TLS wrap khi check ===
 function upstreamHealthChecker() {
-  setInterval(() => {
+  setInterval(async () => {
     const ups = upstreamProxies.slice();
-    for (const addr of ups) {
-      const [h, p] = addr.split(':');
-      const s = net.createConnection({ host: h, port: parseInt(p, 10), timeout: UPSTREAM_HEALTH_CHECK_TIMEOUT_MS });
-      s.once('connect', () => { s.destroy(); setUpstreamHealth(addr, true); });
-      s.once('error',   () => { s.destroy(); setUpstreamHealth(addr, false); });
-      s.once('timeout', () => { s.destroy(); setUpstreamHealth(addr, false); });
+    for (const spec of ups) {
+      const ui = parseUpstreamSpec(spec);
+      if (!ui) { setUpstreamHealth(spec, false); continue; }
+      let raw = null;
+      try {
+        raw = await new Promise((resolve, reject) => {
+          const s = net.createConnection({ host: ui.host, port: ui.port, timeout: UPSTREAM_HEALTH_CHECK_TIMEOUT_MS });
+          s.once('connect', () => resolve(s));
+          s.once('error', reject);
+          s.once('timeout', () => { try { s.destroy(); } catch {} reject(new Error('timeout')); });
+        });
+        if (ui.tls) {
+          const ssl = await tlsWrap(raw, ui.host);
+          try { ssl.end(); } catch {}
+        } else {
+          try { raw.end(); } catch {}
+        }
+        setUpstreamHealth(spec, true);
+      } catch {
+        if (raw) try { raw.destroy(); } catch {}
+        setUpstreamHealth(spec, false);
+      }
     }
   }, UPSTREAM_HEALTH_CHECK_INTERVAL_MS);
 }
+// === FIX v6.3.7: connectTarget trả { socket, upstreamInitial } | null ===
+// upstreamInitial: Buffer chứa data upstream gửi ngay sau handshake (thường rỗng,
+// nhưng phải giữ để không mất byte — caller sẽ write lên client trước tunnel).
+// Advance round-robin SAU KHI thành công (trước đây advance trước dial → skip bug).
 async function connectTarget(host, portNum) {
   const ups = upstreamProxies.slice();
+  const start = upstreamIndex;
   if (ups.length > 0) {
     let aliveCount = 0;
-    for (const u of ups) if (isUpstreamAlive(u)) aliveCount++;
+    for (const spec of ups) if (isUpstreamAlive(spec)) aliveCount++;
+
     for (let i = 0; i < ups.length; i++) {
-      const idx = (upstreamIndex + i) % ups.length;
-      const upstream = ups[idx];
-      if (aliveCount > 0 && !isUpstreamAlive(upstream)) continue;
-      upstreamIndex = (idx + 1) % ups.length;
+      const idx = (start + i) % ups.length;
+      const spec = ups[idx];
+      if (aliveCount > 0 && !isUpstreamAlive(spec)) continue;
+
+      const ui = parseUpstreamSpec(spec);
+      if (!ui) continue;   // đã warn lúc init/reload
+
+      let raw = null;
+      let conn = null;
       try {
-        const [uh, up] = upstream.split(':');
-        return await new Promise((resolve, reject) => {
-          const s = net.createConnection({ host: uh, port: parseInt(up, 10), timeout: CONNECTION_TIMEOUT }, () => resolve(s));
+        raw = await new Promise((resolve, reject) => {
+          const s = net.createConnection({ host: ui.host, port: ui.port, timeout: CONNECTION_TIMEOUT });
+          s.once('connect', () => { try { s.setKeepAlive(true, 60000); } catch {} resolve(s); });
           s.once('error', reject);
-          s.once('timeout', () => { s.destroy(); reject(new Error('timeout')); });
+          s.once('timeout', () => { try { s.destroy(); } catch {} reject(new Error('timeout')); });
         });
-      } catch { setUpstreamHealth(upstream, false); }
+
+        conn = ui.tls ? await tlsWrap(raw, ui.host) : raw;
+
+        let upstreamInitial;
+        if (ui.type === 'socks5') {
+          upstreamInitial = await handshakeSocks5(conn, host, portNum);
+        } else {
+          upstreamInitial = await handshakeHttp(conn, host, portNum);
+        }
+
+        // Advance round-robin SAU KHI handshake thành công
+        upstreamIndex = (idx + 1) % ups.length;
+        setUpstreamHealth(spec, true);
+        return { socket: conn, upstreamInitial: upstreamInitial || Buffer.alloc(0) };
+      } catch (e) {
+        log(`[WARN] Upstream ${spec} fail: ${e.message}`);
+        if (conn) try { conn.destroy(); } catch {}
+        else if (raw) try { raw.destroy(); } catch {}
+        setUpstreamHealth(spec, false);
+      }
     }
   }
-  return dialChecked(host, portNum);
+  // Fallback direct (có SSRF guard)
+  try {
+    const sock = await dialChecked(host, portNum);
+    return { socket: sock, upstreamInitial: Buffer.alloc(0) };
+  } catch {
+    return null;
+  }
 }
 
 // ======================== AUTH (worker) ========================
@@ -810,13 +1049,18 @@ async function handleSOCKS5(socket, reader, remoteIP) {
     socket.setTimeout(0);
     const target = `${host}:${portNum}`;
     log(`[SOCKS5 TCP] ${socket.remoteAddress}:${socket.remotePort} -> ${target}`);
-    let remote;
-    try { remote = await connectTarget(host, portNum); }
-    catch { sendSOCKS5Reply(socket, 0x05, null, 0); return socket.destroy(); }
+    const result = await connectTarget(host, portNum);
+    if (!result) { sendSOCKS5Reply(socket, 0x05, null, 0); return socket.destroy(); }
+    const { socket: remote, upstreamInitial } = result;
 
     const bindIP = remote.localAddress || '0.0.0.0';
     const bindPort = remote.localPort || 0;
     sendSOCKS5Reply(socket, 0x00, bindIP, bindPort);
+
+    // Forward any post-handshake bytes from upstream (usually empty)
+    if (upstreamInitial && upstreamInitial.length) {
+      try { socket.write(upstreamInitial); } catch {}
+    }
 
     const ci = {
       ID: nextConnID(), IP: remoteIP, Port: socket.remotePort, Type: 'SOCKS5_TCP',
@@ -1047,20 +1291,27 @@ async function handleHTTP(socket, reader, remoteIP) {
   activeConns.set(ci.ID, ci);
   stats.HTTP++;
 
-  let remote;
-  try { remote = await connectTarget(host, portNum); }
-  catch { try { socket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n'); } catch {} socket.destroy(); activeConns.delete(ci.ID); return; }
+  const result = await connectTarget(host, portNum);
+  if (!result) { try { socket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n'); } catch {} socket.destroy(); activeConns.delete(ci.ID); return; }
+  const { socket: remote, upstreamInitial } = result;
 
   try {
     if (method === 'CONNECT') {
       try { socket.write('HTTP/1.1 200 Connection Established\r\n\r\n'); } catch {}
+      if (upstreamInitial && upstreamInitial.length) {
+        try { socket.write(upstreamInitial); } catch {}
+      }
       await tunnel(socket, remote, ci, reader.detach());
     } else {
+      if (upstreamInitial && upstreamInitial.length) {
+        log(`[WARN] Upstream sent ${upstreamInitial.length} bytes after CONNECT handshake (HTTP forward) — dropped`);
+      }
       await forwardHTTP(reader, method, parsedURL, headers, remote, socket, ci);
     }
   } finally {
-    flushConnStats(ci);
+    flushStats: flushConnStats(ci);
     activeConns.delete(ci.ID);
+    try { if (remote && !remote.destroyed) remote.destroy(); } catch {}
   }
 }
 async function forwardHTTP(reader, method, parsedURL, headers, remote, client, ci) {
@@ -2269,6 +2520,7 @@ async function mainWorker() {
         deniedCIDRs  = parseCIDRSlice(msg.config.DenyList  || []);
         upstreamProxies = (msg.config.UpstreamProxies || []).slice();
         upstreamIndex = 0;
+        validateUpstreams(upstreamProxies);
         usageSnapshot = new Map(Object.entries(msg.usageSnapshot || {}));
         if (!initDone) { initDone = true; resolveInit(); }
         log(`[INFO] Worker ${process.pid} đã nhận config: ${(msg.config.Users || []).length} users, ${(msg.config.UpstreamProxies || []).length} upstream`);
@@ -2279,6 +2531,7 @@ async function mainWorker() {
         allowedCIDRs = parseCIDRSlice(msg.config.AllowList || []);
         deniedCIDRs  = parseCIDRSlice(msg.config.DenyList  || []);
         upstreamProxies = (msg.config.UpstreamProxies || []).slice();
+        validateUpstreams(upstreamProxies);
         // pwCache dùng stored hash trong key nên tự invalidate khi hash đổi
         log(`[INFO] Worker ${process.pid} áp dụng config mới`);
         break;

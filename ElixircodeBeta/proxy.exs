@@ -999,52 +999,164 @@ end
 defmodule P.Up do
   require Logger
 
+  def parse_upstream_spec(spec) when is_binary(spec) do
+    spec = String.trim(spec)
+    if spec == "" do
+      :error
+    else
+      lower = String.downcase(spec)
+      {type, addr} =
+        cond do
+          String.starts_with?(lower, "socks5://") ->
+            {:socks5, String.trim(String.slice(spec, 9..-1//1))}
+          String.starts_with?(lower, "http://") ->
+            {:http, String.trim(String.slice(spec, 7..-1//1))}
+          true ->
+            {:http, spec}
+        end
+      case split_host_port(addr) do
+        {:ok, h, p} when h != "" -> {:ok, %{spec: spec, type: type, host: h, port: p}}
+        _ -> :error
+      end
+    end
+  end
+  def parse_upstream_spec(_), do: :error
+
+  defp split_host_port("[" <> rest) do
+    case String.split(rest, "]:", parts: 2) do
+      [h, p] ->
+        case Integer.parse(p) do
+          {port, ""} when port >= 1 and port <= 65_535 -> {:ok, h, port}
+          _ -> :error
+        end
+      _ -> :error
+    end
+  end
+  defp split_host_port(addr) do
+    case String.split(addr, ":", parts: 2) do
+      [h, p] ->
+        case Integer.parse(p) do
+          {port, ""} when port >= 1 and port <= 65_535 -> {:ok, h, port}
+          _ -> :error
+        end
+      _ -> :error
+    end
+  end
+
   def connect(host, port) do
     ups = P.Cfg.upstreams()
     if ups != [] do
       case try_upstreams(ups, host, port) do
-        {:ok, s} -> {:ok, s}
-        :error -> connect_direct(host, port)
+        {:ok, s, initial} -> {:ok, s, initial}
+        :error ->
+          case connect_direct(host, port) do
+            {:ok, s} -> {:ok, s, <<>>}
+            e -> e
+          end
       end
     else
-      connect_direct(host, port)
+      case connect_direct(host, port) do
+        {:ok, s} -> {:ok, s, <<>>}
+        e -> e
+      end
     end
   end
 
   defp try_upstreams(ups, host, port) do
-    Enum.find_value(ups, :error, fn up ->
-      case String.split(up, ":", parts: 2) do
-        [h, p] ->
-          case Integer.parse(p) do
-            {uport, ""} ->
-              if P.State.up_alive?(up) do
-                case socks5_connect(h, uport, host, port) do
-                  {:ok, s} -> {:ok, s}
-                  _ -> P.State.set_up(up, false); nil
-                end
-              else
-                nil
-              end
-            _ -> nil
-          end
-        _ -> nil
+    n = length(ups)
+    start_idx = rem(get_idx(), n)
+    alive = Enum.count(ups, fn u -> P.State.up_alive?(u) end)
+
+    Enum.reduce_while(0..(n - 1), :error, fn i, _acc ->
+      idx = rem(start_idx + i, n)
+      upstream = Enum.at(ups, idx)
+
+      if alive > 0 and not P.State.up_alive?(upstream) do
+        {:cont, :error}
+      else
+        case try_one_upstream(upstream, host, port) do
+          {:ok, s, initial} ->
+            set_idx(rem(idx + 1, n))
+            P.State.set_up(upstream, true)
+            {:halt, {:ok, s, initial}}
+          :error ->
+            {:cont, :error}
+        end
       end
     end)
   end
 
-  # SOCKS5 CONNECT thực sự tới upstream
-  defp socks5_connect(u_host, u_port, target_host, target_port) do
-    case :gen_tcp.connect(String.to_charlist(u_host), u_port, [:binary, active: false], 25_000) do
-      {:ok, s} ->
-        with :ok <- :gen_tcp.send(s, <<5, 1, 0>>),
-             {:ok, <<5, 0>>} <- :gen_tcp.recv(s, 2, 10_000),
-             :ok <- :gen_tcp.send(s, build_socks5_connect(target_host, target_port)),
-             {:ok, <<5, 0, _rsv, atyp>>} <- :gen_tcp.recv(s, 4, 15_000),
-             :ok <- consume_socks5_reply(s, atyp) do
-          {:ok, s}
-        else
-          _ -> :gen_tcp.close(s); :error
+  defp try_one_upstream(spec, host, port) do
+    case parse_upstream_spec(spec) do
+      {:ok, %{type: type, host: uh, port: uport}} ->
+        case :gen_tcp.connect(String.to_charlist(uh), uport,
+               [:binary, active: false, packet: :raw], 25_000) do
+          {:ok, s} ->
+            case do_handshake(type, s, host, port) do
+              {:ok, initial} -> {:ok, s, initial}
+              :error ->
+                :gen_tcp.close(s)
+                P.State.set_up(spec, false)
+                :error
+            end
+          _ ->
+            P.State.set_up(spec, false)
+            :error
         end
+      :error ->
+        :error
+    end
+  end
+
+  defp do_handshake(:socks5, s, host, port), do: socks5_handshake(s, host, port)
+  defp do_handshake(:http, s, host, port), do: http_handshake(s, host, port)
+
+  defp http_handshake(s, host, port) do
+    target = "#{host}:#{port}"
+    req = "CONNECT #{target} HTTP/1.1\r\nHost: #{target}\r\n\r\n"
+    reader = %P.Buf{sock: s, buf: <<>>}
+    with :ok <- :gen_tcp.send(s, req),
+         {:ok, line, r1} <- P.Buf.read_line(reader),
+         :ok <- validate_connect_status(line),
+         {:ok, r2} <- consume_http_headers(r1, 128) do
+      {:ok, P.Buf.drain(r2)}
+    else
+      _ -> :error
+    end
+  end
+
+  defp validate_connect_status(line) do
+    case String.split(line, " ", parts: 3) do
+      [ver, code | _] ->
+        if String.starts_with?(ver, "HTTP/1.") and
+           byte_size(code) == 3 and
+           String.starts_with?(code, "2") do
+          :ok
+        else
+          :error
+        end
+      _ -> :error
+    end
+  end
+
+  defp consume_http_headers(r, 0), do: {:ok, r}
+  defp consume_http_headers(r, n) do
+    case P.Buf.read_line(r) do
+      {:ok, "", r2} -> {:ok, r2}
+      {:ok, _, r2} -> consume_http_headers(r2, n - 1)
+      _ -> :error
+    end
+  end
+
+  defp socks5_handshake(s, host, port) do
+    reader = %P.Buf{sock: s, buf: <<>>}
+    with :ok <- :gen_tcp.send(s, <<5, 1, 0>>),
+         {:ok, <<5, 0>>, r1} <- P.Buf.read_n(reader, 2),
+         :ok <- :gen_tcp.send(s, build_socks5_connect(host, port)),
+         {:ok, <<5, 0, _rsv, atyp>>, r2} <- P.Buf.read_n(r1, 4),
+         {:ok, r3} <- consume_socks5_reply_buf(r2, atyp) do
+      {:ok, P.Buf.drain(r3)}
+    else
       _ -> :error
     end
   end
@@ -1058,29 +1170,58 @@ defmodule P.Up do
     end
   end
 
-  defp consume_socks5_reply(s, 1) do
-    case :gen_tcp.recv(s, 6, 5_000) do
-      {:ok, _} -> :ok
+  defp consume_socks5_reply_buf(r, 1) do
+    case P.Buf.read_n(r, 6) do
+      {:ok, _, r2} -> {:ok, r2}
       _ -> :error
     end
   end
-  defp consume_socks5_reply(s, 3) do
-    case :gen_tcp.recv(s, 1, 5_000) do
-      {:ok, <<n>>} ->
-        case :gen_tcp.recv(s, n + 2, 5_000) do
-          {:ok, _} -> :ok
-          _ -> :error
+  defp consume_socks5_reply_buf(r, 3) do
+    with {:ok, <<n>>, r1} <- P.Buf.read_n(r, 1),
+         {:ok, _, r2} <- P.Buf.read_n(r1, n + 2) do
+      {:ok, r2}
+    else
+      _ -> :error
+    end
+  end
+  defp consume_socks5_reply_buf(r, 4) do
+    case P.Buf.read_n(r, 18) do
+      {:ok, _, r2} -> {:ok, r2}
+      _ -> :error
+    end
+  end
+  defp consume_socks5_reply_buf(_, _), do: :error
+
+  defp ensure_idx_table do
+    case :ets.whereis(:p_up_idx) do
+      :undefined ->
+        try do
+          :ets.new(:p_up_idx, [:named_table, :public, :set, {:write_concurrency, true}])
+          :ets.insert(:p_up_idx, {:idx, 0})
+        rescue
+          _ -> :ok
         end
-      _ -> :error
+      _ -> :ok
     end
   end
-  defp consume_socks5_reply(s, 4) do
-    case :gen_tcp.recv(s, 18, 5_000) do
-      {:ok, _} -> :ok
-      _ -> :error
+
+  defp get_idx do
+    ensure_idx_table()
+    try do
+      :ets.lookup_element(:p_up_idx, :idx, 2)
+    rescue
+      _ -> 0
     end
   end
-  defp consume_socks5_reply(_, _), do: :error
+
+  defp set_idx(v) do
+    ensure_idx_table()
+    try do
+      :ets.insert(:p_up_idx, {:idx, v})
+    rescue
+      _ -> :ok
+    end
+  end
 
   defp connect_direct(host, port) do
     case resolve(host) do
@@ -1122,18 +1263,18 @@ defmodule P.Up do
   defp loop do
     Process.sleep(15_000)
     Enum.each(P.Cfg.upstreams(), fn up ->
-      case String.split(up, ":", parts: 2) do
-        [h, p] ->
-          case Integer.parse(p) do
-            {port, ""} ->
-              case :gen_tcp.connect(String.to_charlist(h), port, [:binary, active: false], 3_000) do
-                {:ok, s} -> :gen_tcp.close(s); P.State.set_up(up, true)
-                _ -> P.State.set_up(up, false)
-              end
-            _ -> :ok
-          end
-        _ -> :ok
-      end
+      spawn(fn ->
+        case parse_upstream_spec(up) do
+          {:ok, %{host: h, port: p}} ->
+            case :gen_tcp.connect(String.to_charlist(h), p,
+                   [:binary, active: false], 3_000) do
+              {:ok, s} -> :gen_tcp.close(s); P.State.set_up(up, true)
+              _ -> P.State.set_up(up, false)
+            end
+          :error ->
+            P.State.set_up(up, false)
+        end
+      end)
     end)
     loop()
   end
@@ -1144,7 +1285,8 @@ end
 # ============================================================================
 defmodule P.Tunnel do
 
-  def relay(client, remote, conn_id, user, rate_bps, initial \\ <<>>) do
+  def relay(client, remote, conn_id, user, rate_bps,
+            initial \\ <<>>, initial_down \\ <<>>) do
     if byte_size(initial) > 0 do
       try do
         :gen_tcp.send(remote, initial)
@@ -1155,6 +1297,18 @@ defmodule P.Tunnel do
         _ -> :ok
       end
     end
+
+    if byte_size(initial_down) > 0 do
+      try do
+        :gen_tcp.send(client, initial_down)
+        P.State.inc(:bytes_down, byte_size(initial_down))
+        P.State.inc_conn(conn_id, :down, byte_size(initial_down))
+        P.State.usage_add(user, byte_size(initial_down))
+      rescue
+        _ -> :ok
+      end
+    end
+
     parent = self()
     pid = spawn(fn ->
       receive do
@@ -1359,7 +1513,7 @@ defmodule P.Socks5 do
 
   defp do_connect(sock, reader, host, port, peer_ip, conn_id, user, bps) do
     case P.Up.connect(host, port) do
-      {:ok, remote} ->
+      {:ok, remote, up_initial} ->
         {:ok, {lip, lport}} = :inet.sockname(remote)
         :gen_tcp.send(sock, reply_ok(lip, lport))
         info = %{
@@ -1374,7 +1528,7 @@ defmodule P.Socks5 do
         P.State.inc(:socks5_tcp)
         initial = P.Buf.drain(reader)
         try do
-          P.Tunnel.relay(sock, remote, conn_id, user, bps, initial)
+          P.Tunnel.relay(sock, remote, conn_id, user, bps, initial, up_initial)
         after
           P.State.remove_conn(conn_id)
         end
@@ -1535,7 +1689,7 @@ defmodule P.HTTPProxy do
 
   defp do_request(sock, reader, "CONNECT", _url, _headers, host, port, peer_ip, conn_id, user, bps) do
     case P.Up.connect(host, port) do
-      {:ok, remote} ->
+      {:ok, remote, up_initial} ->
         :gen_tcp.send(sock, "HTTP/1.1 200 Connection Established\r\n\r\n")
         info = %{
           id: conn_id, ip: peer_ip, port: peer_port(sock),
@@ -1548,7 +1702,7 @@ defmodule P.HTTPProxy do
         P.State.inc(:http)
         initial = P.Buf.drain(reader)
         try do
-          P.Tunnel.relay(sock, remote, conn_id, user, bps, initial)
+          P.Tunnel.relay(sock, remote, conn_id, user, bps, initial, up_initial)
         after
           P.State.remove_conn(conn_id)
         end
@@ -1558,7 +1712,7 @@ defmodule P.HTTPProxy do
 
   defp do_request(sock, reader, method, url, headers, host, port, peer_ip, conn_id, user, bps) do
     case P.Up.connect(host, port) do
-      {:ok, remote} ->
+      {:ok, remote, up_initial} ->
         info = %{
           id: conn_id, ip: peer_ip, port: peer_port(sock),
           type: "HTTP", target: "#{host}:#{port}", user: user, rate_bps: bps,
@@ -1599,6 +1753,12 @@ defmodule P.HTTPProxy do
               end
             true -> :ok
           end
+          if byte_size(up_initial) > 0 do
+            :gen_tcp.send(sock, up_initial)
+            P.State.inc(:bytes_down, byte_size(up_initial))
+            P.State.inc_conn(conn_id, :down, byte_size(up_initial))
+            P.State.usage_add(user, byte_size(up_initial))
+          end
           forward_response(remote, sock, conn_id, user, bps)
         after
           :gen_tcp.close(remote)
@@ -1616,7 +1776,7 @@ defmodule P.HTTPProxy do
     end
   end
 
-  defp do_relay_chunked(reader, remote, conn_id, user, total) when total > 100_000_000 do
+  defp do_relay_chunked(_reader, remote, _conn_id, _user, total) when total > 100_000_000 do
     # chặn 100MB — tránh DoS
     :gen_tcp.send(remote, "0\r\n\r\n")
     :ok
@@ -2263,7 +2423,7 @@ defmodule P.Dashboard do
   end
 
   # Tách phần dispatch ra khỏi route/6 để CSRF/route clean hơn
-  defp do_route(sock, actor, method, path, query, headers, body) do
+  defp do_route(sock, actor, method, path, query, _headers, body) do
         case {method, path} do
           {"GET", "/"} -> respond(sock, 200, "text/html; charset=utf-8", html())
           {"GET", "/api/all"} -> respond(sock, 200, "application/json", api_all())
@@ -2547,7 +2707,7 @@ defmodule P.Dashboard do
     end
   end
 
-  defp export_config(sock, actor) do
+  defp export_config(sock, _actor) do
     respond(sock, 200, "application/json", P.JSON.encode(P.Cfg.get()))
   end
 
