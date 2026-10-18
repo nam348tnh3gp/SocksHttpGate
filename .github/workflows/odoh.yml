@@ -1,0 +1,32 @@
+name: ODoH Go checks
+
+on:
+  push:
+    paths:
+      - "ODoH/**"
+      - ".github/workflows/odoh.yml"
+  pull_request:
+    paths:
+      - "ODoH/**"
+      - ".github/workflows/odoh.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ODoH
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+          cache: true
+          cache-dependency-path: ODoH/go.mod
+      - name: Resolve dependencies
+        run: go mod tidy
+      - name: Compile Proxy and Target
+        run: go build ./Proxy ./Target
+      - name: Run package tests
+        run: go test ./...
