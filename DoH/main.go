@@ -15,6 +15,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
@@ -28,13 +29,18 @@ const (
 
 type server struct {
 	upstreamURL string
-	client      *http.Client
+	client      *http.Client // cho DNS query (timeout ngắn)
+	blockClient *http.Client // cho tải blocklist (timeout dài)
 
 	blockMu sync.RWMutex
 	blocked map[string]struct{}
 
 	blocklistURLs []string
 	refreshEvery  time.Duration
+
+	// ready = true khi blocklist remote đã tải xong lần đầu.
+	// /dns-query trả 503 cho đến lúc đó.
+	ready atomic.Bool
 }
 
 func main() {
@@ -50,29 +56,33 @@ func main() {
 	}
 
 	s := &server{
-		upstreamURL: upstream,
-		client: &http.Client{
-			Timeout: 15 * time.Second,
-		},
+		upstreamURL:   upstream,
+		client:        &http.Client{Timeout: 15 * time.Second},
+		blockClient:   &http.Client{Timeout: 60 * time.Second},
 		blocked:       parseBlocklist(os.Getenv("BLOCKLIST")),
 		blocklistURLs: parseURLs(os.Getenv("BLOCKLIST_URLS")),
 		refreshEvery:  refreshEvery,
 	}
 
-	// Load remote lists immediately, then refresh periodically in the background.
+	// 1) Tải blocklist trong nền. /dns-query trả 503 cho đến khi xong.
 	if len(s.blocklistURLs) > 0 {
-		s.refreshBlocklists()
-		go s.refreshLoop()
+		go func() {
+			s.initialLoad() // block tới khi tải xong (retry với backoff)
+			s.refreshLoop() // sau đó refresh định kỳ
+		}()
+	} else {
+		s.ready.Store(true)
 	}
-	log.Printf("Loaded %d blocked domains; remote sources=%d; refresh=%s", s.blockedCount(), len(s.blocklistURLs), s.refreshEvery)
 
+	// 2) HTTP server bật ngay → /health trả 200 → Render không kill.
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleRoot)
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/dns-query", s.handleDoH)
 
 	addr := ":" + port
-	log.Printf("DoH server listening on %s; upstream=%s", addr, upstream)
+	log.Printf("HTTP listening on %s; upstream=%s; remote sources=%d; refresh=%s",
+		addr, upstream, len(s.blocklistURLs), s.refreshEvery)
 	log.Fatal(http.ListenAndServe(addr, securityHeaders(mux)))
 }
 
@@ -82,16 +92,34 @@ func (s *server) handleRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = io.WriteString(w, "Go DoH resolver is running.\nEndpoint: /dns-query\nHealth: /health\n")
+	status := "loading"
+	if s.ready.Load() {
+		status = "ready"
+	}
+	fmt.Fprintf(w, "Go DoH resolver\nEndpoint: /dns-query\nHealth: /health\nStatus: %s\nBlocked: %d\n",
+		status, s.blockedCount())
 }
 
+// /health LUÔN trả 200 khi HTTP đã lên — Render dựa vào đây để coi deploy là healthy.
+// Nếu trả non-200 trong lúc tải blocklist, Render sẽ kill service → đây chính là bug cũ.
 func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	_, _ = io.WriteString(w, "ok\n")
+	if s.ready.Load() {
+		_, _ = io.WriteString(w, "ok\n")
+	} else {
+		_, _ = io.WriteString(w, "ok (loading blocklist)\n")
+	}
 }
 
 func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
+	// Chưa tải xong blocklist → từ chối phục vụ DNS.
+	if !s.ready.Load() {
+		w.Header().Set("Retry-After", "10")
+		http.Error(w, "resolver is still loading blocklist", http.StatusServiceUnavailable)
+		return
+	}
+
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		w.Header().Set("Allow", "GET, POST")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -211,49 +239,53 @@ func (s *server) blockedCount() int {
 	return len(s.blocked)
 }
 
-func (s *server) refreshLoop() {
-	ticker := time.NewTicker(s.refreshEvery)
-	defer ticker.Stop()
-	for range ticker.C {
-		s.refreshBlocklists()
+// initialLoad chạy trong nền: retry với exponential backoff cho đến khi ít nhất
+// một URL HTTPS tải thành công. Xong mới set ready=true để mở /dns-query.
+func (s *server) initialLoad() {
+	backoff := 2 * time.Second
+	for {
+		if s.refreshBlocklists() {
+			s.ready.Store(true)
+			log.Printf("blocklist: initial load complete; active blocked domains=%d", s.blockedCount())
+			return
+		}
+		log.Printf("blocklist: initial load failed; retrying in %s", backoff)
+		time.Sleep(backoff)
+		if backoff < 2*time.Minute {
+			backoff *= 2
+		}
 	}
 }
 
-func (s *server) refreshBlocklists() {
-	// Keep the built-in and manually configured entries, even when a URL is offline.
+// refreshLoop chỉ chạy sau khi initialLoad thành công.
+func (s *server) refreshLoop() {
+	backoff := time.Minute
+	for {
+		if s.refreshBlocklists() {
+			backoff = time.Minute
+			time.Sleep(s.refreshEvery)
+		} else {
+			log.Printf("blocklist: refresh failed; retrying in %s", backoff)
+			time.Sleep(backoff)
+			if backoff < 30*time.Minute {
+				backoff *= 2
+			}
+		}
+	}
+}
+
+// refreshBlocklists trả true nếu có ít nhất một nguồn remote tải thành công
+// (hoặc không có URL nào được cấu hình). Không đụng s.blocked nếu fail.
+func (s *server) refreshBlocklists() bool {
 	next := parseBlocklist(os.Getenv("BLOCKLIST"))
 	successful := 0
 
 	for _, source := range s.blocklistURLs {
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, source, nil)
+		count, err := s.fetchBlocklist(source, next)
 		if err != nil {
-			cancel()
-			log.Printf("blocklist: invalid URL %q: %v", source, err)
+			log.Printf("blocklist: %s: %v", source, err)
 			continue
 		}
-		req.Header.Set("User-Agent", "SocksHttpGate-DoH/1.0")
-		resp, err := s.client.Do(req)
-		if err != nil {
-			cancel()
-			log.Printf("blocklist: download failed for %s: %v", source, err)
-			continue
-		}
-		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
-			cancel()
-			log.Printf("blocklist: %s returned HTTP %d", source, resp.StatusCode)
-			continue
-		}
-		data, readErr := io.ReadAll(io.LimitReader(resp.Body, maxBlocklistBytes+1))
-		resp.Body.Close()
-		cancel()
-		if readErr != nil || len(data) > maxBlocklistBytes {
-			log.Printf("blocklist: failed or oversized response from %s", source)
-			continue
-		}
-
-		count := addListToSet(next, string(data))
 		if count > 0 {
 			successful++
 			log.Printf("blocklist: loaded %d domains from %s", count, source)
@@ -264,17 +296,52 @@ func (s *server) refreshBlocklists() {
 
 	if successful == 0 && len(s.blocklistURLs) > 0 {
 		log.Printf("blocklist: no remote source loaded successfully; keeping current list")
-		return
+		return false
 	}
 
 	s.blockMu.Lock()
 	s.blocked = next
 	s.blockMu.Unlock()
 	log.Printf("blocklist: active blocked domains=%d", len(next))
+	return true
 }
 
+// fetchBlocklist tải một nguồn và thêm domain vào dst. Trả về số domain parse được.
+func (s *server) fetchBlocklist(source string, dst map[string]struct{}) (int, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, source, nil)
+	if err != nil {
+		return 0, fmt.Errorf("invalid URL: %w", err)
+	}
+	req.Header.Set("User-Agent", "go-doh-render/1.0")
+
+	resp, err := s.blockClient.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("download failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBlocklistBytes+1))
+	if err != nil {
+		return 0, fmt.Errorf("read failed: %w", err)
+	}
+	if len(data) > maxBlocklistBytes {
+		return 0, fmt.Errorf("response exceeds %d bytes", maxBlocklistBytes)
+	}
+
+	return addListToSet(dst, string(data)), nil
+}
+
+// addListToSet đếm TẤT CẢ domain parse được (không phải chỉ domain mới),
+// để một nguồn trùng với defaults không bị coi là "no domains parsed".
 func addListToSet(dst map[string]struct{}, raw string) int {
-	before := len(dst)
+	count := 0
 	scanner := bufio.NewScanner(strings.NewReader(raw))
 	scanner.Buffer(make([]byte, 4096), 1024*1024)
 	for scanner.Scan() {
@@ -290,8 +357,8 @@ func addListToSet(dst map[string]struct{}, raw string) int {
 			continue
 		}
 
-		// Support hosts files (0.0.0.0 domain), plain domain lists,
-		// and common Adblock-style domain lines (||domain^).
+		// Hỗ trợ hosts file (0.0.0.0 domain), danh sách domain thuần,
+		// và dòng Adblock kiểu ||domain^.
 		if net.ParseIP(fields[0]) != nil {
 			fields = fields[1:]
 		}
@@ -304,9 +371,10 @@ func addListToSet(dst map[string]struct{}, raw string) int {
 				continue
 			}
 			dst[domain] = struct{}{}
+			count++
 		}
 	}
-	return len(dst) - before
+	return count
 }
 
 func normalizeListEntry(s string) string {
@@ -334,7 +402,7 @@ func parseURLs(raw string) []string {
 	for _, part := range strings.FieldsFunc(raw, func(r rune) bool {
 		return r == ',' || r == '\n' || r == '\r' || r == ';' || r == ' ' || r == '\t'
 	}) {
-		u := strings.TrimSpace(part)
+		u := strings.TrimSpace(strings.Trim(part, `"'`))
 		parsed, err := url.Parse(u)
 		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil {
 			log.Printf("blocklist: ignoring invalid/non-HTTPS URL %q", u)
