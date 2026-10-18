@@ -1,0 +1,33 @@
+# Keep ODOH_KEY_SEED only in Target secrets. Set ODOH_TARGET_URL manually on Proxy.
+services:
+  - type: pserv
+    name: sockshttpgate-odoh-target
+    runtime: docker
+    rootDir: ODoH
+    dockerfilePath: ./Target/Dockerfile
+    dockerContext: .
+    envVars:
+      - key: PORT
+        value: "8080"
+      - key: UPSTREAM_DOH
+        value: https://cloudflare-dns.com/dns-query
+      - key: BLOCKLIST_URLS
+        value: https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts
+      - key: BLOCKLIST_REFRESH
+        value: 6h
+      # Add ODOH_KEY_SEED manually as a Target-only secret.
+
+  - type: web
+    name: sockshttpgate-odoh-proxy
+    runtime: docker
+    rootDir: ODoH
+    dockerfilePath: ./Proxy/Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: "8080"
+      - key: ODOH_TARGET_URL
+        sync: false
+      - key: ALLOW_INSECURE_TARGET
+        value: "YES"
