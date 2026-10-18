@@ -377,4 +377,4 @@ $('refreshNow').addEventListener('click',refresh);
 refresh();setInterval(refresh,3000);
 })();
 </script>
-</body></html>
+</body></html>`
