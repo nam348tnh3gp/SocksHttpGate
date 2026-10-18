@@ -662,6 +662,7 @@ func main() {
 	mux.HandleFunc("/api/upstream", s.handleAPIUpstream)
 
 	addr := ":" + port
+	dlog.Infof("================ PROCESS START pid=%d at %s ================", os.Getpid(), time.Now().UTC().Format(time.RFC3339))
 	dlog.Infof("HTTP listening on %s; upstream=%s; remote sources=%d; refresh=%s; platform=%s/%s; go=%s",
 		addr, upstream, len(s.blocklistURLs), s.refreshEvery, runtime.GOOS, runtime.GOARCH, runtime.Version())
 	log.Fatal(http.ListenAndServe(addr, securityHeaders(mux)))
@@ -751,9 +752,6 @@ func (s *server) handleAPIStats(w http.ResponseWriter, r *http.Request) {
 	})
 
 	// Top domains
-	type kv struct {
-		d DomainStat
-	}
 	var topHit, topBlk []DomainStat
 	s.domainHits.Range(func(k, v any) bool {
 		ds := v.(*domainStat)
@@ -997,22 +995,33 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	defer logRing.Unsubscribe(logCh)
 	defer queryRing.Unsubscribe(queryCh)
 
+	// SSE lifetime cap 1h — tránh leak nếu client treo / tab mở lâu.
+	// Browser EventSource tự reconnect, không mất dữ liệu.
+	sseDeadline := time.After(1 * time.Hour)
 	hb := time.NewTicker(20 * time.Second)
 	defer hb.Stop()
 	for {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-sseDeadline:
+			return
 		case e := <-logCh:
 			data, _ := json.Marshal(e)
-			fmt.Fprintf(w, "event: log\ndata: %s\n\n", data)
+			if _, err := fmt.Fprintf(w, "event: log\ndata: %s\n\n", data); err != nil {
+				return
+			}
 			flusher.Flush()
 		case e := <-queryCh:
 			data, _ := json.Marshal(e)
-			fmt.Fprintf(w, "event: query\ndata: %s\n\n", data)
+			if _, err := fmt.Fprintf(w, "event: query\ndata: %s\n\n", data); err != nil {
+				return
+			}
 			flusher.Flush()
 		case <-hb.C:
-			fmt.Fprint(w, ": ping\n\n")
+			if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil {
+				return
+			}
 			flusher.Flush()
 		}
 	}
@@ -1333,6 +1342,8 @@ func (s *server) refreshBlocklists() bool {
 	s.blockMu.Unlock()
 	s.lastRefresh.Store(time.Now().Unix())
 	dlog.Infof("blocklist: active blocked domains=%d", len(next))
+	// Trả bộ nhớ về OS sau refresh — tránh peak memory khi parse list lớn.
+	debug.FreeOSMemory()
 	return true
 }
 
@@ -1488,5 +1499,3 @@ func env(key, fallback string) string {
 	}
 	return fallback
 }
-
-var _ = debug.SetGCPercent // giữ import runtime/debug (có thể dùng mở rộng sau)
