@@ -206,3 +206,20 @@ func FuzzTargetMalformedODoH(f *testing.F) {
 	})
 }
 
+
+
+func TestVersionedRESTEndpoints(t *testing.T) {
+ tgt := &target{started:time.Now(),blocked:map[string]struct{}{}}
+ mux := http.NewServeMux()
+ mux.HandleFunc("/api/v1/status",tgt.apiStatus)
+ mux.HandleFunc("/api/v1/health",tgt.health)
+ mux.HandleFunc("/api/v1/stats",tgt.stats)
+ for _, path := range []string{"/api/v1/status","/api/v1/health","/api/v1/stats"} {
+  t.Run(path,func(t *testing.T) {
+   rec:=httptest.NewRecorder()
+   mux.ServeHTTP(rec,httptest.NewRequest(http.MethodGet,path,nil))
+   if rec.Code != http.StatusOK { t.Fatalf("status=%d body=%q",rec.Code,rec.Body.String()) }
+   if path != "/api/v1/health" && mediaType(rec.Header().Get("Content-Type")) != "application/json" { t.Fatalf("content-type=%q",rec.Header().Get("Content-Type")) }
+  })
+ }
+}
