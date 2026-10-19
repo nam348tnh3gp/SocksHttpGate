@@ -1,4 +1,4 @@
-name: ODoH Go checks
+name: ODoH full validation
 
 on:
   push:
@@ -11,22 +11,46 @@ on:
       - ".github/workflows/odoh.yml"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  build:
+  validate:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: ODoH
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
           go-version: "1.23.x"
           cache: true
           cache-dependency-path: ODoH/go.mod
-      - name: Resolve dependencies
+      - name: Resolve and verify modules
         run: go mod tidy
-      - name: Compile Proxy and Target
-        run: go build ./Proxy ./Target
-      - name: Run package tests
-        run: go test ./...
+      - name: Check formatting of integration test
+        run: |
+          files="$(gofmt -l integration/e2e_test.go)"
+          if [ -n "$files" ]; then
+            echo "Go files need gofmt:"
+            echo "$files"
+            exit 1
+          fi
+      - name: Static analysis
+        run: go vet ./...
+      - name: Build Proxy and Target
+        run: |
+          go build -trimpath ./Proxy
+          go build -trimpath ./Target
+      - name: Run all tests with race detector
+        env:
+          GODEBUG: "httpmuxgo121=0"
+        run: go test -race -count=1 -v ./...
+      - name: Build Proxy Docker image
+        run: docker build --pull -f Proxy/Dockerfile -t sockshttpgate-odoh-proxy:ci .
+      - name: Build Target Docker image
+        run: docker build --pull -f Target/Dockerfile -t sockshttpgate-odoh-target:ci .
