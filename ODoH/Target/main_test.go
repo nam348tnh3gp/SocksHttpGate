@@ -91,7 +91,7 @@ func TestODoHQueryRoundTripAndBlocklist(t *testing.T) {
 		if err != nil {
 			t.Fatalf("decode ODoH response: %v", err)
 		}
-		plain, err := queryContext.DecryptResponse(encryptedResponse)
+		plain, err := queryContext.OpenAnswer(encryptedResponse)
 		if err != nil {
 			t.Fatalf("decrypt ODoH response: %v", err)
 		}
