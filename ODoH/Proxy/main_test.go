@@ -120,3 +120,27 @@ func TestProxyHealthChecksTarget(t *testing.T) {
 		t.Fatalf("status with unavailable Target = %d, want 503", rec.Code)
 	}
 }
+
+
+func TestVersionedRESTEndpoints(t *testing.T) {
+ target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+  if r.URL.Path == "/health" { w.WriteHeader(http.StatusOK); return }
+  http.NotFound(w,r)
+ }))
+ defer target.Close()
+ targetURL, err := url.Parse(target.URL)
+ if err != nil { t.Fatal(err) }
+ p := &proxy{target:targetURL,client:target.Client(),started:time.Now()}
+ mux := http.NewServeMux()
+ mux.HandleFunc("/api/v1/status",p.apiStatus)
+ mux.HandleFunc("/api/v1/health",p.health)
+ mux.HandleFunc("/api/v1/stats",p.stats)
+ for _, path := range []string{"/api/v1/status","/api/v1/health","/api/v1/stats"} {
+  t.Run(path,func(t *testing.T) {
+   rec:=httptest.NewRecorder()
+   mux.ServeHTTP(rec,httptest.NewRequest(http.MethodGet,path,nil))
+   if rec.Code != http.StatusOK { t.Fatalf("status=%d body=%q",rec.Code,rec.Body.String()) }
+   if path != "/api/v1/health" && media(rec.Header().Get("Content-Type")) != "application/json" { t.Fatalf("content-type=%q",rec.Header().Get("Content-Type")) }
+  })
+ }
+}
