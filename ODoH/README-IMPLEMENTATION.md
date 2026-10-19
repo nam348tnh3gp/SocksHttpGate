@@ -1,43 +1,88 @@
-# SocksHttpGate ODoH services — initial implementation
+# SocksHttpGate ODoH services
 
-Two separate Go services:
-- **Proxy**: opaque forwarding only. It does not import the ODoH crypto library, possess the Target key, forward client IP headers, or log individual queries/domains.
-- **Target**: owns the HPKE key, decrypts ODoH messages, resolves DNS over HTTPS, applies a hosts-format blocklist, and encrypts responses. Logs only aggregate blocklist refresh counts.
+This directory contains two separate Go services implementing the ODoH request path:
 
-Protocol reference: [RFC 9230](https://www.rfc-editor.org/rfc/rfc9230.html). This first version uses archived Cloudflare `odoh-go`; it requires independent review and RFC test-vector verification before real traffic.
+- **Proxy** — accepts ODoH messages, forwards opaque bytes to a fixed Target origin, and does not hold the Target private key. It does not forward client-supplied IP headers or log individual queries/domains.
+- **Target** — publishes ODoH configuration, decrypts requests, checks the configured hosts-format blocklist, resolves allowed names over HTTPS DoH, then encrypts the DNS response.
+- **Integration test** — starts both actual service binaries locally and sends encrypted requests through the Proxy to the Target. Allowed-domain resolution uses the real public Cloudflare DoH endpoint; the blocked-domain case verifies NXDOMAIN.
 
-## Local build
+Protocol reference: [RFC 9230](https://www.rfc-editor.org/rfc/rfc9230.html).
 
-Requires Go 1.23+.
+## GitHub Actions validation
+
+The workflow at `.github/workflows/odoh.yml` runs on ODoH changes and manually. It performs:
+
+1. Dependency resolution with `go mod tidy`.
+2. Formatting check for the integration test and `go vet ./...`.
+3. Builds both Go services.
+4. Runs `go test -race -count=1 -v ./...`, including the real Proxy → Target → Cloudflare DoH integration test.
+5. Builds both Docker images.
+
+The end-to-end tests require outbound HTTPS access to `cloudflare-dns.com`. A passing run verifies the tested path at that commit; it does not certify all ODoH implementations or all DNS names.
+
+## Build and test locally
+
+Requires Go 1.23+ and Docker for image builds.
 
 ```sh
 cd ODoH
 go mod tidy
-go test ./...
-go test -race ./...
 go vet ./...
-go build ./Proxy ./Target
+go test -race -count=1 -v ./...
+go build -trimpath ./Proxy
+go build -trimpath ./Target
+docker build -f Proxy/Dockerfile -t sockshttpgate-odoh-proxy .
+docker build -f Target/Dockerfile -t sockshttpgate-odoh-target .
 ```
 
-Generate a persistent Target-only key seed with `openssl rand -hex 32`. Store the result as secret `ODOH_KEY_SEED` on **Target only**. Never put it in the Proxy environment or repository. Keep the same seed across restarts.
+The integration test binds both services to ephemeral loopback ports and uses `ALLOW_INSECURE_TARGET=YES` only for its local HTTP hop. Do not use that override for a public or untrusted network.
 
-Target environment: `ODOH_KEY_SEED` (required, 64 hex chars), `UPSTREAM_DOH` (HTTPS URL), optional `BLOCKLIST`, optional `BLOCKLIST_URLS` (HTTPS hosts-file URLs), `BLOCKLIST_REFRESH` (minimum 1m; default 6h), `PORT` or `ADDR`.
+## Configuration
 
-Proxy environment: `ODOH_TARGET_URL` (fixed Target origin, no path; HTTPS required except explicit private-test override `ALLOW_INSECURE_TARGET=YES`), `PORT` or `ADDR`.
+Generate a persistent Target key seed:
 
-Endpoints: `GET /.well-known/odohconfigs`, `POST /proxy`, `GET /health`, `GET /api/stats` (aggregate counters only).
+```sh
+openssl rand -hex 32
+```
 
-## Deployment / limitations
+Set the resulting 64-character hex string as the secret `ODOH_KEY_SEED` **on the Target service only**. Never commit it, expose it in logs, or put it in the Proxy environment. Keep it stable across restarts so clients can continue using the same published key configuration.
 
-The Render blueprint keeps Target private and Proxy public. Set the Proxy's `ODOH_TARGET_URL` manually to the Target's internal origin, e.g. `http://sockshttpgate-odoh-target:8080` only if that is the actual private hostname/port Render assigns. The blueprint allows HTTP only for this private hop; use HTTPS if supported. Add `ODOH_KEY_SEED` manually as a Target secret.
+Target environment:
+- `ODOH_KEY_SEED` — required 32-byte seed encoded as 64 hex characters.
+- `UPSTREAM_DOH` — HTTPS DoH URL; defaults to Cloudflare.
+- `BLOCKLIST` — optional inline domains separated by commas, spaces, or newlines.
+- `BLOCKLIST_URLS` — optional comma/semicolon/newline-separated HTTPS hosts-list URLs.
+- `BLOCKLIST_REFRESH` — refresh period, default `6h`, minimum `1m`.
+- `PORT` or `ADDR` — listen address.
 
-For meaningful separation, Proxy and Target should be administered under different trust domains. One provider administrator able to inspect both services can still correlate traffic. ODoH does not hide timing/volume or the Target's view of the Proxy IP.
+Proxy environment:
+- `ODOH_TARGET_URL` — fixed Target origin with no path. HTTPS is required except for an explicitly enabled trusted-private-network HTTP hop.
+- `ALLOW_INSECURE_TARGET=YES` — development/private-network exception only; do not enable for a public/untrusted hop.
+- `PORT` or `ADDR` — listen address.
 
-This is not a security audit or a claim of full RFC 9230 conformance. The ODoH library is archived; test vectors, fuzzing, and end-to-end compatibility checks remain necessary. Failed remote blocklist refresh keeps the last-known-good list when one exists. The archived parser also requires independent review; the Target now recovers per request from parser panics, but that is defense-in-depth, not a substitute for replacing the dependency.
+Endpoints on both services:
+- `GET /.well-known/odohconfigs`
+- `POST /proxy` (ODoH content type: `application/oblivious-dns-message`)
+- `GET /health`
+- `GET /api/stats` (aggregate counters only)
 
+## Render deployment
 
-## Compatibility and test status
+The blueprint in `render.yaml` declares a private Target and a public Proxy. Before deploying:
 
-The automated tests now exercise an encrypted ODoH query/response round trip against a stub HTTPS DNS upstream, verify that a blocklisted name returns NXDOMAIN without reaching upstream, and check that the Proxy forwards opaque ODoH payloads without forwarding `X-Forwarded-For`. These are regression tests, not a complete RFC 9230 conformance suite. Run the commands above locally and confirm the GitHub Actions run before deployment.
+1. Add `ODOH_KEY_SEED` as a secret on the Target only.
+2. Set the Proxy's `ODOH_TARGET_URL` to the actual private internal origin assigned to the Target by Render.
+3. Prefer HTTPS for the Proxy-to-Target hop where the platform supports it. The blueprint's `ALLOW_INSECURE_TARGET=YES` setting is only acceptable if that hop is guaranteed private and trusted; otherwise remove it and configure HTTPS.
+4. Verify the deployed `/health`, `/.well-known/odohconfigs`, and a real encrypted query before sending user traffic.
 
-**Do not enter this ODoH Proxy URL into a DoH-only field in Rethink DNS.** ODoH uses the `application/oblivious-dns-message` format at `/proxy`; conventional DoH uses `application/dns-message` at a `/dns-query` endpoint. This implementation intentionally does not expose a DoH `/dns-query` endpoint, so `http://127.0.0.1:8080/dns-query` will not work. `127.0.0.1` is also reachable only from the same device. To use Rethink DNS, a separate conventional DoH endpoint would need to be implemented and deployed over HTTPS; that endpoint would be DoH, not ODoH.
+Do not assume the example internal hostname in documentation is correct for your deployed service; confirm the actual Render internal hostname and port.
+
+## Security and known limitations
+
+**This is not yet a production security certification or a claim of full RFC 9230 conformance.** The current implementation depends on archived `github.com/cloudflare/odoh-go`. Although request handling has panic recovery and the test suite checks the end-to-end path, an archived protocol library is a material maintenance and security risk. Before exposing this to real users, replace or independently audit the dependency, validate published RFC 9230 test vectors, fuzz malformed ODoH/DNS messages, review key rotation and replay/abuse handling, and conduct an independent security review.
+
+ODoH reduces direct linkage between the client and the DNS Target only when the Proxy and Target are operated with meaningful trust separation. If one administrator/provider can observe both services, traffic timing and volume may still be correlated. The Target sees the Proxy's network identity; ODoH does not hide timing or traffic volume. No individual-query logging is intended, but infrastructure/provider-level logging must also be reviewed.
+
+Blocklist refresh keeps the last-known-good list when refresh sources fail and an existing list is present. Configure trustworthy HTTPS sources and monitor aggregate stats. The public Proxy's health endpoint reports process health, not end-to-end Target readiness.
+
+**Do not enter this ODoH Proxy URL into a DoH-only field in Rethink DNS.** ODoH uses `application/oblivious-dns-message` at `/proxy`; conventional DoH uses `application/dns-message` at `/dns-query`. This service does not implement a conventional DoH endpoint, and the two protocols are not interchangeable.
