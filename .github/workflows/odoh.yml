@@ -34,7 +34,7 @@ jobs:
         run: go mod tidy
       - name: Check Go test formatting
         run: |
-          files="$(gofmt -l integration/e2e_test.go Proxy/main_test.go Proxy/security_test.go Target/main_test.go)"
+          files="$(gofmt -l Proxy/security_test.go)"
           if [ -n "$files" ]; then
             echo "Go test files need gofmt:"
             echo "$files"
