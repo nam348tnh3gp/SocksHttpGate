@@ -109,4 +109,3 @@ func TestProxyDoesNotFollowTargetRedirect(t *testing.T) {
 		t.Fatal("proxy followed a Target redirect to another origin")
 	}
 }
-
