@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -42,7 +43,7 @@ func TestODoHQueryRoundTripAndBlocklist(t *testing.T) {
 		reply.SetReply(query)
 		reply.Answer = append(reply.Answer, &dns.A{
 			Hdr: dns.RR_Header{Name: query.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
-			A:   []byte{192, 0, 2, 10},
+			A:   net.ParseIP("192.0.2.10").To4(),
 		})
 		body, err := reply.Pack()
 		if err != nil {
