@@ -122,3 +122,56 @@ func TestODoHQueryRoundTripAndBlocklist(t *testing.T) {
 		t.Fatalf("blocked response rcode = %s, want NXDOMAIN", dns.RcodeToString[blocked.Rcode])
 	}
 }
+
+func TestTargetRejectsMalformedRequests(t *testing.T) {
+	seed := bytes.Repeat([]byte{0x24}, 32)
+	kp, err := odoh.CreateDefaultKeyPairFromSeed(seed)
+	if err != nil {
+		t.Fatalf("create key pair: %v", err)
+	}
+	target := &target{kp: kp, blocked: map[string]struct{}{}}
+
+	t.Run("wrong method", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/proxy", nil)
+		rec := httptest.NewRecorder()
+		target.query(rec, req)
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("status = %d, want 405", rec.Code)
+		}
+	})
+
+	t.Run("wrong content type", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/proxy", bytes.NewBufferString("bad"))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		target.query(rec, req)
+		if rec.Code != http.StatusUnsupportedMediaType {
+			t.Fatalf("status = %d, want 415", rec.Code)
+		}
+	})
+
+	t.Run("malformed encrypted message", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/proxy", bytes.NewReader([]byte{0xff, 0x00, 0x01}))
+		req.Header.Set("Content-Type", odohType)
+		rec := httptest.NewRecorder()
+		target.query(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body=%q", rec.Code, rec.Body.String())
+		}
+	})
+}
+
+func TestBlocklistSuffixMatching(t *testing.T) {
+	target := &target{blocked: parseInline("ads.example, tracker.test")}
+
+	for _, domain := range []string{"ads.example.", "sub.ads.example.", "tracker.test."} {
+		if !target.isBlocked(domain) {
+			t.Errorf("isBlocked(%q) = false, want true", domain)
+		}
+	}
+	for _, domain := range []string{"notads.example.", "safe.test.", "example."} {
+		if target.isBlocked(domain) {
+			t.Errorf("isBlocked(%q) = true, want false", domain)
+		}
+	}
+}
