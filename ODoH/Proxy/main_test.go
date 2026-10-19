@@ -77,3 +77,46 @@ func TestProxyRejectsWrongContentType(t *testing.T) {
 		t.Fatalf("status = %d, want 415", rec.Code)
 	}
 }
+
+func TestProxyHealthChecksTarget(t *testing.T) {
+	available := true
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/health" {
+			t.Errorf("target path = %q, want /health", r.URL.Path)
+		}
+		if !available {
+			http.Error(w, "not ready", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+
+	targetURL, err := url.Parse(target.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &proxy{target: targetURL, client: target.Client(), started: time.Now()}
+
+	for _, tc := range []struct {
+		name string
+		want int
+	}{
+		{name: "target ready", want: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			p.health(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+			if rec.Code != tc.want {
+				t.Fatalf("status = %d, want %d", rec.Code, tc.want)
+			}
+		})
+	}
+
+	available = false
+	rec := httptest.NewRecorder()
+	p.health(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status with unavailable Target = %d, want 503", rec.Code)
+	}
+}
