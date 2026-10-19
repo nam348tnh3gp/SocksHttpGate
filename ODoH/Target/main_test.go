@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,9 +20,9 @@ func TestODoHQueryRoundTripAndBlocklist(t *testing.T) {
 		t.Fatalf("create key pair: %v", err)
 	}
 
-	upstreamCalls := 0
+	var upstreamCalls atomic.Int32
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upstreamCalls++
+		upstreamCalls.Add(1)
 		if got := mediaType(r.Header.Get("Content-Type")); got != dnsType {
 			t.Errorf("upstream Content-Type = %q, want %q", got, dnsType)
 		}
@@ -143,7 +144,7 @@ func TestODoHQueryRoundTripAndBlocklist(t *testing.T) {
 	if blocked.Rcode != dns.RcodeNameError {
 		t.Fatalf("blocked response rcode = %s, want NXDOMAIN", dns.RcodeToString[blocked.Rcode])
 	}
-	if upstreamCalls != 1 {
-		t.Fatalf("upstream calls = %d, want 1 (blocked query must not reach upstream)", upstreamCalls)
+	if got := upstreamCalls.Load(); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1 (blocked query must not reach upstream)", got)
 	}
 }
