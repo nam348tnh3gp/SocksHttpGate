@@ -10,7 +10,7 @@ Protocol reference: [RFC 9230](https://www.rfc-editor.org/rfc/rfc9230.html).
 
 ## API specification
 
-The OpenAPI 3.1 specification is maintained in [`openapi.yaml`](./openapi.yaml). It documents the public ODoH protocol endpoints and aggregate diagnostics. There are deliberately no public endpoints for changing the Target key or blocklist: those operations would need a separate authenticated administrative interface and should not be exposed on the public Proxy.
+The OpenAPI 3.1 specification is maintained in [`openapi.yaml`](./openapi.yaml). It documents the public ODoH protocol endpoints, versioned JSON status/health/stats routes, and aggregate diagnostics. There are deliberately no public endpoints for changing the Target key or blocklist: those operations would need a separate authenticated administrative interface and should not be exposed on the public Proxy.
 
 ## GitHub Actions validation
 
@@ -69,7 +69,7 @@ Endpoints on both services:
 - `GET /.well-known/odohconfigs`
 - `POST /proxy` (ODoH content type: `application/oblivious-dns-message`)
 - `GET /health`
-- `GET /api/stats` (aggregate counters only)
+- `GET /api/stats` and `GET /api/v1/stats` (aggregate counters only)\n- `GET /api/v1/status` (versioned JSON process status; does not prove the Target/upstream is healthy)\n- `GET /api/v1/health` (versioned health alias; Proxy checks Target availability)
 
 ## Render deployment
 
