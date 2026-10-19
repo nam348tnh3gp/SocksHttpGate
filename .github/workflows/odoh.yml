@@ -38,8 +38,8 @@ jobs:
         run: go vet ./...
       - name: Build Proxy and Target
         run: |
-          go build -trimpath ./Proxy
-          go build -trimpath ./Target
+          go build -trimpath -o ../.odoh-proxy-ci ./Proxy
+          go build -trimpath -o ../.odoh-target-ci ./Target
       - name: Run all tests with race detector
         env:
           GODEBUG: "httpmuxgo121=0"
