@@ -14,6 +14,8 @@ Requires Go 1.23+.
 cd ODoH
 go mod tidy
 go test ./...
+go test -race ./...
+go vet ./...
 go build ./Proxy ./Target
 ```
 
@@ -32,3 +34,10 @@ The Render blueprint keeps Target private and Proxy public. Set the Proxy's `ODO
 For meaningful separation, Proxy and Target should be administered under different trust domains. One provider administrator able to inspect both services can still correlate traffic. ODoH does not hide timing/volume or the Target's view of the Proxy IP.
 
 This is not a security audit or a claim of full RFC 9230 conformance. The ODoH library is archived; test vectors, fuzzing, and end-to-end compatibility checks remain necessary. Failed remote blocklist refresh keeps the last-known-good list when one exists. The archived parser also requires independent review; the Target now recovers per request from parser panics, but that is defense-in-depth, not a substitute for replacing the dependency.
+
+
+## Compatibility and test status
+
+The automated tests now exercise an encrypted ODoH query/response round trip against a stub HTTPS DNS upstream, verify that a blocklisted name returns NXDOMAIN without reaching upstream, and check that the Proxy forwards opaque ODoH payloads without forwarding `X-Forwarded-For`. These are regression tests, not a complete RFC 9230 conformance suite. Run the commands above locally and confirm the GitHub Actions run before deployment.
+
+**Do not enter this ODoH Proxy URL into a DoH-only field in Rethink DNS.** ODoH uses the `application/oblivious-dns-message` format at `/proxy`; conventional DoH uses `application/dns-message` at a `/dns-query` endpoint. This implementation intentionally does not expose a DoH `/dns-query` endpoint, so `http://127.0.0.1:8080/dns-query` will not work. `127.0.0.1` is also reachable only from the same device. To use Rethink DNS, a separate conventional DoH endpoint would need to be implemented and deployed over HTTPS; that endpoint would be DoH, not ODoH.
