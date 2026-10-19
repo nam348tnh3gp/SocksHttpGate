@@ -1,0 +1,99 @@
+openapi: 3.1.0
+info:
+  title: SocksHttpGate ODoH Proxy and Target API
+  version: 1.0.0
+  description: |
+    Public ODoH protocol endpoints plus read-only aggregate diagnostics.
+    The Proxy forwards opaque ODoH messages and must not receive the Target key.
+    These endpoints do not expose administrative key or blocklist mutation.
+servers:
+  - url: https://{proxyHost}
+    description: Public Proxy origin
+    variables:
+      proxyHost:
+        default: odoh-proxy.example.com
+paths:
+  /.well-known/odohconfigs:
+    get:
+      summary: Retrieve the Target's published ODoH configuration
+      description: Proxied unchanged by Proxy; clients use this binary config to encrypt queries.
+      responses:
+        "200":
+          description: Serialized ODoH configuration list
+          content:
+            application/oblivious-dns-message:
+              schema:
+                type: string
+                format: binary
+        "405":
+          description: Method not allowed
+        "502":
+          description: Target unavailable or returned an invalid response
+  /proxy:
+    post:
+      summary: Submit an encrypted ODoH DNS query
+      description: |
+        The request body is an encrypted ODoH message, not a raw DNS packet.
+        Proxy forwards opaque bytes. Target decrypts, applies the blocklist,
+        resolves allowed queries over HTTPS DoH, and encrypts the response.
+      requestBody:
+        required: true
+        content:
+          application/oblivious-dns-message:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: Encrypted ODoH response
+          content:
+            application/oblivious-dns-message:
+              schema:
+                type: string
+                format: binary
+        "400":
+          description: Invalid request body or malformed ODoH message
+        "405":
+          description: Method not allowed
+        "415":
+          description: Unsupported content type
+        "502":
+          description: Target or upstream DNS resolution failed
+  /health:
+    get:
+      summary: Liveness check
+      responses:
+        "200":
+          description: Process is running
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: ok
+        "405":
+          description: Method not allowed
+  /api/stats:
+    get:
+      summary: Read aggregate service counters
+      description: |
+        Returns aggregate counters only. It must not include client IP addresses,
+        queried domains, DNS payloads, encryption keys, or per-query records.
+      responses:
+        "200":
+          description: Aggregate diagnostics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ready:
+                    type: boolean
+                  uptime_seconds:
+                    type: integer
+                  errors:
+                    type: integer
+                  privacy_mode:
+                    type: string
+                required: [ready, uptime_seconds, errors, privacy_mode]
+        "405":
+          description: Method not allowed
