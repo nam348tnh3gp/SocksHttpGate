@@ -97,3 +97,55 @@ paths:
                 required: [ready, uptime_seconds, errors, privacy_mode]
         "405":
           description: Method not allowed
+
+  /api/v1/status:
+    get:
+      summary: Get versioned service status
+      description: Returns process status only; use /health to check Proxy-to-Target readiness.
+      responses:
+        "200":
+          description: Service process is running
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  service:
+                    type: string
+                    enum: [odoh-proxy, odoh-target]
+                  status:
+                    type: string
+                    enum: [running]
+                  protocol:
+                    type: string
+                    example: RFC 9230 ODoH
+                  uptime_seconds:
+                    type: integer
+                required: [service, status, protocol, uptime_seconds]
+        "405":
+          description: Method not allowed
+  /api/v1/health:
+    get:
+      summary: Versioned health check
+      description: Same behavior as /health; Proxy checks the Target health endpoint.
+      responses:
+        "200":
+          description: Service healthy
+        "503":
+          description: Proxy Target is unavailable
+        "405":
+          description: Method not allowed
+  /api/v1/stats:
+    get:
+      summary: Get versioned aggregate counters
+      description: Alias of /api/stats. Contains aggregate counters only and no per-query records.
+      responses:
+        "200":
+          description: Aggregate service counters
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "405":
+          description: Method not allowed
