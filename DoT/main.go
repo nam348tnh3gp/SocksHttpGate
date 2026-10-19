@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
@@ -28,8 +29,9 @@ type resolver struct {
 	blocklistURLs []string
 	refreshEvery time.Duration
 	sources map[string]*blocklistSourceState
-	lastRefresh time.Time
-	ready bool
+	lastRefresh atomic.Int64
+	ready atomic.Bool
+	blocklistVersion atomic.Uint64
 
 	upstreamMu sync.RWMutex
 	stateMu sync.RWMutex
@@ -67,7 +69,7 @@ func main() {
 	if len(blocklistURLs) > 0 {
 		go func() { r.initialLoad(); r.refreshLoop() }()
 	} else {
-		r.ready = true
+		r.ready.Store(true)
 		log.Printf("BLOCKLIST_URLS empty; remote blocklist refresh disabled")
 	}
 
@@ -110,14 +112,12 @@ func (r *resolver) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 		qtype = "UNKNOWN"
 	}
 	clientAddr := w.RemoteAddr().String()
-	r.incrementQuery()
-
 	if r.isBlocked(name) {
 		reply := new(dns.Msg)
 		reply.SetReply(req)
 		reply.Authoritative = true
 		reply.Rcode = dns.RcodeNameError
-		r.recordLog(queryLogEntry{Time: time.Now(), Domain: name, Type: qtype, Client: clientAddr, RCode: dns.RcodeToString[dns.RcodeNameError], Action: "BLOCK"})
+		r.recordQuery(name, qtype, clientAddr, dns.RcodeToString[dns.RcodeNameError], "BLOCK")
 		log.Printf("BLOCK domain=%s type=%s client=%s", name, qtype, clientAddr)
 		if err := w.WriteMsg(reply); err != nil {
 			log.Printf("write blocked response: %v", err)
@@ -128,8 +128,7 @@ func (r *resolver) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 	client, upstream, _ := r.getUpstream()
 	response, _, err := client.Exchange(req, upstream)
 	if err != nil || response == nil {
-		r.incrementError()
-		r.recordLog(queryLogEntry{Time: time.Now(), Domain: name, Type: qtype, Client: clientAddr, RCode: dns.RcodeToString[dns.RcodeServerFailure], Action: "ERROR"})
+		r.recordQuery(name, qtype, clientAddr, dns.RcodeToString[dns.RcodeServerFailure], "ERROR")
 		log.Printf("upstream failure domain=%s upstream=%s err=%v", name, upstream, err)
 		reply := new(dns.Msg)
 		reply.SetRcode(req, dns.RcodeServerFailure)
@@ -139,7 +138,7 @@ func (r *resolver) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 
-	r.recordLog(queryLogEntry{Time: time.Now(), Domain: name, Type: qtype, Client: clientAddr, RCode: dns.RcodeToString[response.Rcode], Action: "QUERY"})
+	r.recordQuery(name, qtype, clientAddr, dns.RcodeToString[response.Rcode], "QUERY")
 	log.Printf("QUERY domain=%s type=%s client=%s rcode=%s", name, qtype, clientAddr, dns.RcodeToString[response.Rcode])
 	if err := w.WriteMsg(response); err != nil {
 		log.Printf("write DNS response: %v", err)

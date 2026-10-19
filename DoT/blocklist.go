@@ -45,7 +45,7 @@ func (r *resolver) initialLoad() {
 	backoff := 2 * time.Second
 	for {
 		if r.refreshBlocklists() {
-			r.stateMu.Lock(); r.ready = true; r.stateMu.Unlock()
+			r.stateMu.Lock(); r.ready.Store(true); r.stateMu.Unlock()
 			log.Printf("blocklist: initial load complete; active blocked domains=%d", r.blockedCount())
 			return
 		}
@@ -92,7 +92,7 @@ func (r *resolver) refreshBlocklists() bool {
 	}
 	r.stateMu.Lock()
 	r.blocked = next
-	r.lastRefresh = time.Now().UTC()
+	r.lastRefresh.Store(time.Now().UTC().Unix())
 	r.stateMu.Unlock()
 	log.Printf("blocklist: active blocked domains=%d", len(next))
 	return true

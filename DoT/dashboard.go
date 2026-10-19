@@ -2,9 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -39,25 +41,26 @@ type statsResponse struct {
 	Sources map[string]*blocklistSourceState `json:"sources"`
 }
 
-func (r *resolver) incrementQuery() {
+// recordQuery records a DNS query in one lock acquisition:
+// updates counters, last_query, append log, trim to 200.
+func (r *resolver) recordQuery(name, qtype, client, rcode, action string) {
 	r.stateMu.Lock()
 	r.stats.Queries++
 	r.stats.LastQuery = time.Now().Format(time.RFC3339)
-	r.stateMu.Unlock()
-}
-
-func (r *resolver) incrementError() {
-	r.stateMu.Lock()
-	r.stats.Errors++
-	r.stateMu.Unlock()
-}
-
-func (r *resolver) recordLog(entry queryLogEntry) {
-	r.stateMu.Lock()
-	if entry.Action == "BLOCK" {
+	switch action {
+	case "BLOCK":
 		r.stats.Blocked++
+	case "ERROR":
+		r.stats.Errors++
 	}
-	r.logs = append(r.logs, entry)
+	r.logs = append(r.logs, queryLogEntry{
+		Time:   time.Now(),
+		Domain: name,
+		Type:   qtype,
+		Client: client,
+		RCode:  rcode,
+		Action: action,
+	})
 	if len(r.logs) > 200 {
 		r.logs = append([]queryLogEntry(nil), r.logs[len(r.logs)-200:]...)
 	}
@@ -85,8 +88,10 @@ func (r *resolver) serveDashboard(addr, listenAddr, upstream string) {
 		sources := make(map[string]*blocklistSourceState, len(r.sources))
 		for key, value := range r.sources { copyValue := *value; sources[key] = &copyValue }
 		lastRefresh := ""
-		if !r.lastRefresh.IsZero() { lastRefresh = r.lastRefresh.Format(time.RFC3339) }
-		s := statsResponse{dashboardStats: r.stats, UptimeSeconds: int64(time.Since(r.started).Seconds()), ListenAddress: listenAddr, BlockedDomains: blockedCount, Ready: r.ready, RefreshEvery: r.refreshEvery.String(), LastRefresh: lastRefresh, Sources: sources}
+		if ts := r.lastRefresh.Load(); ts > 0 {
+			lastRefresh = time.Unix(ts, 0).UTC().Format(time.RFC3339)
+		}
+		s := statsResponse{dashboardStats: r.stats, UptimeSeconds: int64(time.Since(r.started).Seconds()), ListenAddress: listenAddr, BlockedDomains: blockedCount, Ready: r.ready.Load(), RefreshEvery: r.refreshEvery.String(), LastRefresh: lastRefresh, Sources: sources}
 		r.stateMu.RUnlock()
 		_, s.Upstream, s.UpstreamTLSName = r.getUpstream()
 		writeJSON(w, s)
@@ -114,6 +119,12 @@ func (r *resolver) serveDashboard(addr, listenAddr, upstream string) {
 	mux.HandleFunc("/api/blocklist", func(w http.ResponseWriter, req *http.Request) {
 		switch req.Method {
 		case http.MethodGet:
+			etag := fmt.Sprintf(`"%d-%d"`, r.blocklistVersion.Load(), r.lastRefresh.Load())
+			w.Header().Set("ETag", etag)
+			if req.Header.Get("If-None-Match") == etag {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
 			r.stateMu.RLock()
 			domains := make([]string, 0, len(r.blocked))
 			for domain := range r.blocked {
@@ -140,10 +151,12 @@ func (r *resolver) serveDashboard(addr, listenAddr, upstream string) {
 			case "add":
 				r.stateMu.Lock()
 				r.blocked[domain] = struct{}{}
+				r.blocklistVersion.Add(1)
 				r.stateMu.Unlock()
 			case "remove":
 				r.stateMu.Lock()
 				delete(r.blocked, domain)
+				r.blocklistVersion.Add(1)
 				r.stateMu.Unlock()
 			default:
 				http.Error(w, "action must be add or remove", http.StatusBadRequest)
@@ -172,9 +185,15 @@ func localOnly(addr string, next http.Handler) http.Handler {
 	if err != nil {
 		return next
 	}
-	ip := net.ParseIP(strings.Trim(host, "[]"))
-	if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
-		log.Printf("WARNING: dashboard is bound to non-loopback address %q; API has no authentication", addr)
+	isLoopback := host == "localhost"
+	if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil && ip.IsLoopback() {
+		isLoopback = true
+	}
+	if !isLoopback {
+		if os.Getenv("DASHBOARD_ALLOW_PUBLIC") != "1" {
+			log.Fatalf("refusing to bind dashboard to non-loopback %q without DASHBOARD_ALLOW_PUBLIC=1 (API has no auth)", addr)
+		}
+		log.Printf("WARNING: dashboard exposed on %q WITHOUT AUTHENTICATION", addr)
 	}
 	return next
 }
@@ -182,6 +201,7 @@ func localOnly(addr string, next http.Handler) http.Handler {
 func writeJSON(w http.ResponseWriter, value any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(value)
 }
 
@@ -343,8 +363,14 @@ async function loadLogs(){
  $('logCount').textContent=logs.length+' events';
  $('logs').innerHTML=logs.length?logs.slice(0,200).map(x=>'<tr><td>'+esc(new Date(x.time).toLocaleTimeString())+'</td><td title="'+esc(x.domain)+'">'+esc(x.domain)+'</td><td>'+esc(x.type)+'</td><td><span class="tag '+esc(x.rcode)+'">'+esc(x.rcode||'—')+'</span></td><td><span class="tag '+esc(x.action)+'">'+esc(x.action)+'</span></td><td title="'+esc(x.client)+'">'+esc(x.client)+'</td></tr>').join(''):'<tr><td colspan="6" class="wrap muted">No DNS queries yet.</td></tr>';
 }
+let blocklistEtag=null;
 async function loadBlocklist(){
- const b=await api('/api/blocklist');const domains=b.domains||[];
+ const headers={};if(blocklistEtag)headers['If-None-Match']=blocklistEtag;
+ const res=await fetch('/api/blocklist',{headers});
+ if(res.status===304)return;
+ if(!res.ok)throw new Error('HTTP '+res.status);
+ blocklistEtag=res.headers.get('ETag');
+ const b=await res.json();const domains=b.domains||[];
  $('domainSummary').textContent=fmt(domains.length)+' domains';
  $('domains').innerHTML=domains.length?domains.map(d=>'<span class="domain"><span class="domain-name">'+esc(d)+'</span><button type="button" class="danger" data-domain="'+esc(d)+'" aria-label="Remove '+esc(d)+'">×</button></span>').join(''):'<span class="muted">No blocked domains.</span>';
 }
@@ -374,7 +400,7 @@ $('domains').addEventListener('click',async e=>{
  catch(err){setMessage('blockMsg','Could not remove domain: '+err.message,true)}
 });
 $('refreshNow').addEventListener('click',refresh);
-refresh();setInterval(refresh,3000);
+(function tick(){refresh().finally(function(){setTimeout(tick,3000);});})();
 })();
 </script>
 </body></html>`
