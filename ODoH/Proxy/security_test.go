@@ -48,3 +48,65 @@ func TestProxyRejectsOversizedBodyBeforeForwarding(t *testing.T) {
 		t.Fatalf("forwarded request count = %d, want 0", got)
 	}
 }
+
+func TestProxyRejectsOversizedTargetResponse(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", odohType)
+		_, _ = w.Write(bytes.Repeat([]byte("x"), maxBody+1))
+	}))
+	defer target.Close()
+
+	targetURL, err := url.Parse(target.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &proxy{target: targetURL, client: target.Client(), started: time.Now()}
+	req := httptest.NewRequest(http.MethodPost, "/proxy", bytes.NewReader([]byte{1, 2, 3}))
+	req.Header.Set("Content-Type", odohType)
+	rec := httptest.NewRecorder()
+	p.query(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+	if got := p.errors.Load(); got != 1 {
+		t.Fatalf("error count = %d, want 1", got)
+	}
+}
+
+func TestProxyDoesNotFollowTargetRedirect(t *testing.T) {
+	redirected := false
+	destination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		redirected = true
+		w.Header().Set("Content-Type", odohType)
+		_, _ = w.Write([]byte{1})
+	}))
+	defer destination.Close()
+
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, destination.URL+"/proxy", http.StatusFound)
+	}))
+	defer target.Close()
+
+	targetURL, err := url.Parse(target.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := target.Client()
+	client.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	p := &proxy{target: targetURL, client: client, started: time.Now()}
+	req := httptest.NewRequest(http.MethodPost, "/proxy", bytes.NewReader([]byte{1}))
+	req.Header.Set("Content-Type", odohType)
+	rec := httptest.NewRecorder()
+	p.query(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 for redirect", rec.Code)
+	}
+	if redirected {
+		t.Fatal("proxy followed a Target redirect to another origin")
+	}
+}
+
