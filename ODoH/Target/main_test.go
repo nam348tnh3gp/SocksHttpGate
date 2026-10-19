@@ -174,3 +174,35 @@ func TestBlocklistSuffixMatching(t *testing.T) {
 		}
 	}
 }
+
+func FuzzTargetMalformedODoH(f *testing.F) {
+	for _, seed := range [][]byte{
+		nil,
+		{0x00},
+		{0xff, 0x00, 0x01},
+		bytes.Repeat([]byte{0x41}, 64),
+	} {
+		f.Add(seed)
+	}
+
+	seed := bytes.Repeat([]byte{0x5a}, 32)
+	kp, err := odoh.CreateDefaultKeyPairFromSeed(seed)
+	if err != nil {
+		f.Fatalf("create key pair: %v", err)
+	}
+	target := &target{kp: kp, blocked: map[string]struct{}{}}
+
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		if len(raw) > maxBody {
+			t.Skip()
+		}
+		req := httptest.NewRequest(http.MethodPost, "/proxy", bytes.NewReader(raw))
+		req.Header.Set("Content-Type", odohType)
+		rec := httptest.NewRecorder()
+		target.query(rec, req)
+		if rec.Code >= 500 {
+			t.Fatalf("malformed request returned server error %d: %q", rec.Code, rec.Body.String())
+		}
+	})
+}
+
