@@ -41,6 +41,9 @@ func TestODoHQueryRoundTripAndBlocklist(t *testing.T) {
 		}
 		reply := new(dns.Msg)
 		reply.SetReply(query)
+		// Keep the fixture uncompressed so the encrypted round-trip test does not
+		// depend on DNS name-compression pointers in the answer section.
+		reply.Compress = false
 		reply.Answer = append(reply.Answer, &dns.A{
 			Hdr: dns.RR_Header{Name: query.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
 			A:   net.ParseIP("192.0.2.10").To4(),
@@ -48,6 +51,12 @@ func TestODoHQueryRoundTripAndBlocklist(t *testing.T) {
 		body, err := reply.Pack()
 		if err != nil {
 			t.Errorf("pack upstream response: %v", err)
+			http.Error(w, "bad response", http.StatusInternalServerError)
+			return
+		}
+		check := new(dns.Msg)
+		if err := check.Unpack(body); err != nil {
+			t.Errorf("self-check packed upstream response: %v; wire=%x", err, body)
 			http.Error(w, "bad response", http.StatusInternalServerError)
 			return
 		}
