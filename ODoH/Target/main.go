@@ -1,6 +1,6 @@
 package main
 import(
- "bytes";"context";"crypto/subtle";"encoding/hex";"encoding/json";"errors";"fmt";"io";"log";"net/http";"net/url";"os";"strings";"sync";"sync/atomic";"time"
+ "bytes";"context";"crypto/subtle";"encoding/hex";"encoding/json";"errors";"io";"log";"net/http";"net/url";"os";"strings";"sync";"sync/atomic";"time"
  odoh "github.com/cloudflare/odoh-go";"github.com/miekg/dns"
 )
 const(odohType="application/oblivious-dns-message";dnsType="application/dns-message";maxBody=65535;maxList=10<<20)
