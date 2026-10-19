@@ -31,4 +31,4 @@ The Render blueprint keeps Target private and Proxy public. Set the Proxy's `ODO
 
 For meaningful separation, Proxy and Target should be administered under different trust domains. One provider administrator able to inspect both services can still correlate traffic. ODoH does not hide timing/volume or the Target's view of the Proxy IP.
 
-This is not a security audit or a claim of full RFC 9230 conformance. The ODoH library is archived; test vectors, fuzzing, and end-to-end compatibility checks remain necessary. Failed remote blocklist refresh currently falls back to inline entries, replacing the prior remote list.
+This is not a security audit or a claim of full RFC 9230 conformance. The ODoH library is archived; test vectors, fuzzing, and end-to-end compatibility checks remain necessary. Failed remote blocklist refresh keeps the last-known-good list when one exists. The archived parser also requires independent review; the Target now recovers per request from parser panics, but that is defense-in-depth, not a substitute for replacing the dependency.
