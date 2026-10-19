@@ -31,7 +31,11 @@ func TestProxyRejectsOversizedBodyBeforeForwarding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := &proxy{target: targetURL, client: target.Client(), started: time.Now()}
+	p := &proxy{
+		target:  targetURL,
+		client:  target.Client(),
+		started: time.Now(),
+	}
 	payload := bytes.Repeat([]byte("x"), maxBody+1)
 	req := httptest.NewRequest(http.MethodPost, "/proxy", bytes.NewReader(payload))
 	req.Header.Set("Content-Type", odohType)
@@ -60,7 +64,11 @@ func TestProxyRejectsOversizedTargetResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := &proxy{target: targetURL, client: target.Client(), started: time.Now()}
+	p := &proxy{
+		target:  targetURL,
+		client:  target.Client(),
+		started: time.Now(),
+	}
 	req := httptest.NewRequest(http.MethodPost, "/proxy", bytes.NewReader([]byte{1, 2, 3}))
 	req.Header.Set("Content-Type", odohType)
 	rec := httptest.NewRecorder()
@@ -96,7 +104,11 @@ func TestProxyDoesNotFollowTargetRedirect(t *testing.T) {
 	client.CheckRedirect = func(*http.Request, []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
-	p := &proxy{target: targetURL, client: client, started: time.Now()}
+	p := &proxy{
+		target:  targetURL,
+		client:  client,
+		started: time.Now(),
+	}
 	req := httptest.NewRequest(http.MethodPost, "/proxy", bytes.NewReader([]byte{1}))
 	req.Header.Set("Content-Type", odohType)
 	rec := httptest.NewRecorder()
