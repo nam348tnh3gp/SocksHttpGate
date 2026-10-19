@@ -501,6 +501,67 @@ type SourceStatus struct {
 	FailedLoads uint64 `json:"failed_loads"`
 }
 
+
+// ─── JSON API (Google-compatible) ──────────────────────────────────────────
+
+type jsonQuestion struct {
+	Name string `json:"name"`
+	Type uint16 `json:"type"`
+}
+
+type jsonRR struct {
+	Name string `json:"name"`
+	Type uint16 `json:"type"`
+	TTL  uint32 `json:"TTL"`
+	Data string `json:"data"`
+}
+
+type jsonDNSResponse struct {
+	Status     int            `json:"Status"`
+	TC         bool           `json:"TC"`
+	RD         bool           `json:"RD"`
+	RA         bool           `json:"RA"`
+	AD         bool           `json:"AD"`
+	CD         bool           `json:"CD"`
+	Question   []jsonQuestion `json:"Question,omitempty"`
+	Answer     []jsonRR       `json:"Answer,omitempty"`
+	Authority  []jsonRR       `json:"Authority,omitempty"`
+	Additional []jsonRR       `json:"Additional,omitempty"`
+}
+
+func jsonFromMsg(m *dns.Msg) jsonDNSResponse {
+	out := jsonDNSResponse{
+		Status: m.Rcode,
+		TC:     m.Truncated,
+		RD:     m.RecursionDesired,
+		RA:     m.RecursionAvailable,
+		AD:     m.AuthenticatedData,
+		CD:     m.CheckingDisabled,
+	}
+	for _, q := range m.Question {
+		out.Question = append(out.Question, jsonQuestion{Name: q.Name, Type: q.Qtype})
+	}
+	for _, rr := range m.Answer {
+		out.Answer = append(out.Answer, rrToJSON(rr))
+	}
+	for _, rr := range m.Ns {
+		out.Authority = append(out.Authority, rrToJSON(rr))
+	}
+	for _, rr := range m.Extra {
+		out.Additional = append(out.Additional, rrToJSON(rr))
+	}
+	return out
+}
+
+func rrToJSON(rr dns.RR) jsonRR {
+	h := rr.Header()
+	data := ""
+	if parts := strings.SplitN(rr.String(), "\t", 5); len(parts) == 5 {
+		data = parts[4]
+	}
+	return jsonRR{Name: h.Name, Type: h.Rrtype, TTL: h.Ttl, Data: data}
+}
+
 type statsResponse struct {
 	Ready          bool           `json:"ready"`
 	BlockedDomains int            `json:"blocked_domains"`
@@ -874,6 +935,7 @@ func main() {
 	mux.HandleFunc("/", s.handleRoot)
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/dns-query", s.handleDoH)
+	mux.HandleFunc("/resolve", s.handleDoH)
 	mux.HandleFunc("/events", s.handleEvents)
 	mux.HandleFunc("/api/stats", s.handleAPIStats)
 	mux.HandleFunc("/api/logs", s.handleLogDownload)
@@ -1334,6 +1396,11 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.Method == http.MethodGet && r.URL.Query().Get("name") != "" {
+		s.handleDoHJSON(w, r, started)
+		return
+	}
+
 	var packet []byte
 	var err error
 	switch r.Method {
@@ -1483,6 +1550,155 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 	s.bumpDomain(qName, false)
 	s.recordQuery(qName, qType, false, "ok", elapsed)
 	writeDNS(w, out)
+}
+
+
+func (s *server) handleDoHJSON(w http.ResponseWriter, r *http.Request, started time.Time) {
+	q := r.URL.Query()
+
+	name := strings.TrimSpace(q.Get("name"))
+	if name == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing name parameter")
+		return
+	}
+
+	typeStr := strings.ToUpper(strings.TrimSpace(q.Get("type")))
+	if typeStr == "" {
+		typeStr = "A"
+	}
+	qtype, ok := dns.StringToType[typeStr]
+	if !ok {
+		if n, err := strconv.ParseUint(typeStr, 10, 16); err == nil {
+			qtype = uint16(n)
+		} else {
+			writeJSONError(w, http.StatusBadRequest, "invalid type parameter")
+			return
+		}
+	}
+
+	fqdn := dns.Fqdn(name)
+	msg := new(dns.Msg)
+	msg.SetQuestion(fqdn, qtype)
+	msg.RecursionDesired = true
+	if v := q.Get("cd"); v == "1" || strings.EqualFold(v, "true") {
+		msg.CheckingDisabled = true
+	}
+
+	packet, err := msg.Pack()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "could not pack query")
+		return
+	}
+
+	s.bytesIn.Add(uint64(len(packet)))
+	s.qpsCur.Add(1)
+	s.bumpType(typeStr)
+	s.bumpClient(clientIP(r))
+
+	if s.isBlocked(fqdn) {
+		reply := new(dns.Msg)
+		reply.SetReply(msg)
+		reply.Authoritative = true
+		reply.Rcode = dns.RcodeNameError
+
+		s.totalBlocked.Add(1)
+		s.bumpResp("NXDOMAIN")
+		elapsed := time.Since(started)
+		s.recordLatency(elapsed, true)
+		s.bumpDomain(fqdn, true)
+		s.recordQuery(fqdn, typeStr, true, "blocked", elapsed)
+
+		w.Header().Set("Content-Type", "application/dns-json")
+		w.Header().Set("Cache-Control", "no-store")
+		_ = json.NewEncoder(w).Encode(jsonFromMsg(reply))
+		return
+	}
+
+	upstream := s.getUpstream()
+	upstreamStart := time.Now()
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstream, bytes.NewReader(packet))
+	if err != nil {
+		s.totalErrors.Add(1)
+		s.recordQuery(fqdn, typeStr, false, "upstream_error", time.Since(started))
+		dlog.Errorf("upstream: request create failed: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, "could not create upstream request")
+		return
+	}
+	req.Header.Set("Content-Type", dohMediaType)
+	req.Header.Set("Accept", dohMediaType)
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		s.totalErrors.Add(1)
+		s.recordQuery(fqdn, typeStr, false, "upstream_error", time.Since(started))
+		dlog.Warnf("upstream: %v (domain=%s)", err, fqdn)
+		reason := classifyUpstreamErr(err, 0)
+		s.bumpErrReason(reason)
+		s.bumpResp("UPSTREAM_FAIL")
+		s.recordUpstreamFail(reason + ": " + err.Error())
+		writeJSONError(w, http.StatusBadGateway, "DNS upstream unavailable")
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		s.totalErrors.Add(1)
+		s.recordQuery(fqdn, typeStr, false, "upstream_error", time.Since(started))
+		dlog.Warnf("upstream: HTTP %d (domain=%s body=%q)", resp.StatusCode, fqdn, body)
+		reason := classifyUpstreamErr(nil, resp.StatusCode)
+		s.bumpErrReason(reason)
+		s.bumpResp("UPSTREAM_FAIL")
+		s.recordUpstreamFail(reason)
+		writeJSONError(w, http.StatusBadGateway, "DNS upstream returned HTTP error")
+		return
+	}
+
+	respCT := strings.ToLower(strings.TrimSpace(strings.Split(resp.Header.Get("Content-Type"), ";")[0]))
+	if respCT != dohMediaType {
+		s.totalErrors.Add(1)
+		s.recordQuery(fqdn, typeStr, false, "upstream_error", time.Since(started))
+		s.bumpErrReason("content_type")
+		s.bumpResp("UPSTREAM_FAIL")
+		s.recordUpstreamFail("content_type: " + resp.Header.Get("Content-Type"))
+		writeJSONError(w, http.StatusBadGateway, "DNS upstream returned an unexpected content type")
+		return
+	}
+
+	out, err := io.ReadAll(io.LimitReader(resp.Body, 65536))
+	if err != nil || len(out) < 12 || len(out) > 65535 {
+		s.totalErrors.Add(1)
+		s.recordQuery(fqdn, typeStr, false, "upstream_error", time.Since(started))
+		s.bumpErrReason("invalid_body")
+		s.bumpResp("UPSTREAM_FAIL")
+		s.recordUpstreamFail("invalid_body")
+		writeJSONError(w, http.StatusBadGateway, "invalid DNS response from upstream")
+		return
+	}
+
+	check := new(dns.Msg)
+	if err := check.Unpack(out); err != nil || !check.Response {
+		s.totalErrors.Add(1)
+		s.recordQuery(fqdn, typeStr, false, "upstream_error", time.Since(started))
+		s.bumpErrReason("unpack")
+		s.bumpResp("UPSTREAM_FAIL")
+		s.recordUpstreamFail("unpack")
+		writeJSONError(w, http.StatusBadGateway, "malformed DNS response from upstream")
+		return
+	}
+
+	s.totalPassed.Add(1)
+	s.bytesOut.Add(uint64(len(out)))
+	s.bumpResp(dns.RcodeToString[check.Rcode])
+	s.recordUpstreamOK(time.Since(upstreamStart))
+	elapsed := time.Since(started)
+	s.recordLatency(elapsed, false)
+	s.bumpDomain(fqdn, false)
+	s.recordQuery(fqdn, typeStr, false, "ok", elapsed)
+
+	w.Header().Set("Content-Type", "application/dns-json")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(jsonFromMsg(check))
 }
 
 func (s *server) recordQuery(name, qtype string, blocked bool, status string, latency time.Duration) {
