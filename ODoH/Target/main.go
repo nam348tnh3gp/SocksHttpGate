@@ -175,11 +175,6 @@ func (t *target) query(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unable to decrypt ODoH message", http.StatusBadRequest)
 		return
 	}
-	if ctx == nil {
-		t.errors.Add(1)
-		http.Error(w, "invalid ODoH context", http.StatusBadRequest)
-		return
-	}
 
 	// RFC 9230 §6.2: plaintext DNS message must be a valid DNS message (>= 12 bytes header).
 	if len(qb.DnsMessage) < 12 || len(qb.DnsMessage) > 65535 {
