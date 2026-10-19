@@ -88,6 +88,6 @@ Do not assume the example internal hostname in documentation is correct for your
 
 ODoH reduces direct linkage between the client and the DNS Target only when the Proxy and Target are operated with meaningful trust separation. If one administrator/provider can observe both services, traffic timing and volume may still be correlated. The Target sees the Proxy's network identity; ODoH does not hide timing or traffic volume. No individual-query logging is intended, but infrastructure/provider-level logging must also be reviewed.
 
-Blocklist refresh keeps the last-known-good list when refresh sources fail and an existing list is present. Configure trustworthy HTTPS sources and monitor aggregate stats. The public Proxy's health endpoint reports process health, not end-to-end Target readiness.
+Blocklist refresh keeps the last-known-good list when refresh sources fail and an existing list is present. Configure trustworthy HTTPS sources and monitor aggregate stats. The Proxy's `/health` endpoint checks that the Target's `/health` endpoint responds successfully, so Render can detect an unavailable Target; this is a readiness check, not a full encrypted DNS transaction test.
 
 **Do not enter this ODoH Proxy URL into a DoH-only field in Rethink DNS.** ODoH uses `application/oblivious-dns-message` at `/proxy`; conventional DoH uses `application/dns-message` at `/dns-query`. This service does not implement a conventional DoH endpoint, and the two protocols are not interchangeable.
