@@ -8,6 +8,10 @@ This directory contains two separate Go services implementing the ODoH request p
 
 Protocol reference: [RFC 9230](https://www.rfc-editor.org/rfc/rfc9230.html).
 
+## API specification
+
+The OpenAPI 3.1 specification is maintained in [`openapi.yaml`](./openapi.yaml). It documents the public ODoH protocol endpoints and aggregate diagnostics. There are deliberately no public endpoints for changing the Target key or blocklist: those operations would need a separate authenticated administrative interface and should not be exposed on the public Proxy.
+
 ## GitHub Actions validation
 
 The workflow at `.github/workflows/odoh.yml` runs on ODoH changes and manually. It performs:
