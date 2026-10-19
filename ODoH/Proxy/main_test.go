@@ -76,6 +76,7 @@ func TestProxyRejectsWrongContentType(t *testing.T) {
 	if rec.Code != http.StatusUnsupportedMediaType {
 		t.Fatalf("status = %d, want 415", rec.Code)
 	}
+}
 
 func TestProxyRejectsWrongMethod(t *testing.T) {
 	p := &proxy{}
