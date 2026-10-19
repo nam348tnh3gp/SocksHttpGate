@@ -24,7 +24,6 @@ func TestODoHQueryRoundTripAndBlocklist(t *testing.T) {
 	upstreamURL := "https://cloudflare-dns.com/dns-query"
 	upstreamClient := &http.Client{Timeout: 10 * time.Second}
 
-
 	target := &target{
 		kp: kp, client: upstreamClient, upstream: upstreamURL,
 		blocked: map[string]struct{}{"blocked.example": {}},
