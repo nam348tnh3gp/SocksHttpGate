@@ -32,8 +32,14 @@ jobs:
           cache-dependency-path: ODoH/go.mod
       - name: Resolve and verify modules
         run: go mod tidy
-      - name: Format Go tests for validation
-        run: gofmt -w integration/e2e_test.go Proxy/main_test.go Proxy/security_test.go Target/main_test.go
+      - name: Check Go test formatting
+        run: |
+          files="$(gofmt -l integration/e2e_test.go Proxy/main_test.go Proxy/security_test.go Target/main_test.go)"
+          if [ -n "$files" ]; then
+            echo "Go test files need gofmt:"
+            echo "$files"
+            exit 1
+          fi
       - name: Static analysis
         run: go vet ./...
       - name: Build Proxy and Target
