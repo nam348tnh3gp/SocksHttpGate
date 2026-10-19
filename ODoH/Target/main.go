@@ -90,7 +90,14 @@ func main() {
 	mux.HandleFunc("/api/v1/stats", t.stats)
 	mux.HandleFunc("/api/v1/status", t.apiStatus)
 	mux.HandleFunc("/.well-known/odohconfigs", t.configs)
-	mux.HandleFunc("/proxy", t.query)
+	// Rethink gọi GET /proxy để lấy configs, POST /proxy để query
+	mux.HandleFunc("/proxy", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			t.configs(w, r)
+			return
+		}
+		t.query(w, r)
+	})
 
 	srv := &http.Server{
 		Addr:              env("ADDR", ":"+env("PORT", "8080")),

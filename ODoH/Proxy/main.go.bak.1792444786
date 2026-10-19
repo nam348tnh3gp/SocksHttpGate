@@ -1,0 +1,322 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"sync/atomic"
+	"time"
+)
+
+const (
+	odohType = "application/oblivious-dns-message"
+	maxBody  = 65535
+)
+
+type proxy struct {
+	target   *url.URL
+	client   *http.Client
+	started  time.Time
+	requests atomic.Uint64
+	errors   atomic.Uint64
+}
+
+func main() {
+	raw := strings.TrimSpace(os.Getenv("ODOH_TARGET_URL"))
+	if raw == "" {
+		log.Fatal("ODOH_TARGET_URL is required (e.g. http://127.0.0.1:8080)")
+	}
+
+	target, err := parseTarget(raw)
+	if err != nil {
+		log.Fatalf("ODOH_TARGET_URL: %v", err)
+	}
+
+	p := &proxy{
+		target:  target,
+		started: time.Now(),
+		client: &http.Client{
+			Timeout: 10 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+			// Không dùng proxy môi trường cho target nội bộ
+			Transport: &http.Transport{
+				Proxy: nil,
+				DialContext: (&net.Dialer{
+					Timeout:   5 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
+				MaxIdleConns:        16,
+				MaxIdleConnsPerHost: 8,
+				IdleConnTimeout:     60 * time.Second,
+				TLSHandshakeTimeout: 5 * time.Second,
+			},
+		},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", p.health)
+	mux.HandleFunc("/api/stats", p.stats)
+	mux.HandleFunc("/api/v1/health", p.health)
+	mux.HandleFunc("/api/v1/stats", p.stats)
+	mux.HandleFunc("/api/v1/status", p.apiStatus)
+	mux.HandleFunc("/.well-known/odohconfigs", p.configs)
+
+	// /proxy xử lý cả:
+	//   - GET  → Rethink mới gọi để lấy configs (tương thích client cũ & mới)
+	//   - POST → gửi query ODoH đã mã hóa
+	mux.HandleFunc("/proxy", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			p.configs(w, r)
+		case http.MethodPost:
+			p.query(w, r)
+		default:
+			w.Header().Set("Allow", "GET, POST")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
+	addr := env("ADDR", ":"+env("PORT", "8080"))
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           secureHeaders(mux),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      12 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
+
+	log.Printf("ODoH Proxy started; target=%s; listen=%s; per-query logging disabled",
+		target.Redacted(), addr)
+
+	cert, key := os.Getenv("TLS_CERT"), os.Getenv("TLS_KEY")
+	if cert != "" && key != "" {
+		log.Fatal(srv.ListenAndServeTLS(cert, key))
+	}
+	log.Fatal(srv.ListenAndServe())
+}
+
+// parseTarget validate ODOH_TARGET_URL:
+//   - https://bất-kỳ-host        → OK
+//   - http://loopback/localhost   → OK (target chạy cùng máy)
+//   - http://host-khác            → CHẶN (tránh gửi query plaintext qua Internet)
+//   - có path/query/fragment      → CHẶN
+func parseTarget(raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid URL: %w", err)
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("missing host")
+	}
+	if u.User != nil {
+		return nil, fmt.Errorf("userinfo not allowed")
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return nil, fmt.Errorf("query/fragment not allowed")
+	}
+	if u.Path != "" && u.Path != "/" {
+		return nil, fmt.Errorf("path must be empty (got %q)", u.Path)
+	}
+
+	switch u.Scheme {
+	case "https":
+		// HTTPS tới bất kỳ host — mã hóa end-to-end, OK
+		return u, nil
+	case "http":
+		// HTTP chỉ cho phép loopback/localhost — target luôn ở máy này
+		host := u.Hostname()
+		if !isLoopback(host) {
+			return nil, fmt.Errorf("http:// only allowed for loopback (127.0.0.1, ::1, localhost); use https:// for remote target")
+		}
+		return u, nil
+	default:
+		return nil, fmt.Errorf("scheme must be http or https (got %q)", u.Scheme)
+	}
+}
+
+func isLoopback(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	return false
+}
+
+// configs lấy ODoH config (public key) từ Target.
+// Được gọi cho GET /.well-known/odohconfigs và GET /proxy.
+func (p *proxy) configs(w http.ResponseWriter, r *http.Request) {
+	p.forward(w, r, "/.well-known/odohconfigs", false)
+}
+
+// query forward encrypted query tới Target.
+// Chỉ nhận POST + Content-Type ODoH.
+func (p *proxy) query(w http.ResponseWriter, r *http.Request) {
+	if media(r.Header.Get("Content-Type")) != odohType {
+		http.Error(w, "unsupported media type", http.StatusUnsupportedMediaType)
+		return
+	}
+	p.forward(w, r, "/proxy", true)
+}
+
+// forward chuyển request tới Target, giữ nguyên method + body.
+// Với withBody=true: forward body + content-type + accept.
+func (p *proxy) forward(w http.ResponseWriter, r *http.Request, path string, withBody bool) {
+	var body io.Reader
+	if withBody {
+		b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
+		if err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+		body = bytes.NewReader(b)
+	}
+
+	u := *p.target
+	u.Path = path
+
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, u.String(), body)
+	if err != nil {
+		p.errors.Add(1)
+		http.Error(w, "Target unavailable", http.StatusBadGateway)
+		return
+	}
+	if withBody {
+		req.Header.Set("Content-Type", odohType)
+		req.Header.Set("Accept", odohType)
+	}
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		p.errors.Add(1)
+		http.Error(w, "Target unavailable", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		p.errors.Add(1)
+		http.Error(w, fmt.Sprintf("Target returned HTTP %d", resp.StatusCode), http.StatusBadGateway)
+		return
+	}
+
+	b, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
+	if err != nil || len(b) > maxBody {
+		p.errors.Add(1)
+		http.Error(w, "invalid Target response", http.StatusBadGateway)
+		return
+	}
+
+	ct := media(resp.Header.Get("Content-Type"))
+	if withBody && ct != odohType {
+		p.errors.Add(1)
+		http.Error(w, "invalid Target content type", http.StatusBadGateway)
+		return
+	}
+
+	if withBody {
+		p.requests.Add(1)
+	}
+	if ct != "" {
+		w.Header().Set("Content-Type", ct)
+	}
+	if cc := resp.Header.Get("Cache-Control"); cc != "" {
+		w.Header().Set("Cache-Control", cc)
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(b)
+}
+
+func (p *proxy) health(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+
+	u := *p.target
+	u.Path = "/health"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		http.Error(w, "target unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	resp, err := p.client.Do(req)
+	if err != nil {
+		http.Error(w, "target unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		http.Error(w, "target unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain")
+	_, _ = io.WriteString(w, "ok\n")
+}
+
+func (p *proxy) apiStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"service":        "odoh-proxy",
+		"status":         "running",
+		"protocol":       "RFC 9230 ODoH",
+		"uptime_seconds": int64(time.Since(p.started).Seconds()),
+	})
+}
+
+func (p *proxy) stats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"ready":             true,
+		"uptime_seconds":    int64(time.Since(p.started).Seconds()),
+		"forwarded_queries": p.requests.Load(),
+		"errors":            p.errors.Load(),
+		"privacy_mode":      "opaque forwarding; no client IP, domain, or query logging",
+	})
+}
+
+func media(s string) string {
+	return strings.ToLower(strings.TrimSpace(strings.SplitN(s, ";", 2)[0]))
+}
+
+func secureHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		next.ServeHTTP(w, r)
+	})
+}
+
+func env(k, d string) string {
+	if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+		return v
+	}
+	return d
+}
