@@ -13,10 +13,11 @@ Protocol reference: [RFC 9230](https://www.rfc-editor.org/rfc/rfc9230.html).
 The workflow at `.github/workflows/odoh.yml` runs on ODoH changes and manually. It performs:
 
 1. Dependency resolution with `go mod tidy`.
-2. Formatting check for the integration test and `go vet ./...`.
+2. A `gofmt` gate for the maintained Proxy security regression tests, followed by `go vet ./...`.
 3. Builds both Go services.
 4. Runs `go test -race -count=1 -v ./...`, including the real Proxy → Target → Cloudflare DoH integration test.
-5. Builds both Docker images.
+5. Runs a bounded 10-second Go fuzzing session against malformed ODoH Target messages. This is a smoke fuzz run, not exhaustive fuzz coverage.
+6. Builds both Docker images.
 
 The end-to-end tests require outbound HTTPS access to `cloudflare-dns.com`. A passing run verifies the tested path at that commit; it does not certify all ODoH implementations or all DNS names.
 
@@ -79,7 +80,7 @@ Do not assume the example internal hostname in documentation is correct for your
 
 ## Security and known limitations
 
-**This is not yet a production security certification or a claim of full RFC 9230 conformance.** The current implementation depends on archived `github.com/cloudflare/odoh-go`. Although request handling has panic recovery and the test suite checks the end-to-end path, an archived protocol library is a material maintenance and security risk. Before exposing this to real users, replace or independently audit the dependency, validate published RFC 9230 test vectors, fuzz malformed ODoH/DNS messages, review key rotation and replay/abuse handling, and conduct an independent security review.
+**This is not yet a production security certification or a claim of full RFC 9230 conformance.** The current implementation depends on archived `github.com/cloudflare/odoh-go`. Request handling includes panic recovery for malformed ODoH messages; this reduces the risk of a malformed request crashing the Target process, but it does not repair parser flaws in the dependency. The test suite covers the end-to-end path and bounded fuzz smoke run, but an archived protocol library remains a material maintenance and security risk. Before exposing this to real users, replace or independently audit the dependency, validate published RFC 9230 test vectors, fuzz malformed ODoH/DNS messages, review key rotation and replay/abuse handling, and conduct an independent security review.
 
 ODoH reduces direct linkage between the client and the DNS Target only when the Proxy and Target are operated with meaningful trust separation. If one administrator/provider can observe both services, traffic timing and volume may still be correlated. The Target sees the Proxy's network identity; ODoH does not hide timing or traffic volume. No individual-query logging is intended, but infrastructure/provider-level logging must also be reviewed.
 
