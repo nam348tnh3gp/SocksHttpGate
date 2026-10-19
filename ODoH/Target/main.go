@@ -16,12 +16,12 @@ func main(){
  srv:=&http.Server{Addr:env("ADDR",":"+env("PORT","8080")),Handler:secureHeaders(mux),ReadHeaderTimeout:5*time.Second,ReadTimeout:10*time.Second,WriteTimeout:12*time.Second,IdleTimeout:60*time.Second,MaxHeaderBytes:16<<10}
  log.Printf("ODoH Target started; remote_blocklist_sources=%d; per-query logging disabled",len(t.sources));log.Fatal(srv.ListenAndServe())
 }
-func(t *target)configs(w http.ResponseWriter,r *http.Request){if r.Method!="GET"{http.Error(w,"method not allowed",405);return};w.Header().Set("Content-Type",odohType);w.Header().Set("Cache-Control","public, max-age=300");_,_=w.Write(odoh.CreateObliviousDoHConfigs([]odoh.ObliviousDoHConfig{t.kp.Config}).Marshal())}
+func(t *target)configs(w http.ResponseWriter,r *http.Request){if r.Method!="GET"{http.Error(w,"method not allowed",405);return};w.Header().Set("Content-Type","application/octet-stream");w.Header().Set("Cache-Control","public, max-age=300");_,_=w.Write(odoh.CreateObliviousDoHConfigs([]odoh.ObliviousDoHConfig{t.kp.Config}).Marshal())}
 func(t *target)query(w http.ResponseWriter,r *http.Request){
  // The archived odoh-go parser has unchecked length reads in its message-body decoder.
  // A malicious client can craft an authenticated, malformed ODoH plaintext that panics it.
  // Recover per request so one malformed message cannot terminate the Target process.
- defer func(){if recover()!=nil{t.errors.Add(1);http.Error(w,"invalid ODoH message",400)}}()
+ defer func(){if r:=recover();r!=nil{t.errors.Add(1);log.Printf("recovered panic in /proxy: %v",r);http.Error(w,"invalid ODoH message",400)}}()
  if r.Method!="POST"{http.Error(w,"method not allowed",405);return};if mediaType(r.Header.Get("Content-Type"))!=odohType{http.Error(w,"unsupported media type",415);return}
  raw,e:=io.ReadAll(http.MaxBytesReader(w,r.Body,maxBody));if e!=nil{http.Error(w,"invalid request body",400);return}
  msg,e:=odoh.UnmarshalDNSMessage(raw);kid:=t.kp.Config.Contents.KeyID()
@@ -30,7 +30,7 @@ func(t *target)query(w http.ResponseWriter,r *http.Request){
  if len(qb.DnsMessage)<12||len(qb.DnsMessage)>4096{t.errors.Add(1);http.Error(w,"invalid DNS message",400);return}
  q:=new(dns.Msg);if e=q.Unpack(qb.DnsMessage);e!=nil||len(q.Question)!=1{t.errors.Add(1);http.Error(w,"invalid DNS query",400);return};t.queries.Add(1)
  var answer []byte
- if t.isBlocked(q.Question[0].Name){reply:=new(dns.Msg);reply.SetReply(q);reply.Rcode=dns.RcodeNameError;reply.Authoritative=true;answer,e=reply.Pack();t.blockedQueries.Add(1)}else{answer,e=t.resolve(r.Context(),qb.DnsMessage)}
+ if t.isBlocked(q.Question[0].Name){reply:=new(dns.Msg);reply.SetReply(q);reply.Rcode=dns.RcodeNameError;reply.Authoritative=true;if soa,se:=dns.NewRR("blocked.invalid. 60 IN SOA localhost. hostmaster.localhost. 1 3600 600 604800 60");se==nil{reply.Ns=[]dns.RR{soa}};answer,e=reply.Pack();t.blockedQueries.Add(1)}else{answer,e=t.resolve(r.Context(),qb.DnsMessage)}
  if e!=nil||len(answer)==0||len(answer)>4096{t.errors.Add(1);http.Error(w,"DNS resolution failed",502);return}
  out,e:=ctx.EncryptResponse(odoh.CreateObliviousDNSResponse(answer,0));if e!=nil{t.errors.Add(1);http.Error(w,"response encryption failed",500);return}
  w.Header().Set("Content-Type",odohType);w.Header().Set("Cache-Control","no-store");_,_=w.Write(out.Marshal())
