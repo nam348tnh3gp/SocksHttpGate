@@ -1,203 +1,296 @@
-# SocksHttpGate — Universal Proxy Suite
+SocksHttpGate — Universal Proxy Suite
 
-![Version](https://img.shields.io/badge/Version-6.3-blue?style=for-the-badge)
-![License](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)
+￼ ￼
 
-## Languages
+￼ ￼ ￼ ￼ ￼ ￼ ￼ ￼ ￼ ￼
 
-![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)
-![Go](https://img.shields.io/badge/Go-00ADD8?style=for-the-badge&logo=go&logoColor=white)
-![C](https://img.shields.io/badge/C-A8B9CC?style=for-the-badge&logo=c&logoColor=black)
-![JavaScript](https://img.shields.io/badge/JavaScript-F7DF1E?style=for-the-badge&logo=javascript&logoColor=black)
-![Java](https://img.shields.io/badge/Java-ED8B00?style=for-the-badge&logo=openjdk&logoColor=white)
-![Kotlin](https://img.shields.io/badge/Kotlin-7F52FF?style=for-the-badge&logo=kotlin&logoColor=white)
-![Ruby](https://img.shields.io/badge/Ruby-CC342D?style=for-the-badge&logo=ruby&logoColor=white)
-![Elixir](https://img.shields.io/badge/Elixir-4B275F?style=for-the-badge&logo=elixir&logoColor=white)
+Languages
 
-## Protocols and technologies
+￼ ￼ ￼ ￼ ￼ ￼ ￼ ￼
 
-![SOCKS5](https://img.shields.io/badge/SOCKS5-Proxy-2563EB?style=for-the-badge)
-![HTTP Proxy](https://img.shields.io/badge/HTTP-Proxy-0EA5E9?style=for-the-badge)
-![DNS over HTTPS](https://img.shields.io/badge/DNS-over_HTTPS-16A34A?style=for-the-badge)
-![DNS over TLS](https://img.shields.io/badge/DNS-over_TLS-0F766E?style=for-the-badge)
-![GitHub](https://img.shields.io/badge/Hosted_on-GitHub-181717?style=for-the-badge&logo=github&logoColor=white)
+Protocols & Technologies
 
-SocksHttpGate is a multi-language proxy suite with implementations in Python, Go, C, JavaScript, Java, Kotlin, Ruby, and Elixir. The implementations provide SOCKS5 and HTTP proxy functionality, with additional capabilities such as authentication, connection statistics, access rules, upstream proxies, and a management dashboard depending on the implementation and its configuration.
+￼ ￼ ￼ ￼ ￼ ￼
 
-The repository also contains separate Go-based DNS resolvers: **DNS-over-HTTPS (DoH)** in `DoH/` and **DNS-over-TLS (DoT)** in `DoT/`. DoT can be used with Android Private DNS when deployed on a host that supports inbound TCP port 853 and has a valid TLS certificate. The proxy programs do not automatically send their DNS lookups through this DoH service; their DNS behavior depends on each implementation and the host runtime/system configuration.
+SocksHttpGate is a multi-language proxy suite with separate implementations and standalone DNS services. The repository brings together proxy implementations in Python, Go, C, JavaScript, Java, Kotlin, Ruby, and Elixir, alongside independent DNS-over-HTTPS (DoH), DNS-over-TLS (DoT), and experimental Oblivious DNS-over-HTTPS (ODoH) components.
 
-> **Compatibility note:** The language ports are separate programs, and their options, dependencies, and feature parity can differ. Check the relevant source directory before deploying.
+The components are maintained separately. Their configuration options, supported features, dependencies, and deployment requirements may differ.
 
-## Repository layout
+Table of Contents
 
-| Path | Language / component |
-| --- | --- |
-| `server.py` | Python proxy |
-| `GocodeBeta/proxy.go` | Go proxy |
-| `CcodeBeta/proxy.c` | C proxy |
-| `JScodeBeta/proxy.js` | JavaScript / Node.js proxy |
-| `JavacodeBeta/Proxy.java` | Java proxy |
-| `KotlincodeBeta/proxy.kt` | Kotlin proxy |
-| `RubycodeBeta/proxy.rb` | Ruby proxy |
-| `ElixircodeBeta/proxy.exs` | Elixir proxy |
-| `DoH/main.go` | Standalone Go DoH resolver |
-| `DoT/main.go` | Standalone Go DoT resolver for Android Private DNS |
-| `DoT/dashboard.go` | Local DoT web dashboard and runtime blocklist API |
+Features
 
-## Features
+Repository Structure
 
-Features vary by language port, but the suite includes implementations with the following capabilities:
+Requirements
 
-- **SOCKS5 and HTTP proxying** — supports TCP proxying and HTTP CONNECT; SOCKS5 UDP relay is available in implementations that include it.
-- **Proxy authentication** — username/password authentication and configuration-based user settings where implemented.
-- **Upstream proxy support** — configurable HTTP CONNECT and/or SOCKS5 upstreams in supported ports.
-- **Connection visibility** — active connection information, traffic counters, logs, and statistics where implemented.
-- **Access controls** — allow/deny address rules and connection limits in supported implementations.
-- **Operational safeguards** — connection timeouts, cleanup, and authentication-failure handling where implemented.
-- **Standalone DoH resolver** — DNS-over-HTTPS endpoint, statistics, query/system logs, and configurable upstream DoH URL.
-- **Standalone DoT resolver** — DNS-over-TLS over TCP 853, upstream TLS verification, and domain blocklist support for Android Private DNS.
-- **Multiple runtimes** — choose the implementation that best matches your operating system and installed toolchain.
+Getting Started
 
-## Requirements
+Proxy Usage
 
-Install the runtime and build tools for the implementation you plan to use.
+DNS Services 
 
-| Implementation | Typical requirements |
-| --- | --- |
-| Python | Python 3; optional modules may enable additional features |
-| Go | A Go toolchain compatible with the source and its module dependencies |
-| C | A C compiler and the libraries required by that implementation |
-| Java | A compatible JDK; the Java source documents Java 21 usage |
-| Kotlin | Kotlin compiler/runtime compatible with the source |
-| JavaScript | Node.js compatible with the source |
-| Ruby | Ruby compatible with the source |
-| Elixir | Elixir and Erlang/OTP compatible with the source |
-| DoH | Go toolchain and the dependencies declared by the DoH module |
-| DoT | Go 1.23+, the dependencies declared in `DoT/go.mod`, and a valid TLS certificate/key |
+DNS-over-HTTPS (DoH)
 
-The examples below use the Python implementation. Other ports may use different flags and build commands; consult their source files and any accompanying project files.
+DNS-over-TLS (DoT)
 
-## Quick start: Python
+Oblivious DNS-over-HTTPS (ODoH)
+
+Configuration and Deployment
+
+Testing and CI
+
+Security
+
+Troubleshooting
+
+Contributing
+
+License
+
+Features
+
+Proxy Suite
+
+Multiple language implementations — choose an implementation compatible with your runtime and environment.
+
+SOCKS5 and HTTP proxying — available capabilities depend on the selected implementation.
+
+Authentication — username/password authentication where implemented.
+
+Upstream proxy support — supported upstream protocols vary by implementation.
+
+Connection monitoring — logging, connection statistics, and traffic information where implemented.
+
+Access control — connection limits and allow/deny rules where supported.
+
+Flexible deployment — run a compatible implementation on your local machine or server.
+
+DNS Services
+
+DoH: DNS queries over HTTPS through a standalone Go resolver.
+
+DoT: DNS queries over TLS with upstream certificate verification and blocklist support.
+
+ODoH: separate Proxy, Target, and integration components for development and testing.
+
+Blocklists: configurable domain-blocking support in the DNS services that implement it.
+
+Independent services: DNS components do not automatically become the DNS backend for every proxy implementation.
+
+Repository Structure
+
+DirectoryDescriptionGocodeBeta/Go proxy implementationCcodeBeta/C proxy implementationJScodeBeta/JavaScript proxy implementationJavacodeBeta/Java proxy implementationKotlincodeBeta/Kotlin proxy implementationRubycodeBeta/Ruby proxy implementationElixircodeBeta/Elixir proxy implementationDoH/Standalone Go DNS-over-HTTPS serviceDoT/Standalone Go DNS-over-TLS service and dashboardODoH/Proxy/ODoH Proxy componentODoH/Target/ODoH Target componentODoH/integration/ODoH integration tests.github/workflows/GitHub Actions workflows 
+
+Consult the current repository tree for the exact entry point, build command, and configuration of each implementation.
+
+Requirements
+
+Install the toolchain required by the component you want to run.
+
+ComponentTypical requirementsPythonPython 3 and required packagesGoGo toolchain and dependencies declared in go.modCC compiler and required librariesJavaCompatible JDKKotlinCompatible Kotlin compiler/runtimeJavaScriptNode.js and required packagesRubyRuby and required gemsElixirElixir and Erlang/OTPDoHGo toolchain and DoH module dependenciesDoTGo toolchain, module dependencies, TLS certificate and keyODoHGo toolchain and dependencies specified by the individual ODoH modules 
+
+Check each component's README and build files for the required versions. Do not assume that all language implementations use the same flags or configuration format.
+
+Getting Started
 
 Clone the repository:
 
-```bash
-git clone https://github.com/nam348tnh3gp/SocksHttpGate.git
-cd SocksHttpGate
-```
+git clone https://github.com/nam348tnh3gp/SocksHttpGate.git cd SocksHttpGate 
 
-Check the available options before launching:
+Choose the component you want to run and inspect its documentation and source files.
 
-```bash
-python3 server.py --help
-```
+For Termux, install the tools required by your chosen component. For Go-based components, a typical starting point is:
 
-A typical launch is:
+pkg update pkg install git golang 
 
-```bash
-python3 server.py
-```
+Follow the build and launch instructions for that component. Commands and dependencies may differ across directories.
 
-To see the options supported by your checked-out version, use `--help`. Configure the listen address, port, authentication, and other settings only with options actually listed by that version.
+Termux Notes
 
-### Running on Termux
+Install only the dependencies required by the component you intend to use.
 
-Install Python and Git, then clone the repository:
+Confirm the device architecture and available runtime versions.
 
-```bash
-pkg update
-pkg install python git
-git clone https://github.com/nam348tnh3gp/SocksHttpGate.git
-cd SocksHttpGate
-python server.py --help
-```
+Keep long-running services in a trusted environment.
 
-Keep the process running in a trusted environment. Android may restrict background processes depending on device and battery settings.
+Android may stop background processes because of battery optimization or system restrictions.
 
-## Testing the proxy
+Proxy Usage
 
-Use a local or trusted test server first. Replace the example host, port, and credentials with the values configured for your proxy.
+SocksHttpGate contains separate proxy implementations. Review the selected implementation before launching it.
 
-Test an HTTP proxy:
+Before using a proxy:
 
-```bash
-curl -x http://USER:PASSWORD@127.0.0.1:1080 https://example.com/
-```
+Identify its supported protocols and listening port.
 
-Test a SOCKS5 proxy with remote hostname resolution, if supported by your selected implementation:
+Check whether authentication is enabled.
 
-```bash
-curl --socks5-hostname USER:PASSWORD@127.0.0.1:1080 https://example.com/
-```
+Review upstream proxy and access-control settings.
 
-If authentication is disabled, remove the credentials from the command. If your proxy listens on a different address or port, update the examples accordingly. A successful TCP connection alone does not prove that proxy authentication, CONNECT tunneling, DNS resolution, or upstream routing works correctly.
+Bind to a suitable network interface.
 
-## Standalone DNS-over-HTTPS (DoH)
+Test the connection with a trusted destination.
 
-The Go service in `DoH/` is a separate resolver and management service, not a built-in DNS mode shared by every proxy port. Review `DoH/` and its Go module/build files for the exact runtime configuration and deployment requirements.
+Example HTTP proxy test, assuming an HTTP proxy is configured on localhost port 1080:
 
-The service provides these routes in the current implementation:
+curl -x http://127.0.0.1:1080 https://example.com/ 
 
-| Endpoint | Purpose |
-| --- | --- |
-| `/` | Web dashboard |
-| `/health` | Health check |
-| `/dns-query` | DNS-over-HTTPS query endpoint |
-| `/api/stats` | Resolver statistics |
-| `/api/logs?type=query` | Query log download |
-| `/api/logs?type=system` | System log download |
-| `/api/upstream` | Update the upstream DoH URL at runtime using a POST request |
+Example SOCKS5 test, if supported by the selected implementation:
 
-The DNS endpoint supports standard DoH request formats implemented by the service. For exact request headers, methods, environment variables, and deployment commands, refer to `DoH/main.go` and the files in `DoH/`.
+curl --socks5-hostname 127.0.0.1:1080 https://example.com/ 
 
-**Important:** changing the DoH upstream through the runtime endpoint is documented by the service as a runtime-only change; it resets when the process restarts unless separately configured in the deployment environment.
+Change the address, port, and authentication parameters to match your configuration. These examples are connection tests, not a guarantee that every implementation supports the same options.
 
-## Standalone DNS-over-TLS (DoT)
+DNS Services
 
-The Go DoT resolver in `DoT/` is independent of the DoH service and the proxy implementations. It listens on TCP port 853 by default, verifies TLS certificates for its upstream resolver, and can return NXDOMAIN for domains configured in `BLOCKLIST`. A local web dashboard on `127.0.0.1:8080` provides live stats, query logs, and runtime blocklist management. Set `TLS_CERT_FILE`, `TLS_KEY_FILE`, `UPSTREAM_DOT`, `UPSTREAM_TLS_NAME`, and `DASHBOARD_ADDR` as documented in [`DoT/README.md`](DoT/README.md).
+DNS-over-HTTPS (DoH)
 
-**Deployment requirement:** the host must allow inbound TCP port 853 and serve a valid certificate for the hostname entered in Android Private DNS. Render Web Services do not normally expose arbitrary raw TCP port 853, so use a VPS or a platform that explicitly supports TCP ingress. Do not commit production private keys to the repository.
+The standalone DoH service is located in DoH/.
 
-## Configuration
+It provides DNS resolution over HTTPS and supports a configurable upstream DoH endpoint. The current implementation also includes health, statistics, logging, and runtime configuration endpoints.
 
-Configuration options differ between ports. Before running a service in production:
+EndpointPurpose/Web dashboard/healthHealth check/dns-queryDoH query endpoint/api/statsResolver statistics/api/logs?type=queryQuery log access/api/logs?type=systemSystem log access/api/upstreamRuntime upstream configuration endpoint 
 
-1. Run the implementation's help command, if available, or inspect its argument parser.
-2. Review any configuration JSON and environment variables used by that implementation.
-3. Set an explicit listening address and port.
-4. Configure authentication and access restrictions where supported.
-5. Confirm which dashboard and management endpoints are exposed, and restrict them to trusted users/networks.
+Check DoH/README.md, DoH/main.go, and the deployment files for the exact request format, environment variables, and build instructions.
 
-Do not assume that a flag or feature available in one language port also exists in another.
+Android compatibility: Android's built-in Private DNS setting expects a DoT hostname, not a DoH URL. To use DoH, configure a compatible DNS client or application.
 
-## Security
+The DoH service is separate from the proxy implementations. Do not assume proxy DNS lookups are routed through it unless that integration is explicitly configured and tested.
 
-A proxy can expose your network and bandwidth if it is reachable by untrusted users. Apply these precautions:
+DNS-over-TLS (DoT)
 
-- **Do not expose an unauthenticated proxy to the public internet.**
-- Use strong, unique credentials and enable authentication wherever available.
-- Bind to `127.0.0.1` when access should be local-only; use a firewall or private network for remote access.
-- Restrict dashboard and management endpoints. Do not assume that a dashboard or runtime configuration API is authenticated unless you have verified the code and deployment.
-- Treat upstream proxy and DoH URLs as security-sensitive configuration. Allow only trusted upstreams.
-- Keep runtimes and dependencies updated, and test access-control rules before deployment.
-- Monitor logs for unexpected clients, repeated authentication failures, and unusual traffic.
-- Avoid using this software to bypass network policies or access systems without permission.
+The standalone DoT resolver is located in DoT/.
 
-Security controls and protections are not identical across all ports. Review and test the selected implementation before relying on it in a public or production environment.
+Its documented features include:
 
-## Troubleshooting
+DNS queries over TLS.
 
-- **Address already in use:** choose an unused port or stop the process already listening on it.
-- **Authentication fails:** check the configured username/password and whether authentication is enabled in that implementation.
-- **Proxy connects but websites do not load:** test DNS resolution, the target's reachability, CONNECT handling, and any configured upstream separately.
-- **DoH returns an error:** check the service logs, upstream DoH availability, request method/content type, and whether the resolver has completed its initial blocklist loading.
-- **Build fails:** verify the required compiler/runtime version and dependencies for the specific directory.
-- **Dashboard is unreachable:** confirm the dashboard's configured port and listening address, then check firewall and deployment settings.
+Upstream TLS certificate and hostname verification.
 
-## Contributing
+Domain blocklist support.
 
-Bug reports, fixes, documentation improvements, and carefully tested contributions are welcome. When reporting an issue, include the language implementation, operating system/runtime version, steps to reproduce, expected behavior, and relevant logs. Remove passwords, tokens, private addresses, and other sensitive information before sharing logs.
+Query statistics and logs.
 
-## License
+A local dashboard and runtime blocklist management.
 
-This project includes a `LICENSE` file. Read that file for the applicable license terms before redistributing or modifying the project.
+See DoT/README.md for configuration details, including:
+
+DOT_ADDR
+
+TLS_CERT_FILE
+
+TLS_KEY_FILE
+
+UPSTREAM_DOT
+
+UPSTREAM_TLS_NAME
+
+BLOCKLIST
+
+BLOCKLIST_URLS
+
+BLOCKLIST_REFRESH
+
+DASHBOARD_ADDR
+
+Deployment requirements: Android Private DNS needs a hostname with a valid TLS certificate. The hosting platform must accept inbound TCP traffic on port 853. Some HTTP-only hosting services do not expose arbitrary TCP ports; use a compatible VPS or another platform with raw TCP ingress.
+
+Keep production private keys out of source control. Bind the dashboard to localhost or a trusted private network unless remote access has been secured.
+
+Oblivious DNS-over-HTTPS (ODoH)
+
+The ODoH components are located in ODoH/.
+
+ComponentPurposeODoH/Proxy/ODoH Proxy implementationODoH/Target/ODoH Target implementationODoH/integration/Integration and interoperability tests 
+
+ODoH is designed to separate the client-facing Proxy from the DNS-resolving Target. When correctly implemented and deployed, this separation is intended to reduce the ability of one party to link a client's identity with its DNS queries.
+
+Experimental status: treat the current ODoH implementation as experimental until the code, dependencies, protocol conformance, and deployment security have been independently reviewed.
+
+Before testing, read ODoH/README.md and follow its setup instructions. Do not use an experimental deployment for sensitive or production DNS traffic.
+
+A successful build or smoke test does not by itself prove full RFC 9230 conformance, privacy guarantees, or production readiness. In particular, the Proxy and Target trust boundary, Target destination restrictions, query logging, key handling, and network exposure need careful review.
+
+Configuration and Deployment
+
+Configuration varies by component. Before deployment:
+
+Read the documentation for the selected directory.
+
+Confirm the runtime and dependency versions.
+
+Set an explicit listening address and port.
+
+Enable authentication and access restrictions where available.
+
+Review dashboard and management API exposure.
+
+Confirm that the hosting platform supports the required protocols and ports.
+
+Test with non-sensitive traffic before relying on the service.
+
+An HTTPS website deployment does not automatically provide support for arbitrary TCP services such as DoT on port 853.
+
+Testing and CI
+
+The repository includes GitHub Actions workflows for selected components.
+
+ODoH workflow: .github/workflows/odoh.yml
+
+DoT workflow: .github/workflows/test-dot.yml
+
+Inspect the workflow files and their latest run logs for the checks actually performed. Each component should be tested independently.
+
+Passing CI tests only confirms the behaviors covered by those tests. It does not establish that all language implementations, hosting environments, or production configurations are correct.
+
+Security
+
+Proxy and DNS services can expose your network, traffic metadata, and upstream configuration if they are misconfigured.
+
+Avoid public unauthenticated proxies. Enable strong authentication wherever supported.
+
+Limit network exposure. Bind local-only services to 127.0.0.1 and use firewall rules for remote deployments.
+
+Protect dashboards and APIs. Verify authentication and restrict management endpoints to trusted users or networks.
+
+Secure upstream settings. Use trusted upstream proxy and DNS endpoints.
+
+Protect credentials and keys. Never commit passwords, tokens, or production private keys.
+
+Keep dependencies updated. Review dependency changes and run the available tests.
+
+Review logs. Avoid exposing sensitive query information or credentials.
+
+Review ODoH separately. Test its Proxy/Target separation and security assumptions before any public deployment.
+
+Respect network policies. Use the software only on networks and systems you are authorized to access.
+
+Security features differ between implementations. Review the source and test the exact configuration you plan to deploy.
+
+Troubleshooting
+
+ProblemThings to checkBuild failsRuntime version, module dependencies, compiler and build instructionsPort is already in useExisting process and configured listening portProxy authentication failsCredentials and authentication configurationProxy connects but traffic failsDNS resolution, upstream connectivity, routing, and CONNECT handlingDoH requests failRequest format, upstream availability, service logs, and blocklist initializationDoT connection failsTCP port 853, firewall rules, certificate validity, and hostname matchingDashboard is unreachableDashboard address, port, and network restrictionsODoH integration failsProxy/Target configuration, test output, and workflow logs 
+
+Contributing
+
+Contributions, bug reports, fixes, and documentation improvements are welcome.
+
+When opening an issue, include:
+
+The component and directory involved.
+
+Operating system and runtime versions.
+
+Steps to reproduce the problem.
+
+Expected and actual behavior.
+
+Relevant logs with secrets and sensitive data removed.
+
+Please test changes for the affected component before submitting them.
+
+License
+
+This repository contains a LICENSE file. Read it for the applicable license terms before redistributing or modifying the project.
+
