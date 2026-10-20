@@ -4,16 +4,34 @@ A multi-language proxy and DNS networking project. The repository contains SOCKS
 
 > **Status:** Components are maintained independently. Features, configuration, security properties, and deployment requirements vary by directory. Read the component-specific documentation before running or deploying anything.
 
-[![Version](https://img.shields.io/badge/version-6.3-blue?style=for-the-badge)](https://github.com/nam348tnh3gp/SocksHttpGate)
-[![License](https://img.shields.io/badge/license-MIT-yellow?style=for-the-badge)](LICENSE)
-![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)
-![Go](https://img.shields.io/badge/Go-00ADD8?style=for-the-badge&logo=go&logoColor=white)
-![C](https://img.shields.io/badge/C-A8B9CC?style=for-the-badge&logo=c&logoColor=black)
-![JavaScript](https://img.shields.io/badge/JavaScript-F7DF1E?style=for-the-badge&logo=javascript&logoColor=black)
-![Java](https://img.shields.io/badge/Java-ED8B00?style=for-the-badge&logo=openjdk&logoColor=white)
-![Kotlin](https://img.shields.io/badge/Kotlin-7F52FF?style=for-the-badge&logo=kotlin&logoColor=white)
-![Ruby](https://img.shields.io/badge/Ruby-CC342D?style=for-the-badge&logo=ruby&logoColor=white)
-![Elixir](https://img.shields.io/badge/Elixir-4B275F?style=for-the-badge&logo=elixir&logoColor=white)
+[![GitHub stars](https://img.shields.io/github/stars/nam348tnh3gp/SocksHttpGate?style=for-the-badge&logo=github)](https://github.com/nam348tnh3gp/SocksHttpGate/stargazers)
+[![GitHub forks](https://img.shields.io/github/forks/nam348tnh3gp/SocksHttpGate?style=for-the-badge&logo=github)](https://github.com/nam348tnh3gp/SocksHttpGate/forks)
+[![Watchers](https://img.shields.io/github/watchers/nam348tnh3gp/SocksHttpGate?style=for-the-badge&logo=github)](https://github.com/nam348tnh3gp/SocksHttpGate/watchers)
+[![Repo size](https://img.shields.io/github/repo-size/nam348tnh3gp/SocksHttpGate?style=for-the-badge&label=repo%20size)](https://github.com/nam348tnh3gp/SocksHttpGate)
+[![Contributors](https://img.shields.io/github/contributors/nam348tnh3gp/SocksHttpGate?style=for-the-badge)](https://github.com/nam348tnh3gp/SocksHttpGate/graphs/contributors)
+[![Last commit](https://img.shields.io/github/last-commit/nam348tnh3gp/SocksHttpGate?style=for-the-badge)](https://github.com/nam348tnh3gp/SocksHttpGate/commits/main)
+[![Commit activity](https://img.shields.io/github/commit-activity/m/nam348tnh3gp/SocksHttpGate?style=for-the-badge)](https://github.com/nam348tnh3gp/SocksHttpGate/graphs/commit-activity)
+[![Open issues](https://img.shields.io/github/issues/nam348tnh3gp/SocksHttpGate?style=for-the-badge)](https://github.com/nam348tnh3gp/SocksHttpGate/issues)
+[![Closed issues](https://img.shields.io/github/issues-closed/nam348tnh3gp/SocksHttpGate?style=for-the-badge)](https://github.com/nam348tnh3gp/SocksHttpGate/issues?q=is%3Aissue+is%3Aclosed)
+[![Pull requests](https://img.shields.io/github/issues-pr/nam348tnh3gp/SocksHttpGate?style=for-the-badge)](https://github.com/nam348tnh3gp/SocksHttpGate/pulls)
+[![License](https://img.shields.io/github/license/nam348tnh3gp/SocksHttpGate?style=for-the-badge)](LICENSE)
+[![Top language](https://img.shields.io/github/languages/top/nam348tnh3gp/SocksHttpGate?style=for-the-badge)](https://github.com/nam348tnh3gp/SocksHttpGate)
+[![Languages](https://img.shields.io/github/languages/count/nam348tnh3gp/SocksHttpGate?style=for-the-badge)](https://github.com/nam348tnh3gp/SocksHttpGate)
+
+### DNS protocol status
+
+[![DoH CI](https://img.shields.io/github/actions/workflow/status/nam348tnh3gp/SocksHttpGate/test-doh.yml?branch=main&style=for-the-badge&label=DoH%20CI)](https://github.com/nam348tnh3gp/SocksHttpGate/actions)
+[![DoT CI](https://img.shields.io/github/actions/workflow/status/nam348tnh3gp/SocksHttpGate/test-dot.yml?branch=main&style=for-the-badge&label=DoT%20CI)](https://github.com/nam348tnh3gp/SocksHttpGate/actions/workflows/test-dot.yml)
+[![ODoH CI](https://img.shields.io/github/actions/workflow/status/nam348tnh3gp/SocksHttpGate/odoh.yml?branch=main&style=for-the-badge&label=ODoH%20CI)](https://github.com/nam348tnh3gp/SocksHttpGate/actions/workflows/odoh.yml)
+
+[![Go](https://img.shields.io/badge/Go-00ADD8?style=for-the-badge&logo=go&logoColor=white)](https://go.dev/)
+[![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![C](https://img.shields.io/badge/C-A8B9CC?style=for-the-badge&logo=c&logoColor=black)](https://en.cppreference.com/w/c)
+[![JavaScript](https://img.shields.io/badge/JavaScript-F7DF1E?style=for-the-badge&logo=javascript&logoColor=black)](https://developer.mozilla.org/docs/Web/JavaScript)
+[![Java](https://img.shields.io/badge/Java-ED8B00?style=for-the-badge&logo=openjdk&logoColor=white)](https://openjdk.org/)
+[![Kotlin](https://img.shields.io/badge/Kotlin-7F52FF?style=for-the-badge&logo=kotlin&logoColor=white)](https://kotlinlang.org/)
+[![Ruby](https://img.shields.io/badge/Ruby-CC342D?style=for-the-badge&logo=ruby&logoColor=white)](https://www.ruby-lang.org/)
+[![Elixir](https://img.shields.io/badge/Elixir-4B275F?style=for-the-badge&logo=elixir&logoColor=white)](https://elixir-lang.org/)
 
 ## Contents
 
