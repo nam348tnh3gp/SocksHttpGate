@@ -20,7 +20,7 @@ A multi-language proxy and DNS networking project. The repository contains SOCKS
 
 ### DNS protocol status
 
-[![DoH CI](https://img.shields.io/github/actions/workflow/status/nam348tnh3gp/SocksHttpGate/test-doh.yml?branch=main&style=for-the-badge&label=DoH%20CI)](https://github.com/nam348tnh3gp/SocksHttpGate/actions)
+[![DoH](https://img.shields.io/badge/DNS-over--HTTPS-2496ED?style=for-the-badge&logo=cloudflare&logoColor=white)](DoH/)
 [![DoT CI](https://img.shields.io/github/actions/workflow/status/nam348tnh3gp/SocksHttpGate/test-dot.yml?branch=main&style=for-the-badge&label=DoT%20CI)](https://github.com/nam348tnh3gp/SocksHttpGate/actions/workflows/test-dot.yml)
 [![ODoH CI](https://img.shields.io/github/actions/workflow/status/nam348tnh3gp/SocksHttpGate/odoh.yml?branch=main&style=for-the-badge&label=ODoH%20CI)](https://github.com/nam348tnh3gp/SocksHttpGate/actions/workflows/odoh.yml)
 
