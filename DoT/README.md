@@ -1,5 +1,16 @@
 # DNS-over-TLS (DoT)
 
+[![DoT CI](https://img.shields.io/github/actions/workflow/status/nam348tnh3gp/SocksHttpGate/test-dot.yml?branch=main&style=for-the-badge&label=DoT%20CI)](https://github.com/nam348tnh3gp/SocksHttpGate/actions/workflows/test-dot.yml)
+[![Go](https://img.shields.io/badge/Go-1.23%2B-00ADD8?style=for-the-badge&logo=go&logoColor=white)](https://go.dev/)
+[![Protocol](https://img.shields.io/badge/Protocol-DNS--over--TLS-2496ED?style=for-the-badge&logo=letsencrypt&logoColor=white)](#dns-over-tls-dot)
+[![Port](https://img.shields.io/badge/Default%20Port-TCP%20853-555555?style=for-the-badge)](#run-on-a-linux-vps)
+[![TLS](https://img.shields.io/badge/TLS-1.2%2B-success?style=for-the-badge&logo=letsencrypt&logoColor=white)](#configuration)
+[![Docker](https://img.shields.io/badge/Docker-Supported-2496ED?style=for-the-badge&logo=docker&logoColor=white)](#docker)
+[![Blocklists](https://img.shields.io/badge/Blocklists-Supported-2E8B57?style=for-the-badge)](#configuration)
+[![Dashboard](https://img.shields.io/badge/Web%20Dashboard-Included-6f42c1?style=for-the-badge)](#web-dashboard)
+[![Last commit](https://img.shields.io/github/last-commit/nam348tnh3gp/SocksHttpGate/main/DoT?style=for-the-badge)](https://github.com/nam348tnh3gp/SocksHttpGate/commits/main/DoT)
+[![License](https://img.shields.io/github/license/nam348tnh3gp/SocksHttpGate?style=for-the-badge)](../LICENSE)
+
 Standalone DNS-over-TLS forwarder for Android Private DNS. This service is separate from `../DoH`; it does not change the existing DoH service.
 
 ## Features
