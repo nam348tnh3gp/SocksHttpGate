@@ -115,10 +115,27 @@ tr.err td{color:var(--warn)}
   td{max-width:60vw}
   .bar-row{grid-template-columns:minmax(48px,70px) 1fr minmax(30px,50px)}
 }
+.modal-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center;padding:24px}
+.modal-bg.open{display:flex}
+.modal{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:24px;width:100%;max-width:420px;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+.modal h3{font-size:16px;margin-bottom:16px;display:flex;justify-content:space-between;align-items:center}
+.modal h3 button{background:none;border:none;color:var(--muted);font-size:20px;cursor:pointer;padding:0;line-height:1}
+.modal h3 button:hover{color:var(--fg)}
+.modal label{display:block;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}
+.modal input{width:100%;background:#0d1117;border:1px solid var(--border);color:var(--fg);padding:9px 11px;border-radius:6px;font-size:13px;outline:none;margin-bottom:12px}
+.modal input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(88,166,255,.15)}
+.modal .actions{display:flex;gap:8px;justify-content:flex-end;margin-top:8px}
+.modal .actions button{padding:8px 16px;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;border:none}
+.modal .actions .btn-cancel{background:transparent;color:var(--muted);border:1px solid var(--border)}
+.modal .actions .btn-cancel:hover{color:var(--fg);border-color:var(--fg)}
+.modal .actions .btn-ok{background:var(--accent);color:#fff}
+.modal .actions .btn-ok:hover:not(:disabled){background:#4090d0}
+.modal .actions .btn-ok:disabled{opacity:.6;cursor:wait}
+.modal #pw-msg{font-size:12px;min-height:16px;margin-top:8px;text-align:center}
 </style>
 </head>
 <body>
-<h1>Go DoH Resolver <span id="status" class="badge loading">LOADING</span> <a href="#" onclick="logout(event)" style="margin-left:auto;font-size:12px;color:var(--muted);text-decoration:none;font-weight:400;padding:4px 10px;border:1px solid var(--border);border-radius:4px">Sign out</a></h1>
+<h1>Go DoH Resolver <span id="status" class="badge loading">LOADING</span> <span style="margin-left:auto;display:flex;gap:8px;align-items:center"><a href="#" onclick="showPasswordModal(event)" style="font-size:12px;color:var(--muted);text-decoration:none;font-weight:400;padding:4px 10px;border:1px solid var(--border);border-radius:4px">Change password</a><a href="#" onclick="logout(event)" style="font-size:12px;color:var(--muted);text-decoration:none;font-weight:400;padding:4px 10px;border:1px solid var(--border);border-radius:4px">Sign out</a></span></h1>
 <div class="sub">
 Endpoint: <a href="/dns-query">/dns-query</a>
 · <span id="conn" class="conn off">● disconnected</span>
@@ -243,6 +260,23 @@ Endpoint: <a href="/dns-query">/dns-query</a>
       </div>
     </div>
     <div class="panel-body"><table><thead><tr><th>Time</th><th>Level</th><th>Message</th></tr></thead><tbody id="lbody"></tbody></table></div>
+  </div>
+</div>
+
+<div class="modal-bg" id="pw-modal">
+  <div class="modal">
+    <h3>Change password <button type="button" onclick="closePasswordModal()" aria-label="Close">&times;</button></h3>
+    <label for="pw-old">Current password</label>
+    <input id="pw-old" type="password" autocomplete="current-password">
+    <label for="pw-new">New password</label>
+    <input id="pw-new" type="password" autocomplete="new-password">
+    <label for="pw-confirm">Confirm new password</label>
+    <input id="pw-confirm" type="password" autocomplete="new-password">
+    <div id="pw-msg"></div>
+    <div class="actions">
+      <button type="button" class="btn-cancel" onclick="closePasswordModal()">Cancel</button>
+      <button type="button" class="btn-ok" id="pw-submit" onclick="submitPassword()">Save</button>
+    </div>
   </div>
 </div>
 
@@ -447,6 +481,30 @@ Endpoint: <a href="/dns-query">/dns-query</a>
     es.addEventListener('log',function(e){try{addLog(JSON.parse(e.data));}catch(err){}});
   }
 
+  window.showPasswordModal=function(e){if(e)e.preventDefault();document.getElementById('pw-old').value='';document.getElementById('pw-new').value='';document.getElementById('pw-confirm').value='';document.getElementById('pw-msg').textContent='';document.getElementById('pw-modal').classList.add('open');setTimeout(function(){document.getElementById('pw-old').focus();},50);};
+  window.closePasswordModal=function(){document.getElementById('pw-modal').classList.remove('open');};
+  window.submitPassword=function(){
+    var oldPw=document.getElementById('pw-old').value;
+    var newPw=document.getElementById('pw-new').value;
+    var confPw=document.getElementById('pw-confirm').value;
+    var msg=document.getElementById('pw-msg');
+    var btn=document.getElementById('pw-submit');
+    msg.textContent='';msg.style.color='var(--muted)';
+    if(!oldPw||!newPw){msg.textContent='All fields are required';msg.style.color='var(--err)';return;}
+    if(newPw!==confPw){msg.textContent='New passwords do not match';msg.style.color='var(--err)';return;}
+    if(newPw.length<6){msg.textContent='New password must be at least 6 characters';msg.style.color='var(--err)';return;}
+    btn.disabled=true;msg.textContent='Saving...';
+    fetch('/api/password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({old:oldPw,new:newPw})})
+      .then(function(r){return r.json().then(function(j){return {ok:r.ok,body:j};});})
+      .then(function(x){
+        if(x.ok){msg.textContent='Password updated successfully';msg.style.color='var(--ok)';setTimeout(function(){closePasswordModal();},1500);}
+        else{msg.textContent=(x.body&&x.body.error)||('Failed ('+x.status+')');msg.style.color='var(--err)';}
+      })
+      .catch(function(e){msg.textContent='Network error: '+e.message;msg.style.color='var(--err)';})
+      .finally(function(){btn.disabled=false;});
+  };
+  document.getElementById('pw-modal').addEventListener('click',function(e){if(e.target===this)closePasswordModal();});
+  document.addEventListener('keydown',function(e){if(e.key==='Escape')closePasswordModal();});
   window.logout=function(e){e.preventDefault();fetch('/api/logout',{method:'POST'}).finally(function(){location.replace('/login');});};
   refreshStats();
   setInterval(refreshStats,3000);
