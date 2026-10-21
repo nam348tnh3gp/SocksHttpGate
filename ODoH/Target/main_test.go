@@ -19,9 +19,45 @@ func TestODoHQueryRoundTripAndBlocklist(t *testing.T) {
 		t.Fatalf("create key pair: %v", err)
 	}
 
-	// Use the real public Cloudflare DoH endpoint: no fake upstream DNS server.
-	// The ODoH Target and client-facing HTTP endpoint remain local to this test.
-	upstreamURL := "https://cloudflare-dns.com/dns-query"
+	// Keep the upstream DoH hop local and deterministic. This test still exercises
+	// the real ODoH config, HPKE encryption/decryption, HTTP message framing, and
+	// DNS wire-format round trip, without making CI depend on public Internet access.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || mediaType(r.Header.Get("Content-Type")) != dnsType {
+			http.Error(w, "invalid DoH request", http.StatusBadRequest)
+			return
+		}
+		wire, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read request", http.StatusBadRequest)
+			return
+		}
+		query := new(dns.Msg)
+		if err := query.Unpack(wire); err != nil || len(query.Question) != 1 {
+			http.Error(w, "invalid DNS wire message", http.StatusBadRequest)
+			return
+		}
+		answer := new(dns.Msg)
+		answer.SetReply(query)
+		if query.Question[0].Qtype == dns.TypeA {
+			rr, err := dns.NewRR(query.Question[0].Name + " 60 IN A 192.0.2.42")
+			if err != nil {
+				http.Error(w, "build DNS answer", http.StatusInternalServerError)
+				return
+			}
+			answer.Answer = append(answer.Answer, rr)
+		}
+		body, err := answer.Pack()
+		if err != nil {
+			http.Error(w, "pack DNS answer", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", dnsType)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	}))
+	defer upstream.Close()
+	upstreamURL := upstream.URL + "/dns-query"
 	upstreamClient := &http.Client{Timeout: 10 * time.Second}
 
 	target := &target{
@@ -113,7 +149,7 @@ func TestODoHQueryRoundTripAndBlocklist(t *testing.T) {
 		}
 	}
 	if !foundA {
-		t.Fatalf("real upstream response for example.com contains no A record: %v", allowed.Answer)
+		t.Fatalf("local DoH upstream response for example.com contains no A record: %v", allowed.Answer)
 	}
 
 	blocked := runQuery("blocked.example")
