@@ -1,7 +1,8 @@
-name: ODoH full validation
+name: ODoH validation
 
 on:
   push:
+    branches: [main]
     paths:
       - "ODoH/**"
       - ".github/workflows/odoh.yml"
@@ -14,45 +15,60 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: odoh-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: ODoH
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: "1.23.x"
           cache: true
-          cache-dependency-path: ODoH/go.mod
-      - name: Resolve and verify modules
-        run: go mod tidy
-      - name: Check Go test formatting
+          cache-dependency-path: ODoH/go.sum
+
+      - name: Verify module files are tidy
+        run: go mod tidy -diff
+
+      - name: Check Go formatting
+        shell: bash
         run: |
-          files="$(gofmt -l Proxy/security_test.go)"
-          if [ -n "$files" ]; then
-            echo "Go test files need gofmt:"
+          set -euo pipefail
+          files="$(gofmt -l Proxy/*.go Target/*.go)"
+          if [[ -n "$files" ]]; then
+            echo "These Go files need gofmt:"
             echo "$files"
             exit 1
           fi
+
       - name: Static analysis
         run: go vet ./...
+
       - name: Build Proxy and Target
         run: |
-          go build -trimpath -o ../.odoh-proxy-ci ./Proxy
-          go build -trimpath -o ../.odoh-target-ci ./Target
-      - name: Run all tests with race detector
+          go build -trimpath -o /tmp/odoh-proxy-ci ./Proxy
+          go build -trimpath -o /tmp/odoh-target-ci ./Target
+
+      - name: Run protocol and regression tests
         env:
           GODEBUG: "httpmuxgo121=0"
         run: go test -race -count=1 -v ./...
+
       - name: Fuzz malformed ODoH messages
-        run: go test ./Target -run=^$ -fuzz=FuzzTargetMalformedODoH -fuzztime=10s
+        run: go test ./Target -run='^$' -fuzz=FuzzTargetMalformedODoH -fuzztime=10s
+
       - name: Build Proxy Docker image
         run: docker build --pull -f Proxy/Dockerfile -t sockshttpgate-odoh-proxy:ci .
+
       - name: Build Target Docker image
         run: docker build --pull -f Target/Dockerfile -t sockshttpgate-odoh-target:ci .
