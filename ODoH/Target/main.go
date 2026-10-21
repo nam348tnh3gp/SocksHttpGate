@@ -29,14 +29,14 @@ const (
 )
 
 type target struct {
-	kp       odoh.ObliviousDoHKeyPair
-	client   *http.Client
-	upstream string
-	mu       sync.RWMutex
-	blocked  map[string]struct{}
-	sources  []string
-	refresh  time.Duration
-	started  time.Time
+	kp                              odoh.ObliviousDoHKeyPair
+	client                          *http.Client
+	upstream                        string
+	mu                              sync.RWMutex
+	blocked                         map[string]struct{}
+	sources                         []string
+	refresh                         time.Duration
+	started                         time.Time
 	queries, blockedQueries, errors atomic.Uint64
 }
 
@@ -364,14 +364,14 @@ func (t *target) stats(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"ready":            true,
-		"uptime_seconds":   int64(time.Since(t.started).Seconds()),
-		"queries":          t.queries.Load(),
-		"blocked_queries":  t.blockedQueries.Load(),
-		"errors":           t.errors.Load(),
-		"blocked_domains":  n,
+		"ready":             true,
+		"uptime_seconds":    int64(time.Since(t.started).Seconds()),
+		"queries":           t.queries.Load(),
+		"blocked_queries":   t.blockedQueries.Load(),
+		"errors":            t.errors.Load(),
+		"blocked_domains":   n,
 		"blocklist_sources": len(t.sources),
-		"privacy_mode":     "aggregate only; no query/domain/client logging",
+		"privacy_mode":      "aggregate only; no query/domain/client logging",
 	})
 }
 

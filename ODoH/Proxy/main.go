@@ -22,8 +22,8 @@ import (
 const (
 	odohType       = "application/oblivious-dns-message"
 	maxBody        = 65535
-	configsTimeout = 5 * time.Second   // configs ngắn hơn query
-	queryTimeout   = 15 * time.Second  // query dài hơn
+	configsTimeout = 5 * time.Second  // configs ngắn hơn query
+	queryTimeout   = 15 * time.Second // query dài hơn
 )
 
 type proxy struct {
