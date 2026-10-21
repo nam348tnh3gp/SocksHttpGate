@@ -14,6 +14,9 @@ SocksHttpGate ODoH includes **its own Go Proxy and Target server implementations
 
 ## Components
 
+- [Proxy component guide](Proxy/README.md)
+- [Target component guide](Target/README.md)
+
 - **Proxy** — `Proxy/`: accepts ODoH HTTP requests, forwards opaque encrypted messages to the configured Target, and exposes health/status/statistics endpoints.
 - **Target** — `Target/`: publishes ODoH public configuration at `/.well-known/odohconfigs`, processes encrypted ODoH queries, applies the configured blocklist, forwards DNS resolution to an upstream DoH resolver, and returns encrypted responses.
 - **Protocol tests** — the Go tests exercise ODoH configuration retrieval and decoding, query encryption, request handling, response decryption and DNS answer validation, blocklist behavior, malformed input handling, and fuzz cases.
