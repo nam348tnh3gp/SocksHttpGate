@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -116,7 +118,7 @@ tr.err td{color:var(--warn)}
 </style>
 </head>
 <body>
-<h1>Go DoH Resolver <span id="status" class="badge loading">LOADING</span></h1>
+<h1>Go DoH Resolver <span id="status" class="badge loading">LOADING</span> <a href="#" onclick="logout(event)" style="margin-left:auto;font-size:12px;color:var(--muted);text-decoration:none;font-weight:400;padding:4px 10px;border:1px solid var(--border);border-radius:4px">Sign out</a></h1>
 <div class="sub">
 Endpoint: <a href="/dns-query">/dns-query</a>
 · <span id="conn" class="conn off">● disconnected</span>
@@ -445,6 +447,7 @@ Endpoint: <a href="/dns-query">/dns-query</a>
     es.addEventListener('log',function(e){try{addLog(JSON.parse(e.data));}catch(err){}});
   }
 
+  window.logout=function(e){e.preventDefault();fetch('/api/logout',{method:'POST'}).finally(function(){location.replace('/login');});};
   refreshStats();
   setInterval(refreshStats,3000);
   connect();
@@ -453,6 +456,78 @@ Endpoint: <a href="/dns-query">/dns-query</a>
 </body>
 </html>`
 )
+
+const loginHTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Sign in · Go DoH Resolver</title>
+<style>
+:root{--bg:#0d1117;--panel:#161b22;--border:#30363d;--fg:#c9d1d9;--muted:#8b949e;--accent:#58a6ff;--err:#f85149}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:radial-gradient(ellipse at top,#1f2937 0%,#0d1117 60%);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:32px;width:100%;max-width:380px;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+h1{font-size:20px;margin-bottom:8px;text-align:center}
+.sub{text-align:center;color:var(--muted);font-size:13px;margin-bottom:24px}
+label{display:block;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}
+input{width:100%;background:#0d1117;border:1px solid var(--border);color:var(--fg);padding:10px 12px;border-radius:6px;font-size:14px;outline:none;transition:border-color .15s,box-shadow .15s}
+input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(88,166,255,.15)}
+.form-group{margin-bottom:16px}
+button{width:100%;padding:11px;background:var(--accent);color:#fff;border:none;border-radius:6px;font-size:14px;font-weight:600;cursor:pointer;transition:background .15s}
+button:hover:not(:disabled){background:#4090d0}
+button:disabled{opacity:.6;cursor:wait}
+#msg{font-size:13px;margin-top:14px;min-height:18px;text-align:center;color:var(--err)}
+.hint{font-size:11px;color:var(--muted);text-align:center;margin-top:20px;padding-top:16px;border-top:1px solid var(--border);line-height:1.6}
+.hint code{background:rgba(88,166,255,.1);padding:1px 5px;border-radius:3px;color:var(--accent);font-size:10.5px}
+</style>
+</head>
+<body>
+<form class="card" id="loginForm">
+  <h1>Go DoH Resolver</h1>
+  <div class="sub">Sign in to continue</div>
+  <div class="form-group">
+    <label for="u">Username</label>
+    <input id="u" name="username" autocomplete="username" required autofocus>
+  </div>
+  <div class="form-group">
+    <label for="p">Password</label>
+    <input id="p" name="password" type="password" autocomplete="current-password" required>
+  </div>
+  <button id="btn" type="submit">Sign in</button>
+  <div id="msg"></div>
+  <div class="hint">Default credentials <code>admin</code> / <code>admin</code>.<br>Override via env <code>ADMIN_USER</code> and <code>ADMIN_PASSWORD</code>.</div>
+</form>
+<script>
+document.getElementById('loginForm').addEventListener('submit', async function(e){
+  e.preventDefault();
+  var btn=document.getElementById('btn'), msg=document.getElementById('msg');
+  btn.disabled=true; msg.textContent='';
+  try {
+    var r = await fetch('/api/login', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        username: document.getElementById('u').value,
+        password: document.getElementById('p').value
+      })
+    });
+    var j = await r.json().catch(function(){return {};});
+    if (r.ok) {
+      var next = new URLSearchParams(location.search).get('next') || '/';
+      location.replace(next);
+    } else {
+      msg.textContent = j.error || ('Sign in failed (' + r.status + ')');
+    }
+  } catch(err) {
+    msg.textContent = 'Network error: ' + err.message;
+  } finally {
+    btn.disabled=false;
+  }
+});
+</script>
+</body>
+</html>`
 
 // ─── Data types ────────────────────────────────────────────────────────────
 
@@ -500,7 +575,6 @@ type SourceStatus struct {
 	TotalLoads  uint64 `json:"total_loads"`
 	FailedLoads uint64 `json:"failed_loads"`
 }
-
 
 // ─── JSON API (Google-compatible) ──────────────────────────────────────────
 
@@ -695,6 +769,222 @@ func (l *dashLogger) emit(level, f string, a ...any) {
 	l.ring.Add(LogEntry{Time: time.Now(), Level: level, Message: msg})
 }
 
+// ─── Auth ──────────────────────────────────────────────────────────────────
+
+type sessionInfo struct {
+	User    string
+	Expires time.Time
+}
+
+var (
+	adminUser  atomic.Value
+	adminPass  atomic.Value
+	sessionsMu sync.Mutex
+	sessions   = map[string]sessionInfo{}
+	sessionTTL = 24 * time.Hour
+)
+
+func initAuth() error {
+	adminUser.Store(env("ADMIN_USER", "admin"))
+	adminPass.Store(env("ADMIN_PASSWORD", "admin"))
+	if ttl := strings.TrimSpace(os.Getenv("SESSION_TTL")); ttl != "" {
+		d, err := time.ParseDuration(ttl)
+		if err != nil || d < time.Minute {
+			return fmt.Errorf("SESSION_TTL: must be a duration >= 1m")
+		}
+		sessionTTL = d
+	}
+	if adminUser.Load().(string) == "admin" && adminPass.Load().(string) == "admin" {
+		dlog.Warnf("auth: DEFAULT credentials admin/admin in use — set ADMIN_USER and ADMIN_PASSWORD")
+	}
+	go func() {
+		t := time.NewTicker(10 * time.Minute)
+		defer t.Stop()
+		for range t.C {
+			now := time.Now()
+			sessionsMu.Lock()
+			for tok, s := range sessions {
+				if now.After(s.Expires) {
+					delete(sessions, tok)
+				}
+			}
+			sessionsMu.Unlock()
+		}
+	}()
+	return nil
+}
+
+func newSessionToken() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+func createSession(user string) (string, time.Time) {
+	tok := newSessionToken()
+	exp := time.Now().Add(sessionTTL)
+	sessionsMu.Lock()
+	sessions[tok] = sessionInfo{User: user, Expires: exp}
+	sessionsMu.Unlock()
+	return tok, exp
+}
+
+func getSession(r *http.Request) (sessionInfo, bool) {
+	c, err := r.Cookie("dash_session")
+	if err != nil {
+		return sessionInfo{}, false
+	}
+	sessionsMu.Lock()
+	s, ok := sessions[c.Value]
+	sessionsMu.Unlock()
+	if !ok {
+		return sessionInfo{}, false
+	}
+	if time.Now().After(s.Expires) {
+		sessionsMu.Lock()
+		delete(sessions, c.Value)
+		sessionsMu.Unlock()
+		return sessionInfo{}, false
+	}
+	return s, true
+}
+
+func dropSession(r *http.Request) {
+	c, err := r.Cookie("dash_session")
+	if err != nil {
+		return
+	}
+	sessionsMu.Lock()
+	delete(sessions, c.Value)
+	sessionsMu.Unlock()
+}
+
+func cookieSecure(r *http.Request) bool {
+	return r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
+}
+
+func requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := getSession(r); ok {
+			next(w, r)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/events" {
+			writeJSONError(w, http.StatusUnauthorized, "authentication required")
+			return
+		}
+		http.Redirect(w, r, "/login?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusSeeOther)
+	}
+}
+
+func (s *server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if _, ok := getSession(r); ok {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Frame-Options", "DENY")
+	_, _ = io.WriteString(w, loginHTML)
+}
+
+func (s *server) handleLoginAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var body struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	wantUser := adminUser.Load().(string)
+	wantPass := adminPass.Load().(string)
+	userOK := subtle.ConstantTimeCompare([]byte(body.Username), []byte(wantUser)) == 1
+	passOK := subtle.ConstantTimeCompare([]byte(body.Password), []byte(wantPass)) == 1
+	if !userOK || !passOK {
+		time.Sleep(200 * time.Millisecond)
+		writeJSONError(w, http.StatusUnauthorized, "invalid username or password")
+		return
+	}
+	tok, exp := createSession(body.Username)
+	http.SetCookie(w, &http.Cookie{
+		Name: "dash_session", Value: tok, Path: "/",
+		Expires: exp, HttpOnly: true, Secure: cookieSecure(r), SameSite: http.SameSiteStrictMode,
+	})
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "user": body.Username})
+}
+
+func (s *server) handleLogoutAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	dropSession(r)
+	http.SetCookie(w, &http.Cookie{
+		Name: "dash_session", Value: "", Path: "/", MaxAge: -1,
+		HttpOnly: true, Secure: cookieSecure(r), SameSite: http.SameSiteStrictMode,
+	})
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (s *server) handlePasswordAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if _, ok := getSession(r); !ok {
+		writeJSONError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	var body struct {
+		Old string `json:"old"`
+		New string `json:"new"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if len(body.New) < 6 {
+		writeJSONError(w, http.StatusBadRequest, "new password must be at least 6 characters")
+		return
+	}
+	wantPass := adminPass.Load().(string)
+	if subtle.ConstantTimeCompare([]byte(body.Old), []byte(wantPass)) != 1 {
+		time.Sleep(200 * time.Millisecond)
+		writeJSONError(w, http.StatusUnauthorized, "old password incorrect")
+		return
+	}
+	adminPass.Store(body.New)
+	current, _ := r.Cookie("dash_session")
+	sessionsMu.Lock()
+	for tok := range sessions {
+		if current != nil && tok == current.Value {
+			continue
+		}
+		delete(sessions, tok)
+	}
+	sessionsMu.Unlock()
+	dlog.Infof("auth: admin password changed (in-memory; env ADMIN_PASSWORD overrides on restart)")
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
 // ─── Server ────────────────────────────────────────────────────────────────
 
 type domainStat struct {
@@ -812,11 +1102,19 @@ func (s *server) bumpErrReason(reason string) {
 	s.errMu.Unlock()
 }
 
+const clientMapCap = 5000
+
 func (s *server) bumpClient(ip string) {
 	if ip == "" {
 		return
 	}
 	s.cliMu.Lock()
+	if _, exists := s.clients[ip]; !exists && len(s.clients) >= clientMapCap {
+		for k := range s.clients {
+			delete(s.clients, k)
+			break
+		}
+	}
 	s.clients[ip]++
 	s.cliMu.Unlock()
 }
@@ -872,11 +1170,18 @@ func classifyUpstreamErr(err error, statusCode int) string {
 }
 
 func clientIP(r *http.Request) string {
+	// Behind Render/PaaS: XFF is "<client>, <edge>" (or longer chain).
+	// The last entry is the trusted edge; the entry right before it is the client.
+	// Never trust XFF[0] — clients can spoof it.
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if i := strings.Index(xff, ","); i > 0 {
-			return strings.TrimSpace(xff[:i])
+		parts := strings.Split(xff, ",")
+		for i := range parts {
+			parts[i] = strings.TrimSpace(parts[i])
 		}
-		return strings.TrimSpace(xff)
+		if n := len(parts); n >= 2 {
+			return parts[n-2]
+		}
+		return parts[0]
 	}
 	if xr := r.Header.Get("X-Real-IP"); xr != "" {
 		return strings.TrimSpace(xr)
@@ -896,6 +1201,10 @@ func main() {
 	refreshEvery, err := time.ParseDuration(env("BLOCKLIST_REFRESH", defaultRefreshTime.String()))
 	if err != nil || refreshEvery < time.Minute {
 		log.Fatal("BLOCKLIST_REFRESH must be a duration of at least 1m, for example 6h")
+	}
+
+	if err := initAuth(); err != nil {
+		log.Fatal(err)
 	}
 
 	s := &server{
@@ -932,20 +1241,37 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", s.handleRoot)
+	// Public (DoH must stay open)
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/dns-query", s.handleDoH)
 	mux.HandleFunc("/resolve", s.handleDoH)
-	mux.HandleFunc("/events", s.handleEvents)
-	mux.HandleFunc("/api/stats", s.handleAPIStats)
-	mux.HandleFunc("/api/logs", s.handleLogDownload)
-	mux.HandleFunc("/api/upstream", s.handleAPIUpstream)
+	// Auth
+	mux.HandleFunc("/login", s.handleLogin)
+	mux.HandleFunc("/api/login", s.handleLoginAPI)
+	mux.HandleFunc("/api/logout", s.handleLogoutAPI)
+	// Protected
+	mux.HandleFunc("/", requireAuth(s.handleRoot))
+	mux.HandleFunc("/events", requireAuth(s.handleEvents))
+	mux.HandleFunc("/api/stats", requireAuth(s.handleAPIStats))
+	mux.HandleFunc("/api/logs", requireAuth(s.handleLogDownload))
+	mux.HandleFunc("/api/upstream", requireAuth(s.handleAPIUpstream))
+	mux.HandleFunc("/api/password", requireAuth(s.handlePasswordAPI))
 
 	addr := ":" + port
 	dlog.Infof("================ PROCESS START pid=%d at %s ================", os.Getpid(), time.Now().UTC().Format(time.RFC3339))
 	dlog.Infof("HTTP listening on %s; upstream=%s; remote sources=%d; refresh=%s; platform=%s/%s; go=%s",
 		addr, upstream, len(s.blocklistURLs), s.refreshEvery, runtime.GOOS, runtime.GOARCH, runtime.Version())
-	log.Fatal(http.ListenAndServe(addr, securityHeaders(mux)))
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           securityHeaders(mux),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+		ErrorLog:          log.New(os.Stderr, "[http] ", log.LstdFlags),
+	}
+	log.Fatal(srv.ListenAndServe())
 }
 
 func (s *server) qpsLoop() {
@@ -1322,6 +1648,9 @@ func csvEscape(s string) string {
 }
 
 func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
+	// SSE needs to live past Server.WriteTimeout.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming not supported", http.StatusInternalServerError)
@@ -1444,6 +1773,7 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		reply := new(dns.Msg)
 		reply.SetReply(msg)
 		reply.Authoritative = true
+		reply.RecursionAvailable = true
 		reply.Rcode = dns.RcodeNameError
 		out, packErr := reply.Pack()
 		if packErr != nil {
@@ -1540,6 +1870,17 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "malformed DNS response from upstream", http.StatusBadGateway)
 		return
 	}
+	if (check.Id != msg.Id && check.Id != 0) || len(check.Question) != 1 || !equalQuestion(check.Question[0], msg.Question[0]) {
+		s.totalErrors.Add(1)
+		s.recordQuery(qName, qType, false, "upstream_error", time.Since(started))
+		dlog.Warnf("upstream: response mismatch domain=%s", qName)
+		s.bumpErrReason("response_mismatch")
+		s.bumpResp("UPSTREAM_FAIL")
+		s.bumpClient(clientIP(r))
+		s.recordUpstreamFail("response_mismatch")
+		http.Error(w, "upstream response does not match query", http.StatusBadGateway)
+		return
+	}
 	s.totalPassed.Add(1)
 	s.bytesOut.Add(uint64(len(out)))
 	s.bumpResp(dns.RcodeToString[check.Rcode])
@@ -1551,7 +1892,6 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 	s.recordQuery(qName, qType, false, "ok", elapsed)
 	writeDNS(w, out)
 }
-
 
 func (s *server) handleDoHJSON(w http.ResponseWriter, r *http.Request, started time.Time) {
 	q := r.URL.Query()
@@ -1599,6 +1939,7 @@ func (s *server) handleDoHJSON(w http.ResponseWriter, r *http.Request, started t
 		reply := new(dns.Msg)
 		reply.SetReply(msg)
 		reply.Authoritative = true
+		reply.RecursionAvailable = true
 		reply.Rcode = dns.RcodeNameError
 
 		s.totalBlocked.Add(1)
@@ -1686,6 +2027,15 @@ func (s *server) handleDoHJSON(w http.ResponseWriter, r *http.Request, started t
 		writeJSONError(w, http.StatusBadGateway, "malformed DNS response from upstream")
 		return
 	}
+	if (check.Id != msg.Id && check.Id != 0) || len(check.Question) != 1 || !equalQuestion(check.Question[0], msg.Question[0]) {
+		s.totalErrors.Add(1)
+		s.recordQuery(fqdn, typeStr, false, "upstream_error", time.Since(started))
+		s.bumpErrReason("response_mismatch")
+		s.bumpResp("UPSTREAM_FAIL")
+		s.recordUpstreamFail("response_mismatch")
+		writeJSONError(w, http.StatusBadGateway, "upstream response does not match query")
+		return
+	}
 
 	s.totalPassed.Add(1)
 	s.bytesOut.Add(uint64(len(out)))
@@ -1757,6 +2107,10 @@ func (s *server) bumpDomain(name string, blocked bool) {
 	if blocked {
 		ds.blocked.Add(1)
 	}
+}
+
+func equalQuestion(a, b dns.Question) bool {
+	return a.Qtype == b.Qtype && a.Qclass == b.Qclass && strings.EqualFold(a.Name, b.Name)
 }
 
 func writeDNS(w http.ResponseWriter, packet []byte) {
