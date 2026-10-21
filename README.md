@@ -51,8 +51,8 @@ A multi-language SOCKS5/HTTP proxy project with standalone DNS-over-HTTPS (DoH),
 | `ElixircodeBeta/` | Elixir proxy | [README](ElixircodeBeta/README.md) |
 | `DoH/` | Standalone Go DNS-over-HTTPS service and dashboard | [README](DoH/README.md) |
 | `DoT/` | Standalone Go DNS-over-TLS service and dashboard | [README](DoT/README.md) |
-| `ODoH/Proxy/` | ODoH HTTP Proxy service | [ODoH README](ODoH/README.md) |
-| `ODoH/Target/` | ODoH Target service; key material belongs here only | [ODoH implementation notes](ODoH/README-IMPLEMENTATION.md) |
+| `ODoH/Proxy/` | ODoH HTTP Proxy service | [Proxy README](ODoH/Proxy/README.md) |
+| `ODoH/Target/` | ODoH Target service; key material belongs here only | [Target README](ODoH/Target/README.md) |
 | `ODoH/run.sh` | Optional legacy reference interoperability harness | [ODoH README](ODoH/README.md) |
 
 These are separate programs, not one unified executable. DoH/DoT/ODoH are not automatically wired into every SOCKS5/HTTP proxy implementation. Verify a specific integration in that component's source and tests before relying on it.
@@ -82,7 +82,7 @@ Python proxy:
 
 ```sh
 python3 server.py --help
-python3 server.py --listen 127.0.0.1 --port 1080
+python3 server.py --listen 127.0.0.1 --port 1080 --dashboard-bind 127.0.0.1
 ```
 
 Check exact options and configure credentials/dashboard access before use. For other implementations, open the linked component README first.
