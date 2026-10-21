@@ -104,6 +104,7 @@ jobs:
             "crypto/tls"
             "fmt"
             "os"
+            "time"
 
             "github.com/miekg/dns"
           )
