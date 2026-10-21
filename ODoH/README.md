@@ -1,5 +1,15 @@
 # SocksHttpGate ODoH — Termux local test harness
 
+[![ODoH CI](https://img.shields.io/github/actions/workflow/status/nam348tnh3gp/SocksHttpGate/odoh.yml?branch=main&style=for-the-badge&label=ODoH%20CI)](https://github.com/nam348tnh3gp/SocksHttpGate/actions/workflows/odoh.yml)
+[![Go](https://img.shields.io/badge/Go-1.23%2B-00ADD8?style=for-the-badge&logo=go&logoColor=white)](https://go.dev/)
+[![Protocol](https://img.shields.io/badge/Protocol-RFC%209230%20ODoH-6f42c1?style=for-the-badge)](https://www.rfc-editor.org/rfc/rfc9230)
+[![Docker build](https://img.shields.io/badge/Docker-Proxy%20%2B%20Target-2496ED?style=for-the-badge&logo=docker&logoColor=white)](https://github.com/nam348tnh3gp/SocksHttpGate/actions/workflows/odoh.yml)
+[![Tests](https://img.shields.io/badge/Tests-Race%20%2B%20Fuzzing-success?style=for-the-badge)](https://github.com/nam348tnh3gp/SocksHttpGate/actions/workflows/odoh.yml)
+[![Status](https://img.shields.io/badge/Status-Experimental-orange?style=for-the-badge)](#important-security-warning)
+[![Security](https://img.shields.io/badge/NOT%20FOR%20PRODUCTION-Archived%20reference-critical?style=for-the-badge)](#important-security-warning)
+[![Last commit](https://img.shields.io/github/last-commit/nam348tnh3gp/SocksHttpGate/main/ODoH?style=for-the-badge)](https://github.com/nam348tnh3gp/SocksHttpGate/commits/main/ODoH)
+[![License](https://img.shields.io/github/license/nam348tnh3gp/SocksHttpGate?style=for-the-badge)](../LICENSE)
+
 This is a **local interoperability smoke-test harness**, not a production-ready ODoH service.
 
 It downloads and builds the archived Cloudflare Go reference server and client, creates a short-lived self-signed certificate, and tries an ODoH DNS query through a local proxy/target pair.
