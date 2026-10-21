@@ -91,7 +91,7 @@ Run from this directory with Go 1.23 or newer:
 
 ```sh
 go mod tidy -diff
-gofmt -d *.go
+test -z "$(gofmt -l *.go)"
 go test -count=1 ./...
 go vet ./...
 go build -trimpath -o dot .
