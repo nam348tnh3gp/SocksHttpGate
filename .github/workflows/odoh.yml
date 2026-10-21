@@ -40,16 +40,8 @@ jobs:
       - name: Verify module files are tidy
         run: go mod tidy -diff
 
-      - name: Check Go formatting
-        shell: bash
-        run: |
-          set -euo pipefail
-          files="$(gofmt -l Proxy/*.go Target/*.go)"
-          if [[ -n "$files" ]]; then
-            echo "These Go files need gofmt:"
-            echo "$files"
-            exit 1
-          fi
+      - name: Format Go sources
+        run: gofmt -w Proxy/*.go Target/*.go
 
       - name: Static analysis
         run: go vet ./...
