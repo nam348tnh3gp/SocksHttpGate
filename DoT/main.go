@@ -15,29 +15,29 @@ import (
 )
 
 const (
-	defaultListenAddr = ":853"
-	defaultUpstream = "1.1.1.1:853"
-	defaultTLSName = "cloudflare-dns.com"
+	defaultListenAddr       = ":853"
+	defaultUpstream         = "1.1.1.1:853"
+	defaultTLSName          = "cloudflare-dns.com"
 	defaultBlocklistRefresh = 6 * time.Hour
 )
 
 type resolver struct {
-	upstream string
-	upstreamTLSName string
-	client *dns.Client
-	blocked map[string]struct{}
-	blocklistURLs []string
-	refreshEvery time.Duration
-	sources map[string]*blocklistSourceState
-	lastRefresh atomic.Int64
-	ready atomic.Bool
+	upstream         string
+	upstreamTLSName  string
+	client           *dns.Client
+	blocked          map[string]struct{}
+	blocklistURLs    []string
+	refreshEvery     time.Duration
+	sources          map[string]*blocklistSourceState
+	lastRefresh      atomic.Int64
+	ready            atomic.Bool
 	blocklistVersion atomic.Uint64
 
 	upstreamMu sync.RWMutex
-	stateMu sync.RWMutex
-	started time.Time
-	stats dashboardStats
-	logs []queryLogEntry
+	stateMu    sync.RWMutex
+	started    time.Time
+	stats      dashboardStats
+	logs       []queryLogEntry
 }
 
 func main() {
@@ -64,12 +64,14 @@ func main() {
 
 	r := &resolver{
 		upstream: upstream, upstreamTLSName: serverName,
-		blocked: parseBlocklist(os.Getenv("BLOCKLIST")),
+		blocked:       parseBlocklist(os.Getenv("BLOCKLIST")),
 		blocklistURLs: blocklistURLs, refreshEvery: refreshEvery,
 		sources: make(map[string]*blocklistSourceState), started: time.Now(),
 		client: newDoTClient(serverName),
 	}
-	for _, source := range blocklistURLs { r.sources[source] = &blocklistSourceState{} }
+	for _, source := range blocklistURLs {
+		r.sources[source] = &blocklistSourceState{}
+	}
 	if len(blocklistURLs) > 0 {
 		go func() { r.initialLoad(); r.refreshLoop() }()
 	} else {
@@ -250,7 +252,9 @@ func (r *resolver) getUpstream() (*dns.Client, string, string) {
 }
 
 func (r *resolver) setUpstream(upstream, serverName string) error {
-	if _, _, err := net.SplitHostPort(upstream); err != nil { return err }
+	if _, _, err := net.SplitHostPort(upstream); err != nil {
+		return err
+	}
 	if strings.TrimSpace(serverName) == "" || strings.ContainsAny(serverName, "/: ") {
 		return fmt.Errorf("invalid TLS server name")
 	}
