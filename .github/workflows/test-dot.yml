@@ -26,6 +26,10 @@ jobs:
     defaults:
       run:
         working-directory: DoT
+    env:
+      # Basic Auth cho DoT dashboard — override default admin/admin
+      ADMIN_USER: ci
+      ADMIN_PASSWORD: ci-test-password
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -66,29 +70,47 @@ jobs:
             -days 1 -subj "/CN=localhost" \
             -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
 
+          # Start server với ADMIN_USER/ADMIN_PASSWORD override
+          ADMIN_USER="${ADMIN_USER}" \
+          ADMIN_PASSWORD="${ADMIN_PASSWORD}" \
           DOT_ADDR=127.0.0.1:8853 \
           DASHBOARD_ADDR=127.0.0.1:8080 \
           TLS_CERT_FILE=/tmp/dot-test/cert.pem \
           TLS_KEY_FILE=/tmp/dot-test/key.pem \
+          UPSTREAM_DOT=1.1.1.1:853 \
+          UPSTREAM_TLS_NAME=cloudflare-dns.com \
           /tmp/sockshttpgate-dot > /tmp/dot-test/server.log 2>&1 &
           server_pid=$!
           trap 'kill "$server_pid" 2>/dev/null || true' EXIT
 
+          # Poll dashboard với Basic Auth
           ready=0
           for attempt in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:8080/api/stats >/tmp/dot-test/stats.json; then
+            code=$(curl -sS -o /tmp/dot-test/stats.json -w "%{http_code}" \
+              -u "${ADMIN_USER}:${ADMIN_PASSWORD}" \
+              http://127.0.0.1:8080/api/stats || true)
+            echo "attempt=$attempt http=$code"
+            if [[ "$code" == "200" ]]; then
               ready=1
               break
             fi
             sleep 1
           done
           if [[ "$ready" != 1 ]]; then
+            echo "--- server.log ---"
             cat /tmp/dot-test/server.log
+            echo "--- stats.json ---"
+            cat /tmp/dot-test/stats.json 2>/dev/null || true
             echo "Dashboard did not become ready" >&2
             exit 1
           fi
-          grep -q '"ready":true' /tmp/dot-test/stats.json
 
+          echo "--- stats.json ---"
+          cat /tmp/dot-test/stats.json
+          python3 -c "import json; json.load(open('/tmp/dot-test/stats.json'))" \
+            || { echo "stats.json is not valid JSON" >&2; exit 1; }
+
+          # DoT client (tự ký cert → InsecureSkipVerify cho test localhost)
           cat >/tmp/dot-test/client.go <<'EOF'
           package main
 
@@ -105,8 +127,8 @@ jobs:
             client := &dns.Client{
               Net: "tcp-tls",
               TLSConfig: &tls.Config{
-                ServerName: "localhost",
-                InsecureSkipVerify: true, // Self-signed certificate is only for this local CI test.
+                ServerName:         "localhost",
+                InsecureSkipVerify: true, // Self-signed cert, local CI only
               },
               Timeout: 8 * time.Second,
             }
@@ -121,12 +143,17 @@ jobs:
               fmt.Fprintf(os.Stderr, "unexpected DNS response: %#v\n", response)
               os.Exit(1)
             }
-            fmt.Printf("DoT OK: rcode=%s answers=%d\n", dns.RcodeToString[response.Rcode], len(response.Answer))
+            fmt.Printf("DoT OK: rcode=%s answers=%d\n",
+              dns.RcodeToString[response.Rcode], len(response.Answer))
           }
           EOF
 
-          # The temporary client is run from this module so it can resolve
-          # github.com/miekg/dns from DoT/go.mod.
+          # Chạy từ module DoT để resolve github.com/miekg/dns
           go run /tmp/dot-test/client.go
-          cat /tmp/dot-test/stats.json
+
+          echo "--- stats after query ---"
+          curl -sS -u "${ADMIN_USER}:${ADMIN_PASSWORD}" \
+            http://127.0.0.1:8080/api/stats || true
+
+          echo "--- server.log ---"
           cat /tmp/dot-test/server.log
