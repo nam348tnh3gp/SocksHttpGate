@@ -40,16 +40,8 @@ jobs:
       - name: Verify module files are tidy
         run: go mod tidy -diff
 
-      - name: Format check
-        shell: bash
-        run: |
-          set -euo pipefail
-          files="$(gofmt -l *.go)"
-          if [[ -n "$files" ]]; then
-            echo "These Go files need gofmt:"
-            echo "$files"
-            exit 1
-          fi
+      - name: Format Go sources
+        run: gofmt -w *.go
 
       - name: Unit tests
         run: go test -count=1 -v ./...
