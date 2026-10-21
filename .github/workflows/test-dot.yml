@@ -7,13 +7,22 @@ on:
     paths:
       - "DoT/**"
       - ".github/workflows/test-dot.yml"
+  pull_request:
+    paths:
+      - "DoT/**"
+      - ".github/workflows/test-dot.yml"
 
 permissions:
   contents: read
 
+concurrency:
+  group: dot-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test-dot:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: DoT
@@ -28,21 +37,31 @@ jobs:
           cache: true
           cache-dependency-path: DoT/go.sum
 
+      - name: Verify module files are tidy
+        run: go mod tidy -diff
+
       - name: Format check
+        shell: bash
         run: |
-          test -z "$(gofmt -l *.go)" || {
-            gofmt -l *.go
+          set -euo pipefail
+          files="$(gofmt -l *.go)"
+          if [[ -n "$files" ]]; then
+            echo "These Go files need gofmt:"
+            echo "$files"
             exit 1
-          }
+          fi
 
       - name: Unit tests
-        run: go test -v ./...
+        run: go test -count=1 -v ./...
 
       - name: Vet
         run: go vet ./...
 
       - name: Build
         run: go build -trimpath -ldflags="-s -w" -o /tmp/sockshttpgate-dot .
+
+      - name: Build Docker image
+        run: docker build --pull -t sockshttpgate-dot:ci .
 
       - name: Smoke test DoT and dashboard
         shell: bash
@@ -63,13 +82,19 @@ jobs:
           server_pid=$!
           trap 'kill "$server_pid" 2>/dev/null || true' EXIT
 
+          ready=0
           for attempt in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:8080/api/stats >/tmp/dot-test/stats.json; then
+              ready=1
               break
             fi
             sleep 1
           done
-          test -s /tmp/dot-test/stats.json
+          if [[ "$ready" != 1 ]]; then
+            cat /tmp/dot-test/server.log
+            echo "Dashboard did not become ready" >&2
+            exit 1
+          fi
           grep -q '"ready":true' /tmp/dot-test/stats.json
 
           cat >/tmp/dot-test/client.go <<'EOF'
@@ -88,8 +113,9 @@ jobs:
               Net: "tcp-tls",
               TLSConfig: &tls.Config{
                 ServerName: "localhost",
-                InsecureSkipVerify: true, // Self-signed certificate used only in this CI smoke test.
+                InsecureSkipVerify: true, // Self-signed certificate is only for this local CI test.
               },
+              Timeout: 8 * time.Second,
             }
             query := new(dns.Msg)
             query.SetQuestion("example.com.", dns.TypeA)
@@ -106,8 +132,9 @@ jobs:
           }
           EOF
 
+          # The temporary client is run from this module so it can resolve
+          # github.com/miekg/dns from DoT/go.mod.
+          sed -i '/"os"/a\            "time"' /tmp/dot-test/client.go
           go run /tmp/dot-test/client.go
-          echo "Dashboard stats:"
           cat /tmp/dot-test/stats.json
-          echo "DoT server log:"
           cat /tmp/dot-test/server.log
