@@ -1,14 +1,21 @@
 package main
 
 import (
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -67,9 +74,302 @@ func (r *resolver) recordQuery(name, qtype, client, rcode, action string) {
 	r.stateMu.Unlock()
 }
 
+const loginHTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Sign in · SocksHttpGate DoT</title>
+<style>
+:root{--bg:#0d1117;--panel:#161b22;--border:#30363d;--fg:#c9d1d9;--muted:#8b949e;--accent:#58a6ff;--err:#f85149}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:radial-gradient(ellipse at top,#1f2937 0%,#0d1117 60%);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:32px;width:100%;max-width:380px;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+h1{font-size:20px;margin-bottom:8px;text-align:center}
+.sub{text-align:center;color:var(--muted);font-size:13px;margin-bottom:24px}
+label{display:block;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}
+input{width:100%;background:#0d1117;border:1px solid var(--border);color:var(--fg);padding:10px 12px;border-radius:6px;font-size:14px;outline:none;transition:border-color .15s,box-shadow .15s}
+input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(88,166,255,.15)}
+.form-group{margin-bottom:16px}
+button{width:100%;padding:11px;background:var(--accent);color:#fff;border:none;border-radius:6px;font-size:14px;font-weight:600;cursor:pointer}
+button:hover:not(:disabled){background:#4090d0}
+button:disabled{opacity:.6;cursor:wait}
+#msg{font-size:13px;margin-top:14px;min-height:18px;text-align:center;color:var(--err)}
+.hint{font-size:11px;color:var(--muted);text-align:center;margin-top:20px;padding-top:16px;border-top:1px solid var(--border);line-height:1.6}
+.hint code{background:rgba(88,166,255,.1);padding:1px 5px;border-radius:3px;color:var(--accent);font-size:10.5px}
+</style>
+</head>
+<body>
+<form class="card" id="loginForm">
+  <h1>SocksHttpGate DoT</h1>
+  <div class="sub">Sign in to continue</div>
+  <div class="form-group">
+    <label for="u">Username</label>
+    <input id="u" name="username" autocomplete="username" required autofocus>
+  </div>
+  <div class="form-group">
+    <label for="p">Password</label>
+    <input id="p" name="password" type="password" autocomplete="current-password" required>
+  </div>
+  <button id="btn" type="submit">Sign in</button>
+  <div id="msg"></div>
+  <div class="hint">Default credentials <code>admin</code> / <code>admin</code>.<br>Override via env <code>ADMIN_USER</code> and <code>ADMIN_PASSWORD</code>.</div>
+</form>
+<script>
+document.getElementById('loginForm').addEventListener('submit', async function(e){
+  e.preventDefault();
+  var btn=document.getElementById('btn'), msg=document.getElementById('msg');
+  btn.disabled=true; msg.textContent='';
+  try {
+    var r = await fetch('/api/login', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        username: document.getElementById('u').value,
+        password: document.getElementById('p').value
+      })
+    });
+    var j = await r.json().catch(function(){return {};});
+    if (r.ok) {
+      var next = new URLSearchParams(location.search).get('next') || '/';
+      location.replace(next);
+    } else {
+      msg.textContent = j.error || ('Sign in failed (' + r.status + ')');
+    }
+  } catch(err) {
+    msg.textContent = 'Network error: ' + err.message;
+  } finally {
+    btn.disabled=false;
+  }
+});
+</script>
+</body>
+</html>`
+
+// ─── Auth ────────────────────────────────────────────────────────────────
+
+type sessionInfo struct {
+	User    string
+	Expires time.Time
+}
+
+var (
+	adminUser  atomic.Value
+	adminPass  atomic.Value
+	sessionsMu sync.Mutex
+	sessions   = map[string]sessionInfo{}
+	sessionTTL = 24 * time.Hour
+)
+
+func initAuth() error {
+	adminUser.Store(env("ADMIN_USER", "admin"))
+	adminPass.Store(env("ADMIN_PASSWORD", "admin"))
+	if ttl := strings.TrimSpace(os.Getenv("SESSION_TTL")); ttl != "" {
+		d, err := time.ParseDuration(ttl)
+		if err != nil || d < time.Minute {
+			return fmt.Errorf("SESSION_TTL: must be a duration >= 1m")
+		}
+		sessionTTL = d
+	}
+	if adminUser.Load().(string) == "admin" && adminPass.Load().(string) == "admin" {
+		log.Printf("auth: DEFAULT credentials admin/admin in use — set ADMIN_USER and ADMIN_PASSWORD")
+	}
+	go func() {
+		t := time.NewTicker(10 * time.Minute)
+		defer t.Stop()
+		for range t.C {
+			now := time.Now()
+			sessionsMu.Lock()
+			for tok, s := range sessions {
+				if now.After(s.Expires) {
+					delete(sessions, tok)
+				}
+			}
+			sessionsMu.Unlock()
+		}
+	}()
+	return nil
+}
+
+func newSessionToken() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+func createSession(user string) (string, time.Time) {
+	tok := newSessionToken()
+	exp := time.Now().Add(sessionTTL)
+	sessionsMu.Lock()
+	sessions[tok] = sessionInfo{User: user, Expires: exp}
+	sessionsMu.Unlock()
+	return tok, exp
+}
+
+func getSession(r *http.Request) (sessionInfo, bool) {
+	c, err := r.Cookie("dash_session")
+	if err != nil {
+		return sessionInfo{}, false
+	}
+	sessionsMu.Lock()
+	s, ok := sessions[c.Value]
+	sessionsMu.Unlock()
+	if !ok {
+		return sessionInfo{}, false
+	}
+	if time.Now().After(s.Expires) {
+		sessionsMu.Lock()
+		delete(sessions, c.Value)
+		sessionsMu.Unlock()
+		return sessionInfo{}, false
+	}
+	return s, true
+}
+
+func dropSession(r *http.Request) {
+	c, err := r.Cookie("dash_session")
+	if err != nil {
+		return
+	}
+	sessionsMu.Lock()
+	delete(sessions, c.Value)
+	sessionsMu.Unlock()
+}
+
+func cookieSecure(r *http.Request) bool {
+	return r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
+}
+
+func requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := getSession(r); ok {
+			next(w, r)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			writeJSONError(w, http.StatusUnauthorized, "authentication required")
+			return
+		}
+		http.Redirect(w, r, "/login?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusSeeOther)
+	}
+}
+
+func (r *resolver) handleLogin(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if _, ok := getSession(req); ok {
+		http.Redirect(w, req, "/", http.StatusSeeOther)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Frame-Options", "DENY")
+	_, _ = io.WriteString(w, loginHTML)
+}
+
+func (r *resolver) handleLoginAPI(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var body struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(io.LimitReader(req.Body, 4096)).Decode(&body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	wantUser := adminUser.Load().(string)
+	wantPass := adminPass.Load().(string)
+	userOK := subtle.ConstantTimeCompare([]byte(body.Username), []byte(wantUser)) == 1
+	passOK := subtle.ConstantTimeCompare([]byte(body.Password), []byte(wantPass)) == 1
+	if !userOK || !passOK {
+		time.Sleep(200 * time.Millisecond)
+		writeJSONError(w, http.StatusUnauthorized, "invalid username or password")
+		return
+	}
+	tok, exp := createSession(body.Username)
+	http.SetCookie(w, &http.Cookie{
+		Name: "dash_session", Value: tok, Path: "/",
+		Expires: exp, HttpOnly: true, Secure: cookieSecure(req), SameSite: http.SameSiteStrictMode,
+	})
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "user": body.Username})
+}
+
+func (r *resolver) handleLogoutAPI(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	dropSession(req)
+	http.SetCookie(w, &http.Cookie{
+		Name: "dash_session", Value: "", Path: "/", MaxAge: -1,
+		HttpOnly: true, Secure: cookieSecure(req), SameSite: http.SameSiteStrictMode,
+	})
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (r *resolver) handlePasswordAPI(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if _, ok := getSession(req); !ok {
+		writeJSONError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	var body struct {
+		Old string `json:"old"`
+		New string `json:"new"`
+	}
+	if err := json.NewDecoder(io.LimitReader(req.Body, 4096)).Decode(&body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if len(body.New) < 6 {
+		writeJSONError(w, http.StatusBadRequest, "new password must be at least 6 characters")
+		return
+	}
+	wantPass := adminPass.Load().(string)
+	if subtle.ConstantTimeCompare([]byte(body.Old), []byte(wantPass)) != 1 {
+		time.Sleep(200 * time.Millisecond)
+		writeJSONError(w, http.StatusUnauthorized, "old password incorrect")
+		return
+	}
+	adminPass.Store(body.New)
+	current, _ := req.Cookie("dash_session")
+	sessionsMu.Lock()
+	for tok := range sessions {
+		if current != nil && tok == current.Value {
+			continue
+		}
+		delete(sessions, tok)
+	}
+	sessionsMu.Unlock()
+	log.Printf("auth: admin password changed (in-memory; env ADMIN_PASSWORD overrides on restart)")
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
 func (r *resolver) serveDashboard(addr, listenAddr, upstream string) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
+	// Public
+	mux.HandleFunc("/login", r.handleLogin)
+	mux.HandleFunc("/api/login", r.handleLoginAPI)
+	mux.HandleFunc("/api/logout", r.handleLogoutAPI)
+	// Protected
+	mux.HandleFunc("/", requireAuth(func(w http.ResponseWriter, req *http.Request) {
 		if req.URL.Path != "/" {
 			http.NotFound(w, req)
 			return
@@ -77,8 +377,8 @@ func (r *resolver) serveDashboard(addr, listenAddr, upstream string) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
 		_, _ = w.Write([]byte(dashboardHTML))
-	})
-	mux.HandleFunc("/api/stats", func(w http.ResponseWriter, req *http.Request) {
+	}))
+	mux.HandleFunc("/api/stats", requireAuth(func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -95,8 +395,8 @@ func (r *resolver) serveDashboard(addr, listenAddr, upstream string) {
 		r.stateMu.RUnlock()
 		_, s.Upstream, s.UpstreamTLSName = r.getUpstream()
 		writeJSON(w, s)
-	})
-	mux.HandleFunc("/api/logs", func(w http.ResponseWriter, req *http.Request) {
+	}))
+	mux.HandleFunc("/api/logs", requireAuth(func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -108,15 +408,15 @@ func (r *resolver) serveDashboard(addr, listenAddr, upstream string) {
 			logs[i], logs[j] = logs[j], logs[i]
 		}
 		writeJSON(w, logs)
-	})
-	mux.HandleFunc("/api/upstream", func(w http.ResponseWriter, req *http.Request) {
+	}))
+	mux.HandleFunc("/api/upstream", requireAuth(func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodPost { http.Error(w, "method not allowed", http.StatusMethodNotAllowed); return }
 		var input struct { Upstream string `json:"upstream"`; TLSName string `json:"tls_name"` }
 		if err := json.NewDecoder(http.MaxBytesReader(w, req.Body, 4096)).Decode(&input); err != nil { http.Error(w, "invalid JSON body", http.StatusBadRequest); return }
 		if err := r.setUpstream(strings.TrimSpace(input.Upstream), strings.TrimSpace(input.TLSName)); err != nil { http.Error(w, "invalid upstream or TLS name", http.StatusBadRequest); return }
 		w.WriteHeader(http.StatusNoContent)
-	})
-	mux.HandleFunc("/api/blocklist", func(w http.ResponseWriter, req *http.Request) {
+	}))
+	mux.HandleFunc("/api/blocklist", requireAuth(func(w http.ResponseWriter, req *http.Request) {
 		switch req.Method {
 		case http.MethodGet:
 			etag := fmt.Sprintf(`"%d-%d"`, r.blocklistVersion.Load(), r.lastRefresh.Load())
@@ -166,7 +466,8 @@ func (r *resolver) serveDashboard(addr, listenAddr, upstream string) {
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
-	})
+	}))
+	mux.HandleFunc("/api/password", requireAuth(r.handlePasswordAPI))
 
 	server := &http.Server{
 		Addr: addr, Handler: localOnly(addr, mux),
@@ -190,10 +491,7 @@ func localOnly(addr string, next http.Handler) http.Handler {
 		isLoopback = true
 	}
 	if !isLoopback {
-		if os.Getenv("DASHBOARD_ALLOW_PUBLIC") != "1" {
-			log.Fatalf("refusing to bind dashboard to non-loopback %q without DASHBOARD_ALLOW_PUBLIC=1 (API has no auth)", addr)
-		}
-		log.Printf("WARNING: dashboard exposed on %q WITHOUT AUTHENTICATION", addr)
+		log.Printf("WARNING: dashboard bound to non-loopback %q — login (admin/admin default) protects the API, but binding to 127.0.0.1 is safer", addr)
 	}
 	return next
 }
@@ -203,6 +501,13 @@ func writeJSON(w http.ResponseWriter, value any) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+func writeJSONError(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
 const dashboardHTML = `<!doctype html>
@@ -275,7 +580,11 @@ tr:last-child td{border-bottom:0}
 <body><main>
 <header class="header">
   <div><h1>SocksHttpGate <span class="brand">DoT</span> <span id="status" class="status off">● CONNECTING</span></h1><div class="subtitle">DNS-over-TLS resolver · Live dashboard · refresh every 3 seconds</div></div>
-  <div class="status" id="connection">● waiting for API</div>
+  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+    <div class="status" id="connection">● waiting for API</div>
+    <button type="button" class="secondary" onclick="showPasswordModal(event)" style="padding:4px 10px;font-size:11px">Change password</button>
+    <button type="button" class="secondary" onclick="logout(event)" style="padding:4px 10px;font-size:11px">Sign out</button>
+  </div>
 </header>
 
 <h2>Resolver overview</h2>
@@ -337,7 +646,18 @@ tr:last-child td{border-bottom:0}
   <div class="panel-head"><span>Recent DNS queries</span><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><span class="muted" id="logCount">0 events</span><button type="button" class="secondary" id="refreshNow">Refresh</button></div></div>
   <div class="logs table-wrap"><table><thead><tr><th>Time</th><th>Domain</th><th>Type</th><th>Result</th><th>Action</th><th>Client</th></tr></thead><tbody id="logs"><tr><td colspan="6" class="wrap">Waiting for queries…</td></tr></tbody></table></div>
 </section>
-<footer class="footer">Dashboard API has no authentication. Keep it bound to 127.0.0.1 and do not expose it publicly. DNS query logs are held in memory and limited to the latest 200 entries.</footer>
+<footer class="footer">Dashboard is protected by session login (default admin/admin). DNS query logs are held in memory and limited to the latest 200 entries.</footer>
+
+<div id="pw-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center;padding:24px">
+  <div style="background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:24px;width:100%;max-width:420px;box-shadow:0 20px 60px rgba(0,0,0,.5)">
+    <h3 style="font-size:16px;margin-bottom:16px;display:flex;justify-content:space-between;align-items:center">Change password <button type="button" onclick="closePasswordModal()" style="background:none;border:none;color:var(--muted);font-size:20px;cursor:pointer;padding:0;line-height:1;width:auto;flex:0 0 auto;min-width:0">×</button></h3>
+    <div style="margin-bottom:12px"><div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">Current password</div><input id="pw-old" type="password" autocomplete="current-password" style="width:100%"></div>
+    <div style="margin-bottom:12px"><div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">New password</div><input id="pw-new" type="password" autocomplete="new-password" style="width:100%"></div>
+    <div style="margin-bottom:12px"><div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">Confirm new password</div><input id="pw-confirm" type="password" autocomplete="new-password" style="width:100%"></div>
+    <div id="pw-msg" style="font-size:12px;min-height:16px;margin-bottom:12px;text-align:center"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end"><button type="button" class="secondary" onclick="closePasswordModal()">Cancel</button><button type="button" id="pw-submit" onclick="submitPassword()">Save</button></div>
+  </div>
+</div>
 </main>
 <script>
 (function(){
@@ -401,6 +721,28 @@ $('domains').addEventListener('click',async e=>{
 });
 $('refreshNow').addEventListener('click',refresh);
 (function tick(){refresh().finally(function(){setTimeout(tick,3000);});})();
+window.showPasswordModal=function(e){if(e)e.preventDefault();document.getElementById('pw-old').value='';document.getElementById('pw-new').value='';document.getElementById('pw-confirm').value='';document.getElementById('pw-msg').textContent='';document.getElementById('pw-modal').style.display='flex';setTimeout(function(){document.getElementById('pw-old').focus();},50);};
+window.closePasswordModal=function(){document.getElementById('pw-modal').style.display='none';};
+window.submitPassword=function(){
+  var o=document.getElementById('pw-old').value,n=document.getElementById('pw-new').value,c=document.getElementById('pw-confirm').value;
+  var msg=document.getElementById('pw-msg'),btn=document.getElementById('pw-submit');
+  msg.textContent='';msg.style.color='var(--muted)';
+  if(!o||!n){msg.textContent='All fields are required';msg.style.color='var(--err)';return;}
+  if(n!==c){msg.textContent='New passwords do not match';msg.style.color='var(--err)';return;}
+  if(n.length<6){msg.textContent='New password must be at least 6 characters';msg.style.color='var(--err)';return;}
+  btn.disabled=true;msg.textContent='Saving...';
+  fetch('/api/password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({old:o,new:n})})
+    .then(function(r){return r.json().then(function(j){return {ok:r.ok,body:j};});})
+    .then(function(x){
+      if(x.ok){msg.textContent='Password updated successfully';msg.style.color='var(--ok)';setTimeout(function(){closePasswordModal();},1500);}
+      else{msg.textContent=(x.body&&x.body.error)||('Failed ('+x.status+')');msg.style.color='var(--err)';}
+    })
+    .catch(function(e){msg.textContent='Network error: '+e.message;msg.style.color='var(--err)';})
+    .finally(function(){btn.disabled=false;});
+};
+document.getElementById('pw-modal').addEventListener('click',function(e){if(e.target===this)closePasswordModal();});
+document.addEventListener('keydown',function(e){if(e.key==='Escape')closePasswordModal();});
+window.logout=function(e){e.preventDefault();fetch('/api/logout',{method:'POST'}).finally(function(){location.replace('/login');});};
 })();
 </script>
 </body></html>`

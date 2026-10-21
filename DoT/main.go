@@ -58,6 +58,10 @@ func main() {
 		log.Fatalf("load server TLS certificate/key: %v", err)
 	}
 
+	if err := initAuth(); err != nil {
+		log.Fatal(err)
+	}
+
 	r := &resolver{
 		upstream: upstream, upstreamTLSName: serverName,
 		blocked: parseBlocklist(os.Getenv("BLOCKLIST")),
@@ -93,29 +97,57 @@ func main() {
 }
 
 func (r *resolver) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
-	if req == nil || len(req.Question) == 0 {
+	if req == nil {
+		return
+	}
+	if req.Opcode != dns.OpcodeQuery {
 		reply := new(dns.Msg)
-		if req != nil {
-			reply.SetRcode(req, dns.RcodeFormatError)
-		} else {
-			reply.MsgHdr.Rcode = dns.RcodeFormatError
-			reply.MsgHdr.Response = true
-		}
+		reply.SetRcode(req, dns.RcodeNotImplemented)
+		reply.RecursionAvailable = true
+		_ = w.WriteMsg(reply)
+		return
+	}
+	if len(req.Question) != 1 {
+		reply := new(dns.Msg)
+		reply.SetRcode(req, dns.RcodeFormatError)
+		reply.RecursionAvailable = true
 		_ = w.WriteMsg(reply)
 		return
 	}
 
 	q := req.Question[0]
+	if q.Qclass != dns.ClassINET && q.Qclass != dns.ClassANY {
+		reply := new(dns.Msg)
+		reply.SetRcode(req, dns.RcodeNotImplemented)
+		reply.RecursionAvailable = true
+		_ = w.WriteMsg(reply)
+		return
+	}
+
 	name := normalizeDomain(q.Name)
 	qtype := dns.TypeToString[q.Qtype]
 	if qtype == "" {
 		qtype = "UNKNOWN"
 	}
 	clientAddr := w.RemoteAddr().String()
+
+	clientHost, _, _ := net.SplitHostPort(clientAddr)
+	if clientHost == "" {
+		clientHost = clientAddr
+	}
+	if !r.allowQuery(clientHost) {
+		reply := new(dns.Msg)
+		reply.SetRcode(req, dns.RcodeRefused)
+		reply.RecursionAvailable = true
+		_ = w.WriteMsg(reply)
+		return
+	}
+
 	if r.isBlocked(name) {
 		reply := new(dns.Msg)
 		reply.SetReply(req)
 		reply.Authoritative = true
+		reply.RecursionAvailable = true
 		reply.Rcode = dns.RcodeNameError
 		r.recordQuery(name, qtype, clientAddr, dns.RcodeToString[dns.RcodeNameError], "BLOCK")
 		log.Printf("BLOCK domain=%s type=%s client=%s", name, qtype, clientAddr)
@@ -132,9 +164,20 @@ func (r *resolver) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 		log.Printf("upstream failure domain=%s upstream=%s err=%v", name, upstream, err)
 		reply := new(dns.Msg)
 		reply.SetRcode(req, dns.RcodeServerFailure)
+		reply.RecursionAvailable = true
 		if writeErr := w.WriteMsg(reply); writeErr != nil {
 			log.Printf("write SERVFAIL response: %v", writeErr)
 		}
+		return
+	}
+
+	if (response.Id != req.Id && response.Id != 0) || len(response.Question) != 1 || !equalQuestion(response.Question[0], req.Question[0]) {
+		r.recordQuery(name, qtype, clientAddr, "MISMATCH", "ERROR")
+		log.Printf("upstream response mismatch: id=%d/%d domain=%s", response.Id, req.Id, name)
+		reply := new(dns.Msg)
+		reply.SetRcode(req, dns.RcodeServerFailure)
+		reply.RecursionAvailable = true
+		_ = w.WriteMsg(reply)
 		return
 	}
 
@@ -143,6 +186,56 @@ func (r *resolver) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 	if err := w.WriteMsg(response); err != nil {
 		log.Printf("write DNS response: %v", err)
 	}
+}
+
+type rateBucket struct {
+	tokens float64
+	last   time.Time
+}
+
+var (
+	rateMu      sync.Mutex
+	rateBuckets = map[string]*rateBucket{}
+)
+
+const (
+	rateQPS   = 50.0
+	rateBurst = 100.0
+	rateCap   = 5000
+)
+
+func (r *resolver) allowQuery(ip string) bool {
+	if ip == "" {
+		return true
+	}
+	rateMu.Lock()
+	defer rateMu.Unlock()
+	b, ok := rateBuckets[ip]
+	if !ok {
+		if len(rateBuckets) >= rateCap {
+			for k := range rateBuckets {
+				delete(rateBuckets, k)
+				break
+			}
+		}
+		b = &rateBucket{tokens: rateBurst, last: time.Now()}
+		rateBuckets[ip] = b
+	}
+	now := time.Now()
+	b.tokens += now.Sub(b.last).Seconds() * rateQPS
+	if b.tokens > rateBurst {
+		b.tokens = rateBurst
+	}
+	b.last = now
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens--
+	return true
+}
+
+func equalQuestion(a, b dns.Question) bool {
+	return a.Qtype == b.Qtype && a.Qclass == b.Qclass && strings.EqualFold(a.Name, b.Name)
 }
 
 func newDoTClient(serverName string) *dns.Client {
