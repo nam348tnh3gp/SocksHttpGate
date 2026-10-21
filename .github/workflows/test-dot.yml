@@ -27,7 +27,6 @@ jobs:
       run:
         working-directory: DoT
     env:
-      # Basic Auth cho DoT dashboard — override default admin/admin
       ADMIN_USER: ci
       ADMIN_PASSWORD: ci-test-password
     steps:
@@ -70,7 +69,6 @@ jobs:
             -days 1 -subj "/CN=localhost" \
             -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
 
-          # Start server với ADMIN_USER/ADMIN_PASSWORD override
           ADMIN_USER="${ADMIN_USER}" \
           ADMIN_PASSWORD="${ADMIN_PASSWORD}" \
           DOT_ADDR=127.0.0.1:8853 \
@@ -83,13 +81,39 @@ jobs:
           server_pid=$!
           trap 'kill "$server_pid" 2>/dev/null || true' EXIT
 
-          # Poll dashboard với Basic Auth
+          # ---- 1. Login → save session cookie ----
+          login_ok=0
+          for attempt in $(seq 1 30); do
+            login_code=$(curl -sS \
+              -c /tmp/dot-test/cookies.txt \
+              -o /tmp/dot-test/login.json \
+              -w "%{http_code}" \
+              -X POST \
+              -H 'Content-Type: application/json' \
+              -d "{\"username\":\"${ADMIN_USER}\",\"password\":\"${ADMIN_PASSWORD}\"}" \
+              http://127.0.0.1:8080/api/login || true)
+            echo "login attempt=$attempt http=$login_code"
+            if [[ "$login_code" == "200" ]]; then
+              login_ok=1
+              break
+            fi
+            sleep 1
+          done
+          if [[ "$login_ok" != 1 ]]; then
+            echo "--- server.log ---"; cat /tmp/dot-test/server.log
+            echo "--- login.json ---"; cat /tmp/dot-test/login.json 2>/dev/null || true
+            echo "Login did not succeed" >&2; exit 1
+          fi
+
+          # ---- 2. Poll /api/stats with session cookie ----
           ready=0
           for attempt in $(seq 1 30); do
-            code=$(curl -sS -o /tmp/dot-test/stats.json -w "%{http_code}" \
-              -u "${ADMIN_USER}:${ADMIN_PASSWORD}" \
+            code=$(curl -sS \
+              -b /tmp/dot-test/cookies.txt \
+              -o /tmp/dot-test/stats.json \
+              -w "%{http_code}" \
               http://127.0.0.1:8080/api/stats || true)
-            echo "attempt=$attempt http=$code"
+            echo "stats attempt=$attempt http=$code"
             if [[ "$code" == "200" ]]; then
               ready=1
               break
@@ -97,12 +121,9 @@ jobs:
             sleep 1
           done
           if [[ "$ready" != 1 ]]; then
-            echo "--- server.log ---"
-            cat /tmp/dot-test/server.log
-            echo "--- stats.json ---"
-            cat /tmp/dot-test/stats.json 2>/dev/null || true
-            echo "Dashboard did not become ready" >&2
-            exit 1
+            echo "--- server.log ---"; cat /tmp/dot-test/server.log
+            echo "--- stats.json ---"; cat /tmp/dot-test/stats.json 2>/dev/null || true
+            echo "Dashboard did not become ready" >&2; exit 1
           fi
 
           echo "--- stats.json ---"
@@ -110,7 +131,7 @@ jobs:
           python3 -c "import json; json.load(open('/tmp/dot-test/stats.json'))" \
             || { echo "stats.json is not valid JSON" >&2; exit 1; }
 
-          # DoT client (tự ký cert → InsecureSkipVerify cho test localhost)
+          # ---- 3. Real DoT query (self-signed cert → InsecureSkipVerify) ----
           cat >/tmp/dot-test/client.go <<'EOF'
           package main
 
@@ -147,13 +168,19 @@ jobs:
               dns.RcodeToString[response.Rcode], len(response.Answer))
           }
           EOF
-
-          # Chạy từ module DoT để resolve github.com/miekg/dns
           go run /tmp/dot-test/client.go
 
+          # ---- 4. Verify stats updated after query ----
           echo "--- stats after query ---"
-          curl -sS -u "${ADMIN_USER}:${ADMIN_PASSWORD}" \
+          curl -sS -b /tmp/dot-test/cookies.txt \
             http://127.0.0.1:8080/api/stats || true
 
+          # ---- 5. Test logout ----
+          echo ""
+          echo "--- logout ---"
+          curl -sS -b /tmp/dot-test/cookies.txt -X POST \
+            http://127.0.0.1:8080/api/logout || true
+
+          echo ""
           echo "--- server.log ---"
           cat /tmp/dot-test/server.log
