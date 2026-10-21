@@ -135,7 +135,6 @@ jobs:
 
           # The temporary client is run from this module so it can resolve
           # github.com/miekg/dns from DoT/go.mod.
-          sed -i '/"os"/a\            "time"' /tmp/dot-test/client.go
           go run /tmp/dot-test/client.go
           cat /tmp/dot-test/stats.json
           cat /tmp/dot-test/server.log
