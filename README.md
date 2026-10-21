@@ -6,6 +6,15 @@ A multi-language SOCKS5/HTTP proxy project with standalone DNS-over-HTTPS (DoH),
 
 [![GitHub stars](https://img.shields.io/github/stars/nam348tnh3gp/SocksHttpGate?style=for-the-badge&logo=github)](https://github.com/nam348tnh3gp/SocksHttpGate/stargazers)
 [![GitHub forks](https://img.shields.io/github/forks/nam348tnh3gp/SocksHttpGate?style=for-the-badge&logo=github)](https://github.com/nam348tnh3gp/SocksHttpGate/forks)
+[![Watchers](https://img.shields.io/github/watchers/nam348tnh3gp/SocksHttpGate?style=for-the-badge)](https://github.com/nam348tnh3gp/SocksHttpGate/watchers)
+[![Repo size](https://img.shields.io/github/repo-size/nam348tnh3gp/SocksHttpGate?style=for-the-badge&label=repo%20size)](https://github.com/nam348tnh3gp/SocksHttpGate)
+[![Contributors](https://img.shields.io/github/contributors/nam348tnh3gp/SocksHttpGate?style=for-the-badge)](https://github.com/nam348tnh3gp/SocksHttpGate/graphs/contributors)
+[![Commit activity](https://img.shields.io/github/commit-activity/m/nam348tnh3gp/SocksHttpGate?style=for-the-badge)](https://github.com/nam348tnh3gp/SocksHttpGate/graphs/commit-activity)
+[![Open issues](https://img.shields.io/github/issues/nam348tnh3gp/SocksHttpGate?style=for-the-badge)](https://github.com/nam348tnh3gp/SocksHttpGate/issues)
+[![Closed issues](https://img.shields.io/github/issues-closed/nam348tnh3gp/SocksHttpGate?style=for-the-badge)](https://github.com/nam348tnh3gp/SocksHttpGate/issues?q=is%3Aissue+is%3Aclosed)
+[![Pull requests](https://img.shields.io/github/issues-pr/nam348tnh3gp/SocksHttpGate?style=for-the-badge)](https://github.com/nam348tnh3gp/SocksHttpGate/pulls)
+[![Top language](https://img.shields.io/github/languages/top/nam348tnh3gp/SocksHttpGate?style=for-the-badge)](https://github.com/nam348tnh3gp/SocksHttpGate)
+[![Languages](https://img.shields.io/github/languages/count/nam348tnh3gp/SocksHttpGate?style=for-the-badge)](https://github.com/nam348tnh3gp/SocksHttpGate)
 [![Last commit](https://img.shields.io/github/last-commit/nam348tnh3gp/SocksHttpGate?style=for-the-badge)](https://github.com/nam348tnh3gp/SocksHttpGate/commits/main)
 [![License](https://img.shields.io/github/license/nam348tnh3gp/SocksHttpGate?style=for-the-badge)](LICENSE)
 
