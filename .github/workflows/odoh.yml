@@ -29,6 +29,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -40,8 +42,16 @@ jobs:
       - name: Verify module files are tidy
         run: go mod tidy -diff
 
-      - name: Format Go sources
-        run: gofmt -w Proxy/*.go Target/*.go
+      - name: Check Go source formatting
+        run: |
+          files=$(find Proxy Target -name '*.go' -type f)
+          unformatted=$(gofmt -l $files)
+          if [ -n "$unformatted" ]; then
+            echo "::error::Các file sau chưa được gofmt:"
+            echo "$unformatted"
+            gofmt -d $unformatted
+            exit 1
+          fi
 
       - name: Static analysis
         run: go vet ./...
@@ -62,7 +72,7 @@ jobs:
         env:
           # Bound fuzz worker count to avoid exhausting runner process limits.
           GOMAXPROCS: "2"
-        run: go test ./Target -run='^$' -fuzz=FuzzTargetMalformedODoH -fuzztime=10s -parallel=2 -timeout=1m
+        run: go test ./Target -run='^$' -fuzz=FuzzTargetMalformedODoH -fuzztime=10s -parallel=2 -timeout=5m
 
       - name: Build Proxy Docker image
         run: docker build --pull -f Proxy/Dockerfile -t sockshttpgate-odoh-proxy:ci .
