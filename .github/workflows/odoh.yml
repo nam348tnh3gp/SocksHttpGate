@@ -16,7 +16,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: odoh-\${{ github.workflow }}-\${{ github.ref }}
+  group: odoh-${{ github.workflow }}-\${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
