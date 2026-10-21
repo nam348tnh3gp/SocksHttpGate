@@ -85,9 +85,17 @@ On Android, open **Settings → Network & Internet → Private DNS** (menu names
 
 Render Web Services generally expose HTTP/HTTPS through their managed ingress and do not provide arbitrary inbound TCP port 853. Deploy this service on a VPS or another platform that explicitly supports raw TCP ingress on port 853. The existing DoH service on Render can continue running independently.
 
-## Test
+## Test and CI
+
+Run from this directory with Go 1.23 or newer:
 
 ```sh
-go test ./...
-go build ./...
+go mod tidy -diff
+gofmt -d *.go
+go test -count=1 ./...
+go vet ./...
+go build -trimpath -o dot .
+docker build -t sockshttpgate-dot:ci .
 ```
+
+The [DoT workflow](../.github/workflows/test-dot.yml) runs on pushes, pull requests and manual dispatch. In addition to these checks, it starts the service with a temporary self-signed certificate, checks the dashboard readiness endpoint, and sends a DoT DNS query. That query uses the configured upstream resolver, so outbound DNS-over-TLS connectivity is required for the end-to-end smoke test.
