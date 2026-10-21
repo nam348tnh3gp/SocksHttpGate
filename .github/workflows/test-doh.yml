@@ -1,0 +1,151 @@
+name: Test DoH
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "DoH/**"
+      - ".github/workflows/test-doh.yml"
+  pull_request:
+    paths:
+      - "DoH/**"
+      - ".github/workflows/test-doh.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: doh-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-doh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: DoH
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: DoH/go.mod
+          cache: true
+          cache-dependency-path: DoH/go.sum
+
+      - name: Verify module files are tidy
+        run: go mod tidy -diff
+
+      - name: Format check
+        shell: bash
+        run: |
+          set -euo pipefail
+          files="$(gofmt -l *.go)"
+          if [[ -n "$files" ]]; then
+            echo "These Go files need gofmt:"
+            echo "$files"
+            exit 1
+          fi
+
+      - name: Unit tests
+        run: go test -count=1 -v ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build -trimpath -ldflags="-s -w" -o /tmp/sockshttpgate-doh .
+
+      - name: Build Docker image
+        run: docker build --pull -t sockshttpgate-doh:ci .
+
+      - name: Smoke test HTTP endpoints and real DoH query
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/doh-test
+          PORT=18080 UPSTREAM_DOH=https://cloudflare-dns.com/dns-query \
+            /tmp/sockshttpgate-doh > /tmp/doh-test/server.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+
+          ready=0
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18080/health >/tmp/doh-test/health.json; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [[ "$ready" != 1 ]]; then
+            cat /tmp/doh-test/server.log
+            echo "DoH health endpoint did not become ready" >&2
+            exit 1
+          fi
+          curl -fsS http://127.0.0.1:18080/ >/tmp/doh-test/dashboard.html
+
+          cat >/tmp/doh-test/client.go <<'EOF'
+          package main
+
+          import (
+            "bytes"
+            "fmt"
+            "io"
+            "net/http"
+            "os"
+            "time"
+
+            "github.com/miekg/dns"
+          )
+
+          func main() {
+            query := new(dns.Msg)
+            query.SetQuestion("example.com.", dns.TypeA)
+            wire, err := query.Pack()
+            if err != nil {
+              panic(err)
+            }
+            client := &http.Client{Timeout: 12 * time.Second}
+            req, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:18080/dns-query", bytes.NewReader(wire))
+            if err != nil {
+              panic(err)
+            }
+            req.Header.Set("Content-Type", "application/dns-message")
+            req.Header.Set("Accept", "application/dns-message")
+            resp, err := client.Do(req)
+            if err != nil {
+              fmt.Fprintln(os.Stderr, "DoH request failed:", err)
+              os.Exit(1)
+            }
+            defer resp.Body.Close()
+            body, err := io.ReadAll(resp.Body)
+            if err != nil {
+              panic(err)
+            }
+            if resp.StatusCode != http.StatusOK {
+              fmt.Fprintf(os.Stderr, "DoH returned HTTP %d: %s\n", resp.StatusCode, body)
+              os.Exit(1)
+            }
+            answer := new(dns.Msg)
+            if err := answer.Unpack(body); err != nil {
+              fmt.Fprintln(os.Stderr, "invalid DNS response:", err)
+              os.Exit(1)
+            }
+            if answer.Rcode != dns.RcodeSuccess {
+              fmt.Fprintf(os.Stderr, "DNS response rcode=%s\n", dns.RcodeToString[answer.Rcode])
+              os.Exit(1)
+            }
+            fmt.Printf("DoH OK: rcode=%s answers=%d\n", dns.RcodeToString[answer.Rcode], len(answer.Answer))
+          }
+          EOF
+
+          # Run from this module so the temporary client resolves DoH/go.mod dependencies.
+          go run /tmp/doh-test/client.go
+          echo "Health response:"
+          cat /tmp/doh-test/health.json
+          echo "Server log:"
+          cat /tmp/doh-test/server.log
