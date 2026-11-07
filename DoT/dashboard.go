@@ -386,7 +386,11 @@ func (r *resolver) serveDashboard(addr, listenAddr, upstream string) {
 		r.stateMu.RLock()
 		blockedCount := len(r.blocked)
 		sources := make(map[string]*blocklistSourceState, len(r.sources))
-		for key, value := range r.sources { copyValue := *value; sources[key] = &copyValue }
+		for key, value := range r.sources {
+			copyValue := *value
+			copyValue.domains = nil // unexported; not serialized; drop ref to release GC
+			sources[key] = &copyValue
+		}
 		lastRefresh := ""
 		if ts := r.lastRefresh.Load(); ts > 0 {
 			lastRefresh = time.Unix(ts, 0).UTC().Format(time.RFC3339)

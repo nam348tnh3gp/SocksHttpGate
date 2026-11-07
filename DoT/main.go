@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -33,9 +34,10 @@ type resolver struct {
 	ready            atomic.Bool
 	blocklistVersion atomic.Uint64
 
-	upstreamMu sync.RWMutex
-	stateMu    sync.RWMutex
-	started    time.Time
+	upstreamMu  sync.RWMutex
+	stateMu     sync.RWMutex
+	blockClient *http.Client
+	started     time.Time
 	stats      dashboardStats
 	logs       []queryLogEntry
 }
@@ -67,7 +69,8 @@ func main() {
 		blocked:       parseBlocklist(os.Getenv("BLOCKLIST")),
 		blocklistURLs: blocklistURLs, refreshEvery: refreshEvery,
 		sources: make(map[string]*blocklistSourceState), started: time.Now(),
-		client: newDoTClient(serverName),
+		client:      newDoTClient(serverName),
+		blockClient: &http.Client{Timeout: 60 * time.Second},
 	}
 	for _, source := range blocklistURLs {
 		r.sources[source] = &blocklistSourceState{}
@@ -151,7 +154,7 @@ func (r *resolver) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 		reply.Authoritative = true
 		reply.RecursionAvailable = true
 		reply.Rcode = dns.RcodeNameError
-		r.recordQuery(name, qtype, clientAddr, dns.RcodeToString[dns.RcodeNameError], "BLOCK")
+		r.recordQuery(name, qtype, clientHost, rcodeName(dns.RcodeNameError), "BLOCK")
 		log.Printf("BLOCK domain=%s type=%s client=%s", name, qtype, clientAddr)
 		if err := w.WriteMsg(reply); err != nil {
 			log.Printf("write blocked response: %v", err)
@@ -162,7 +165,7 @@ func (r *resolver) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 	client, upstream, _ := r.getUpstream()
 	response, _, err := client.Exchange(req, upstream)
 	if err != nil || response == nil {
-		r.recordQuery(name, qtype, clientAddr, dns.RcodeToString[dns.RcodeServerFailure], "ERROR")
+		r.recordQuery(name, qtype, clientHost, rcodeName(dns.RcodeServerFailure), "ERROR")
 		log.Printf("upstream failure domain=%s upstream=%s err=%v", name, upstream, err)
 		reply := new(dns.Msg)
 		reply.SetRcode(req, dns.RcodeServerFailure)
@@ -174,7 +177,7 @@ func (r *resolver) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 	}
 
 	if (response.Id != req.Id && response.Id != 0) || len(response.Question) != 1 || !equalQuestion(response.Question[0], req.Question[0]) {
-		r.recordQuery(name, qtype, clientAddr, "MISMATCH", "ERROR")
+		r.recordQuery(name, qtype, clientHost, "MISMATCH", "ERROR")
 		log.Printf("upstream response mismatch: id=%d/%d domain=%s", response.Id, req.Id, name)
 		reply := new(dns.Msg)
 		reply.SetRcode(req, dns.RcodeServerFailure)
@@ -183,8 +186,9 @@ func (r *resolver) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 
-	r.recordQuery(name, qtype, clientAddr, dns.RcodeToString[response.Rcode], "QUERY")
-	log.Printf("QUERY domain=%s type=%s client=%s rcode=%s", name, qtype, clientAddr, dns.RcodeToString[response.Rcode])
+	rc := rcodeName(response.Rcode)
+	r.recordQuery(name, qtype, clientHost, rc, "QUERY")
+	log.Printf("QUERY domain=%s type=%s client=%s rcode=%s", name, qtype, clientHost, rc)
 	if err := w.WriteMsg(response); err != nil {
 		log.Printf("write DNS response: %v", err)
 	}
@@ -236,6 +240,13 @@ func (r *resolver) allowQuery(ip string) bool {
 	return true
 }
 
+func rcodeName(code int) string {
+	if s, ok := dns.RcodeToString[code]; ok {
+		return s
+	}
+	return fmt.Sprintf("RCODE%d", code)
+}
+
 func equalQuestion(a, b dns.Question) bool {
 	return a.Qtype == b.Qtype && a.Qclass == b.Qclass && strings.EqualFold(a.Name, b.Name)
 }
@@ -270,12 +281,17 @@ func (r *resolver) isBlocked(name string) bool {
 	}
 	r.stateMu.RLock()
 	defer r.stateMu.RUnlock()
-	for domain := range r.blocked {
-		if name == domain || strings.HasSuffix(name, "."+domain) {
+	// Walk labels right-to-left; O(labels), independent of blocklist size.
+	for {
+		if _, ok := r.blocked[name]; ok {
 			return true
 		}
+		i := strings.IndexByte(name, '.')
+		if i < 0 {
+			return false
+		}
+		name = name[i+1:]
 	}
-	return false
 }
 
 func parseBlocklist(raw string) map[string]struct{} {

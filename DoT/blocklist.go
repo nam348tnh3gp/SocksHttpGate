@@ -18,10 +18,14 @@ const maxBlocklistBytes = 10 << 20
 
 type blocklistSourceState struct {
 	LastSuccess string `json:"last_success,omitempty"`
-	LastError string `json:"last_error,omitempty"`
-	DomainCount int `json:"domain_count"`
-	TotalLoads uint64 `json:"total_loads"`
+	LastError   string `json:"last_error,omitempty"`
+	DomainCount int    `json:"domain_count"`
+	TotalLoads  uint64 `json:"total_loads"`
 	FailedLoads uint64 `json:"failed_loads"`
+	// domains holds the last successful parse for THIS source.
+	// Kept per-source so a single failing source does not wipe the whole
+	// blocklist on the next merge.
+	domains map[string]struct{}
 }
 
 func parseBlocklistURLs(raw string) []string {
@@ -63,59 +67,85 @@ func (r *resolver) refreshLoop() {
 }
 
 func (r *resolver) refreshBlocklists() bool {
-	next := parseBlocklist(os.Getenv("BLOCKLIST"))
 	successful := 0
 	for _, source := range r.blocklistURLs {
 		r.stateMu.Lock()
 		st := r.sources[source]
-		if st == nil { st = &blocklistSourceState{}; r.sources[source] = st }
+		if st == nil {
+			st = &blocklistSourceState{}
+			r.sources[source] = st
+		}
 		st.TotalLoads++
 		r.stateMu.Unlock()
-		count, err := fetchBlocklist(source, next)
+
+		set, err := r.fetchBlocklist(source)
 		r.stateMu.Lock()
 		if err != nil {
-			st.LastError = err.Error(); st.FailedLoads++
+			st.LastError = err.Error()
+			st.FailedLoads++
 			r.stateMu.Unlock()
 			log.Printf("blocklist: %s: %v", source, err)
 			continue
 		}
-		if count > 0 {
-			successful++; st.LastSuccess = time.Now().UTC().Format(time.RFC3339)
-			st.LastError = ""; st.DomainCount = count
-		} else { st.LastError = "no domains parsed" }
+		if len(set) > 0 {
+			successful++
+			st.LastSuccess = time.Now().UTC().Format(time.RFC3339)
+			st.LastError = ""
+			st.DomainCount = len(set)
+			st.domains = set
+		} else {
+			st.LastError = "no domains parsed"
+		}
 		r.stateMu.Unlock()
-		if count > 0 { log.Printf("blocklist: loaded %d new domains from %s", count, source) }
+		if len(set) > 0 {
+			log.Printf("blocklist: loaded %d new domains from %s", len(set), source)
+		}
 	}
 	if len(r.blocklistURLs) > 0 && successful == 0 {
 		log.Printf("blocklist: no remote source loaded successfully; keeping current list")
 		return false
 	}
+
+	// Merge: defaults/env + the LAST successful snapshot of every source.
+	// A source failing this round keeps its previous domains — no data loss.
+	merged := parseBlocklist(os.Getenv("BLOCKLIST"))
+	r.stateMu.RLock()
+	for _, source := range r.blocklistURLs {
+		if st := r.sources[source]; st != nil {
+			for d := range st.domains {
+				merged[d] = struct{}{}
+			}
+		}
+	}
+	r.stateMu.RUnlock()
+
 	r.stateMu.Lock()
-	r.blocked = next
+	r.blocked = merged
 	r.lastRefresh.Store(time.Now().UTC().Unix())
 	r.stateMu.Unlock()
-	log.Printf("blocklist: active blocked domains=%d", len(next))
+	log.Printf("blocklist: active blocked domains=%d", len(merged))
 	return true
 }
 
-func fetchBlocklist(source string, dst map[string]struct{}) (int, error) {
+func (r *resolver) fetchBlocklist(source string) (map[string]struct{}, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, source, nil)
-	if err != nil { return 0, fmt.Errorf("invalid URL: %w", err) }
+	if err != nil { return nil, fmt.Errorf("invalid URL: %w", err) }
 	req.Header.Set("User-Agent", "SocksHttpGate-DoT/1.0")
-	resp, err := (&http.Client{Timeout: 60 * time.Second}).Do(req)
-	if err != nil { return 0, fmt.Errorf("download failed: %w", err) }
+	resp, err := r.blockClient.Do(req)
+	if err != nil { return nil, fmt.Errorf("download failed: %w", err) }
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK { return 0, fmt.Errorf("HTTP %d", resp.StatusCode) }
+	if resp.StatusCode != http.StatusOK { return nil, fmt.Errorf("HTTP %d", resp.StatusCode) }
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBlocklistBytes+1))
-	if err != nil { return 0, fmt.Errorf("read failed: %w", err) }
-	if len(data) > maxBlocklistBytes { return 0, fmt.Errorf("response exceeds %d bytes", maxBlocklistBytes) }
-	return addListToSet(dst, string(data)), nil
+	if err != nil { return nil, fmt.Errorf("read failed: %w", err) }
+	if len(data) > maxBlocklistBytes { return nil, fmt.Errorf("response exceeds %d bytes", maxBlocklistBytes) }
+	set := make(map[string]struct{})
+	addListToSet(set, string(data))
+	return set, nil
 }
 
-func addListToSet(dst map[string]struct{}, raw string) int {
-	count := 0
+func addListToSet(dst map[string]struct{}, raw string) {
 	scanner := bufio.NewScanner(strings.NewReader(raw))
 	scanner.Buffer(make([]byte, 4096), 1024*1024)
 	for scanner.Scan() {
@@ -128,11 +158,9 @@ func addListToSet(dst map[string]struct{}, raw string) int {
 		for _, field := range fields {
 			domain := normalizeListEntry(field)
 			if domain == "" || !validBlockDomain(domain) { continue }
-			if _, exists := dst[domain]; !exists { dst[domain] = struct{}{} }
-			count++
+			dst[domain] = struct{}{}
 		}
 	}
-	return count
 }
 
 func normalizeListEntry(s string) string {
