@@ -8,6 +8,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -1134,6 +1135,10 @@ type srcState struct {
 	domainCount int
 	totalLoads  uint64
 	failedLoads uint64
+	// domains holds the last successful parse for THIS source.
+	// Kept per-source so a single failing source does not wipe out the
+	// whole blocklist on the next merge.
+	domains map[string]struct{}
 }
 
 func (s *server) getUpstream() string {
@@ -1206,6 +1211,8 @@ func classifyUpstreamErr(err error, statusCode int) string {
 	if err != nil {
 		msg := strings.ToLower(err.Error())
 		switch {
+		case strings.Contains(msg, "context canceled"):
+			return "client_cancel"
 		case strings.Contains(msg, "deadline exceeded") || strings.Contains(msg, "timeout"):
 			return "timeout"
 		case strings.Contains(msg, "connection refused"):
@@ -1228,9 +1235,15 @@ func classifyUpstreamErr(err error, statusCode int) string {
 }
 
 func clientIP(r *http.Request) string {
-	// Behind Render/PaaS: XFF is "<client>, <edge>" (or longer chain).
-	// The last entry is the trusted edge; the entry right before it is the client.
-	// Never trust XFF[0] — clients can spoof it.
+	// Prefer edge-injected headers that cannot be spoofed by the client.
+	if v := r.Header.Get("CF-Connecting-IP"); v != "" {
+		return strings.TrimSpace(v)
+	}
+	if v := r.Header.Get("True-Client-IP"); v != "" {
+		return strings.TrimSpace(v)
+	}
+	// XFF is spoofable in general; behind our Render proxy the trusted edge
+	// appends its own hop, so XFF[len-2] is the client as seen by that edge.
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		parts := strings.Split(xff, ",")
 		for i := range parts {
@@ -1769,6 +1782,13 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func rcodeName(code int) string {
+	if s, ok := dns.RcodeToString[code]; ok {
+		return s
+	}
+	return fmt.Sprintf("RCODE%d", code)
+}
+
 func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 
@@ -1866,9 +1886,14 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := s.client.Do(req)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || r.Context().Err() != nil {
+			s.recordQuery(qName, qType, false, "client_cancel", time.Since(started))
+			dlog.Infof("upstream: client canceled (domain=%s)", normalizeDomain(qName))
+			return
+		}
 		s.totalErrors.Add(1)
 		s.recordQuery(qName, qType, false, "upstream_error", time.Since(started))
-		dlog.Warnf("upstream: %v (domain=%s upstream=%s)", err, qName, upstream)
+		dlog.Warnf("upstream: %v (domain=%s upstream=%s)", err, normalizeDomain(qName), upstream)
 		reason := classifyUpstreamErr(err, 0)
 		s.bumpErrReason(reason)
 		s.bumpResp("UPSTREAM_FAIL")
@@ -1941,7 +1966,7 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 	}
 	s.totalPassed.Add(1)
 	s.bytesOut.Add(uint64(len(out)))
-	s.bumpResp(dns.RcodeToString[check.Rcode])
+	s.bumpResp(rcodeName(check.Rcode))
 	s.bumpClient(clientIP(r))
 	s.recordUpstreamOK(time.Since(upstreamStart))
 	elapsed := time.Since(started)
@@ -2028,9 +2053,14 @@ func (s *server) handleDoHJSON(w http.ResponseWriter, r *http.Request, started t
 
 	resp, err := s.client.Do(req)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || r.Context().Err() != nil {
+			s.recordQuery(fqdn, typeStr, false, "client_cancel", time.Since(started))
+			dlog.Infof("upstream: client canceled (domain=%s)", normalizeDomain(fqdn))
+			return
+		}
 		s.totalErrors.Add(1)
 		s.recordQuery(fqdn, typeStr, false, "upstream_error", time.Since(started))
-		dlog.Warnf("upstream: %v (domain=%s)", err, fqdn)
+		dlog.Warnf("upstream: %v (domain=%s)", err, normalizeDomain(fqdn))
 		reason := classifyUpstreamErr(err, 0)
 		s.bumpErrReason(reason)
 		s.bumpResp("UPSTREAM_FAIL")
@@ -2097,7 +2127,7 @@ func (s *server) handleDoHJSON(w http.ResponseWriter, r *http.Request, started t
 
 	s.totalPassed.Add(1)
 	s.bytesOut.Add(uint64(len(out)))
-	s.bumpResp(dns.RcodeToString[check.Rcode])
+	s.bumpResp(rcodeName(check.Rcode))
 	s.recordUpstreamOK(time.Since(upstreamStart))
 	elapsed := time.Since(started)
 	s.recordLatency(elapsed, false)
@@ -2186,12 +2216,17 @@ func (s *server) isBlocked(name string) bool {
 	}
 	s.blockMu.RLock()
 	defer s.blockMu.RUnlock()
-	for d := range s.blocked {
-		if name == d || strings.HasSuffix(name, "."+d) {
+	// Walk labels right-to-left; O(labels), independent of blocklist size.
+	for {
+		if _, ok := s.blocked[name]; ok {
 			return true
 		}
+		i := strings.IndexByte(name, '.')
+		if i < 0 {
+			return false
+		}
+		name = name[i+1:]
 	}
-	return false
 }
 
 func (s *server) blockedCount() int {
@@ -2230,6 +2265,8 @@ func (s *server) initialLoad() {
 }
 
 func (s *server) refreshLoop() {
+	// initialLoad() already refreshed once; don't hammer the source immediately.
+	time.Sleep(s.refreshEvery)
 	backoff := time.Minute
 	for {
 		if s.refreshBlocklists() {
@@ -2246,7 +2283,6 @@ func (s *server) refreshLoop() {
 }
 
 func (s *server) refreshBlocklists() bool {
-	next := parseBlocklist(os.Getenv("BLOCKLIST"))
 	successful := 0
 
 	for _, source := range s.blocklistURLs {
@@ -2259,7 +2295,7 @@ func (s *server) refreshBlocklists() bool {
 		st.totalLoads++
 		s.sourcesMu.Unlock()
 
-		count, err := s.fetchBlocklist(source, next)
+		set, err := s.fetchBlocklist(source)
 		if err != nil {
 			s.sourcesMu.Lock()
 			st.lastError = err.Error()
@@ -2268,14 +2304,15 @@ func (s *server) refreshBlocklists() bool {
 			dlog.Warnf("blocklist: %s: %v", source, err)
 			continue
 		}
-		if count > 0 {
+		if len(set) > 0 {
 			successful++
 			s.sourcesMu.Lock()
 			st.lastSuccess = time.Now()
 			st.lastError = ""
-			st.domainCount = count
+			st.domainCount = len(set)
+			st.domains = set
 			s.sourcesMu.Unlock()
-			dlog.Infof("blocklist: loaded %d domains from %s", count, source)
+			dlog.Infof("blocklist: loaded %d domains from %s", len(set), source)
 		} else {
 			dlog.Warnf("blocklist: no domains parsed from %s; keeping other entries", source)
 		}
@@ -2286,10 +2323,23 @@ func (s *server) refreshBlocklists() bool {
 		return false
 	}
 
+	// Merge: defaults/env + the LAST successful snapshot of every source.
+	// A source that fails this round keeps its previous domains — no data loss.
+	merged := parseBlocklist(os.Getenv("BLOCKLIST"))
+	s.sourcesMu.RLock()
+	for _, u := range s.blocklistURLs {
+		if st := s.sources[u]; st != nil {
+			for d := range st.domains {
+				merged[d] = struct{}{}
+			}
+		}
+	}
+	s.sourcesMu.RUnlock()
+
 	s.blockMu.Lock()
 	prevSize := int64(len(s.blocked))
-	s.blocked = next
-	newSize := int64(len(next))
+	s.blocked = merged
+	newSize := int64(len(merged))
 	s.blockMu.Unlock()
 	if prevSize > 0 && newSize != prevSize {
 		if d := newSize - prevSize; d > 0 {
@@ -2300,39 +2350,41 @@ func (s *server) refreshBlocklists() bool {
 	}
 	s.lastSize.Store(newSize)
 	s.lastRefresh.Store(time.Now().Unix())
-	dlog.Infof("blocklist: active blocked domains=%d", len(next))
+	dlog.Infof("blocklist: active blocked domains=%d", len(merged))
 	// Trả bộ nhớ về OS sau refresh — tránh peak memory khi parse list lớn.
 	debug.FreeOSMemory()
 	return true
 }
 
-func (s *server) fetchBlocklist(source string, dst map[string]struct{}) (int, error) {
+func (s *server) fetchBlocklist(source string) (map[string]struct{}, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, source, nil)
 	if err != nil {
-		return 0, fmt.Errorf("invalid URL: %w", err)
+		return nil, fmt.Errorf("invalid URL: %w", err)
 	}
 	req.Header.Set("User-Agent", "go-doh-render/1.0")
 
 	resp, err := s.blockClient.Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("download failed: %w", err)
+		return nil, fmt.Errorf("download failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBlocklistBytes+1))
 	if err != nil {
-		return 0, fmt.Errorf("read failed: %w", err)
+		return nil, fmt.Errorf("read failed: %w", err)
 	}
 	if len(data) > maxBlocklistBytes {
-		return 0, fmt.Errorf("response exceeds %d bytes", maxBlocklistBytes)
+		return nil, fmt.Errorf("response exceeds %d bytes", maxBlocklistBytes)
 	}
-	return addListToSet(dst, string(data)), nil
+	set := make(map[string]struct{})
+	addListToSet(set, string(data))
+	return set, nil
 }
 
 // ─── Parsing helpers ───────────────────────────────────────────────────────
