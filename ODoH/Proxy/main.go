@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -36,9 +37,19 @@ type proxy struct {
 }
 
 func main() {
-	raw := strings.TrimSpace(os.Getenv("ODOH_TARGET_URL"))
+	var (
+		flagPort   = flag.String("port", env("PORT", "8080"), "listen port")
+		flagAddr   = flag.String("addr", env("ADDR", ""), "listen address (overrides -port)")
+		flagTarget = flag.String("target", env("ODOH_TARGET_URL", ""), "fixed Target origin (http loopback or https)")
+		flagKeyPEM = flag.String("keypem", env("TLS_CERT", ""), "TLS certificate (PEM) for the Proxy listener")
+		flagKeyFull = flag.String("keyfull", env("TLS_KEY", ""), "TLS private key (PEM) for the Proxy listener (alias: -keyfile)")
+		flagKeyFile = flag.String("keyfile", env("TLS_KEY", ""), "alias of -keyfull")
+	)
+	flag.Parse()
+
+	raw := strings.TrimSpace(*flagTarget)
 	if raw == "" {
-		log.Fatal("ODOH_TARGET_URL is required (e.g. http://127.0.0.1:8080)")
+		log.Fatal("missing target: use -target or ODOH_TARGET_URL")
 	}
 
 	target, err := parseTarget(raw)
@@ -61,7 +72,7 @@ func main() {
 	mux.HandleFunc("/.well-known/odohconfigs", p.configs)
 
 	// /proxy: GET → configs, POST → query
-	mux.HandleFunc("/proxy", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/dns-query", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			p.configs(w, r)
@@ -76,7 +87,10 @@ func main() {
 	// Recover + access log + request ID wrap
 	handler := recoverMiddleware(accessLogMiddleware(secureHeaders(mux)))
 
-	addr := env("ADDR", ":"+env("PORT", "8080"))
+	addr := *flagAddr
+	if addr == "" {
+		addr = ":" + *flagPort
+	}
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           handler,
@@ -91,10 +105,19 @@ func main() {
 	log.Printf("ODoH Proxy started; target=%s; listen=%s; configs_timeout=%v query_timeout=%v",
 		target.Redacted(), addr, configsTimeout, queryTimeout)
 
-	cert, key := os.Getenv("TLS_CERT"), os.Getenv("TLS_KEY")
-	if cert != "" && key != "" {
+	cert := strings.TrimSpace(*flagKeyPEM)
+	key := strings.TrimSpace(*flagKeyFull)
+	if key == "" {
+		key = strings.TrimSpace(*flagKeyFile)
+	}
+	if (cert == "") != (key == "") {
+		log.Fatal("TLS: -keypem and -keyfull must be provided together")
+	}
+	if cert != "" {
+		log.Printf("TLS enabled; cert=%s key=%s", cert, key)
 		log.Fatal(srv.ListenAndServeTLS(cert, key))
 	}
+	log.Printf("TLS disabled; listening plain HTTP")
 	log.Fatal(srv.ListenAndServe())
 }
 
@@ -189,7 +212,7 @@ func (p *proxy) query(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unsupported media type", http.StatusUnsupportedMediaType)
 		return
 	}
-	p.forward(w, r, "/proxy", true, queryTimeout)
+	p.forward(w, r, "/dns-query", true, queryTimeout)
 }
 
 // forward: chuyển request tới target, giữ method/body.

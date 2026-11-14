@@ -1,24 +1,25 @@
 package main
 
 import (
+
 	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"flag"
+	"github.com/miekg/dns"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
+	odoh "github.com/cloudflare/odoh-go"
 	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	odoh "github.com/cloudflare/odoh-go"
-	"github.com/miekg/dns"
 )
 
 const (
@@ -40,20 +41,55 @@ type target struct {
 	queries, blockedQueries, errors atomic.Uint64
 }
 
+func loadSeed(inline, file string) (string, error) {
+	if inline != "" {
+		return strings.TrimSpace(inline), nil
+	}
+	if file != "" {
+		b, err := os.ReadFile(file)
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(string(b)), nil
+	}
+	if v := strings.TrimSpace(os.Getenv("ODOH_KEY_SEED")); v != "" {
+		return v, nil
+	}
+	return "", errors.New("missing seed: use -key, -keyfile, or ODOH_KEY_SEED")
+}
+
 func main() {
-	seed, err := hex.DecodeString(strings.TrimSpace(os.Getenv("ODOH_KEY_SEED")))
+	var (
+		flagPort     = flag.String("port", env("PORT", "8080"), "listen port")
+		flagAddr     = flag.String("addr", env("ADDR", ""), "listen address (overrides -port)")
+		flagKey      = flag.String("key", "", "ODoH key seed (64 hex chars); falls back to ODOH_KEY_SEED")
+		flagKeyFile  = flag.String("keyfile", "", "file containing the 64-hex ODoH key seed (alias: -keyfull)")
+		flagKeyFull  = flag.String("keyfull", "", "alias of -keyfile")
+		flagUpstream = flag.String("upstream", env("UPSTREAM_DOH", "https://cloudflare-dns.com/dns-query"), "upstream HTTPS DoH URL")
+	)
+	flag.Parse()
+
+	keyFile := *flagKeyFile
+	if keyFile == "" {
+		keyFile = *flagKeyFull
+	}
+	seedHex, err := loadSeed(*flagKey, keyFile)
+	if err != nil {
+		log.Fatalf("ODoH key seed: %v", err)
+	}
+	seed, err := hex.DecodeString(seedHex)
 	if err != nil || len(seed) != 32 {
-		log.Fatal("ODOH_KEY_SEED must be a persistent 32-byte seed (64 hex chars); generate with: openssl rand -hex 32")
+		log.Fatal("ODoH key seed must be 32 bytes (64 hex chars); generate with: openssl rand -hex 32")
 	}
 	kp, err := odoh.CreateDefaultKeyPairFromSeed(seed)
 	if err != nil {
 		log.Fatalf("ODoH key: %v", err)
 	}
 
-	upstream := env("UPSTREAM_DOH", "https://cloudflare-dns.com/dns-query")
+	upstream := strings.TrimSpace(*flagUpstream)
 	u, err := url.Parse(upstream)
 	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.Fragment != "" {
-		log.Fatal("UPSTREAM_DOH must be a fixed HTTPS URL without userinfo/fragment")
+		log.Fatal("upstream must be a fixed HTTPS URL without userinfo/fragment")
 	}
 
 	refresh := 6 * time.Hour
@@ -91,16 +127,24 @@ func main() {
 	mux.HandleFunc("/api/v1/status", t.apiStatus)
 	mux.HandleFunc("/.well-known/odohconfigs", t.configs)
 	// Rethink gọi GET /proxy để lấy configs, POST /proxy để query
-	mux.HandleFunc("/proxy", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet {
+	mux.HandleFunc("/dns-query", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
 			t.configs(w, r)
-			return
+		case http.MethodPost:
+			t.query(w, r)
+		default:
+			w.Header().Set("Allow", "GET, POST")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
-		t.query(w, r)
 	})
 
+	listenAddr := *flagAddr
+	if listenAddr == "" {
+		listenAddr = ":" + *flagPort
+	}
 	srv := &http.Server{
-		Addr:              env("ADDR", ":"+env("PORT", "8080")),
+		Addr:              listenAddr,
 		Handler:           secureHeaders(mux),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
@@ -131,7 +175,7 @@ func (t *target) query(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			t.errors.Add(1)
-			log.Printf("recovered panic in /proxy: %v", rec)
+			log.Printf("recovered panic in /dns-query: %v", rec)
 			http.Error(w, "invalid ODoH message", http.StatusBadRequest)
 		}
 	}()

@@ -44,11 +44,12 @@ install_deps() {
     local SUDO=""
     case "$PLATFORM" in
         termux)
-            info "Cài gói Termux (python-cryptography, dnsutils, proot)..."
+            info "Cài gói Termux (python-pip, python-cryptography, dnsutils, proot)..."
             pkg update -y >/dev/null 2>&1 || true
+            # python-pip của Termux được build sẵn, KHÔNG nâng cấp bằng pip để tránh hỏng.
             # python-cryptography tự kéo cffi làm dependency.
             # dnspython KHÔNG có trong kho Termux → cài qua pip ở install_certbot().
-            pkg install -y python python-cryptography dnsutils proot openssl
+            pkg install -y python python-pip python-cryptography dnsutils proot openssl
             ;;
         debian)
             command -v sudo >/dev/null && SUDO=sudo
@@ -68,8 +69,8 @@ install_deps() {
         arch)
             command -v sudo >/dev/null && SUDO=sudo
             info "Cài gói pacman (python-cryptography, python-cffi, python-pyopenssl)..."
-            $SUDO pacman -Sy --noconfirm python python-cryptography python-cffi \
-                python-pyopenssl python-dnspython bind openssl
+            $SUDO pacman -Sy --noconfirm python python python-pip python-cryptography \
+                python-cffi python-pyopenssl python-dnspython bind openssl
             ;;
         macos)
             info "macOS: cryptography + cffi + pyopenssl sẽ cài qua pip (wheel có sẵn)"
@@ -82,7 +83,7 @@ install_deps() {
     esac
 }
 
-# ============ 3. Tạo venv (skip nếu đã có) ============
+# ============ 3. Tạo venv + đảm bảo pip khỏe mạnh ============
 setup_venv() {
     if [ -x "$VENV/bin/python3" ]; then
         info "Venv đã tồn tại: $VENV (dùng lại)"
@@ -97,8 +98,40 @@ setup_venv() {
     fi
     # shellcheck disable=SC1091
     source "$VENV/bin/activate"
-    pip install --upgrade pip wheel >/dev/null 2>&1 || true
+
+    ensure_pip_healthy
+
+    # Termux: KHÔNG nâng cấp pip (pip do Termux quản lý). Nền tảng khác: nâng cấp bình thường.
+    if [ "$PLATFORM" = "termux" ]; then
+        pip install --upgrade wheel >/dev/null 2>&1 || true
+    else
+        pip install --upgrade pip wheel >/dev/null 2>&1 || true
+    fi
     ok "Venv: $VENV"
+}
+
+# Kiểm tra pip có bị hỏng (thiếu pip._internal.operations.install.wheel) không.
+# Nếu hỏng → tự chạy get-pip.py --force-reinstall để phục hồi.
+ensure_pip_healthy() {
+    if python3 -c 'import pip._internal.operations.install.wheel' >/dev/null 2>&1; then
+        return 0
+    fi
+    warn "pip trong venv bị hỏng (thiếu pip._internal.operations.install.wheel) — đang phục hồi..."
+    local tmp
+    tmp="$(mktemp -d)"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL https://bootstrap.pypa.io/get-pip.py -o "$tmp/get-pip.py"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$tmp/get-pip.py" https://bootstrap.pypa.io/get-pip.py
+    else
+        rm -rf "$tmp"
+        die "Cần curl hoặc wget để tải get-pip.py (Termux: pkg install curl)"
+    fi
+    python3 "$tmp/get-pip.py" --force-reinstall >/dev/null
+    rm -rf "$tmp"
+    python3 -c 'import pip._internal.operations.install.wheel' >/dev/null 2>&1 \
+        || die "Phục hồi pip thất bại — xoá thủ công: rm -rf $VENV rồi chạy lại"
+    ok "Đã phục hồi pip trong venv"
 }
 
 # ============ 4. Cài certbot không kéo cryptography/cffi từ source ============

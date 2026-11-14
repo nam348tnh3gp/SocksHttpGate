@@ -25,7 +25,7 @@ The default listen address is `:8080`; override it with `PORT` or `ADDR`.
 ## Endpoints
 
 - `GET /.well-known/odohconfigs` — forwards Target configuration.
-- `POST /proxy` — forwards requests with content type `application/oblivious-dns-message`.
+- `POST /dns-query` — forwards requests with content type `application/oblivious-dns-message`.
 - `GET /health`, `GET /api/stats`, `GET /api/v1/stats`, `GET /api/v1/status`.
 
 ## Test and build
@@ -44,3 +44,8 @@ The parent [ODoH README](../README.md) documents the paired Proxy/Target integra
 ## Security
 
 Keep the Target private key seed exclusively on Target. Use HTTPS for Proxy-to-Target communication unless the hop is guaranteed private and trusted. Do not expose administrative or diagnostic endpoints beyond what is needed.
+
+## CLI flags
+
+- `-port` (default `8080`) / `-addr` (overrides `-port`)
+- `-target` — fixed Target origin (`http://` only for loopback, else `https://`)

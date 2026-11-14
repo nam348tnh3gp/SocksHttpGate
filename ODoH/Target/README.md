@@ -31,7 +31,7 @@ The default listen address is `:8080`; override it with `PORT` or `ADDR`.
 ## Endpoints
 
 - `GET /.well-known/odohconfigs` — publishes Target public configuration.
-- `POST /proxy` — accepts encrypted ODoH requests.
+- `POST /dns-query` — accepts encrypted ODoH requests.
 - `GET /health`, `GET /api/stats`, `GET /api/v1/stats`, `GET /api/v1/status`.
 
 ## Test and build
@@ -51,3 +51,12 @@ Some integration tests use the real Cloudflare DoH endpoint and require outbound
 ## Security
 
 Keep this service private and reachable only by the intended Proxy where possible. The Target is the only component that should receive `ODOH_KEY_SEED`. The current implementation uses an archived ODoH dependency; passing tests do not replace RFC-vector validation or an independent security review.
+
+## CLI flags
+
+- `-port` (default `8080`) / `-addr` (overrides `-port`)
+- `-key` — 64-hex ODoH seed
+- `-keyfile` / `-keyfull` — file containing the 64-hex seed
+- `-upstream` — upstream HTTPS DoH URL
+
+`--keypem` is not supported: `odoh-go` expects a raw 32-byte seed, not PEM.
