@@ -1,25 +1,20 @@
 // go.mod
 module sockshttpgate-odoh
 
-go 1.23
+go 1.26.0
 
 require (
-	github.com/cloudflare/odoh-go v0.0.0-20230926114050-f39fa019b017
 	github.com/miekg/dns v1.1.63
+	github.com/nam348tnh3gp/odoh-go v0.0.0-20261115153257-fd3c2502f892
 )
 
 require (
-	git.schwanenlied.me/yawning/x448.git v0.0.0-20170617130356-01b048fb03d6 // indirect
-	github.com/cisco/go-hpke v0.0.0-20210215210317-01c430f1f302 // indirect
-	github.com/cisco/go-tls-syntax v0.0.0-20200617162716-46b0cfb76b9b // indirect
-	github.com/cloudflare/circl v1.0.0 // indirect
-	golang.org/x/crypto v0.29.0 // indirect
-	golang.org/x/mod v0.18.0 // indirect
-	golang.org/x/net v0.31.0 // indirect
-	golang.org/x/sync v0.7.0 // indirect
-	golang.org/x/sys v0.27.0 // indirect
-	golang.org/x/tools v0.22.0 // indirect
+	github.com/cisco/go-hpke v0.0.0-20230407100446-246075f83609 // indirect
+	github.com/jedisct1/go-hpke-compact v0.0.0-20260917221930-f479271ae452 // indirect
+	golang.org/x/crypto v0.57.0 // indirect
+	golang.org/x/mod v0.41.0 // indirect
+	golang.org/x/net v0.58.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/tools v0.49.0 // indirect
 )
-
-// Thêm dòng này để trỏ sang fork đã được cập nhật
-replace github.com/cloudflare/odoh-go => github.com/sthorne/odoh-go v1.0.4
