@@ -86,11 +86,8 @@ func TestODoHQueryRoundTripAndBlocklist(t *testing.T) {
 	upstreamURL := upstream.URL + "/dns-query"
 	upstreamClient := &http.Client{Timeout: 10 * time.Second}
 
-	target := &target{
-		kp: kp, client: upstreamClient, upstream: upstreamURL,
-		blocked: map[string]struct{}{"blocked.example": {}},
-		started: time.Now(),
-	}
+	target := newTestTarget(t, kp, upstreamURL, map[string]struct{}{"blocked.example": {}})
+	target.client = upstreamClient
 	mux := http.NewServeMux()
 	mux.HandleFunc("/proxy", target.query)
 	mux.HandleFunc("/.well-known/odohconfigs", target.configs)
