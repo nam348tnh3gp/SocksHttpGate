@@ -3,11 +3,12 @@
 // Test toàn bộ pipeline: client → Proxy (HTTPS) → Target (HTTP) → Upstream DoH
 //
 // Env (tất cả optional):
-//   ODOH_PROXY_URL      — base URL của proxy (default: https://odohtermux.duckdns.org:8443)
-//   ODOH_TEST_NORMAL    — domain test resolve thành công (default: example.com)
-//   ODOH_TEST_BLOCKED   — domain test bị block (default: doubleclick.net)
-//                          → set "skip" hoặc "-" để bỏ qua test block
-//   ODOH_TIMEOUT        — timeout giây (default: 15)
+//
+//	ODOH_PROXY_URL      — base URL của proxy (default: https://odohtermux.duckdns.org:8443)
+//	ODOH_TEST_NORMAL    — domain test resolve thành công (default: example.com)
+//	ODOH_TEST_BLOCKED   — domain test bị block (default: doubleclick.net)
+//	                       → set "skip" hoặc "-" để bỏ qua test block
+//	ODOH_TIMEOUT        — timeout giây (default: 15)
 package main
 
 import (
@@ -20,17 +21,17 @@ import (
 	"strings"
 	"time"
 
-	odoh "github.com/nam348tnh3gp/odoh-go"
 	"github.com/miekg/dns"
+	odoh "github.com/nam348tnh3gp/odoh-go"
 )
 
 const odohMediaType = "application/oblivious-dns-message"
 
 var (
-	proxyBase     string
-	testNormal    string
-	testBlocked   string
-	httpTimeout   time.Duration
+	proxyBase   string
+	testNormal  string
+	testBlocked string
+	httpTimeout time.Duration
 )
 
 func init() {

@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	odoh "github.com/nam348tnh3gp/odoh-go"
 	"github.com/miekg/dns"
+	odoh "github.com/nam348tnh3gp/odoh-go"
 )
 
 const odohMediaType = "application/oblivious-dns-message"
@@ -44,15 +44,15 @@ func TestProxyTargetEndToEndWithRealUpstream(t *testing.T) {
 	proxyAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(proxyPort))
 
 	target := startService(t, targetBin, map[string]string{
-		"ADDR": targetAddr,
-		"ODOH_KEY_SEED": strings.Repeat("42", 32),
-		"UPSTREAM_DOH": "https://cloudflare-dns.com/dns-query",
-		"BLOCKLIST": "blocked.example",
+		"ADDR":           targetAddr,
+		"ODOH_KEY_SEED":  strings.Repeat("42", 32),
+		"UPSTREAM_DOH":   "https://cloudflare-dns.com/dns-query",
+		"BLOCKLIST":      "blocked.example",
 		"BLOCKLIST_URLS": "",
 	})
 	proxy := startService(t, proxyBin, map[string]string{
-		"ADDR": proxyAddr,
-		"ODOH_TARGET_URL": "http://" + targetAddr,
+		"ADDR":                  proxyAddr,
+		"ODOH_TARGET_URL":       "http://" + targetAddr,
 		"ALLOW_INSECURE_TARGET": "YES",
 	})
 	baseURL := "http://" + proxyAddr
