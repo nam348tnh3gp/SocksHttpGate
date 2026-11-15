@@ -12,6 +12,26 @@ import (
 	odoh "github.com/nam348tnh3gp/odoh-go"
 )
 
+// newTestTarget builds a target with all maps initialized, matching main().
+func newTestTarget(t *testing.T, kp odoh.ObliviousDoHKeyPair, upstream string, blocked map[string]struct{}) *target {
+t.Helper()
+if blocked == nil {
+blocked = map[string]struct{}{}
+}
+return &target{
+kp:       kp,
+upstream: upstream,
+client:   &http.Client{Timeout: 10 * time.Second},
+blocked:  blocked,
+sources:  []string{},
+refresh:  6 * time.Hour,
+started:  time.Now(),
+respC:    map[string]uint64{},
+types:    map[string]uint64{},
+srcSt:    map[string]*srcState{},
+}
+}
+
 func TestODoHQueryRoundTripAndBlocklist(t *testing.T) {
 	seed := bytes.Repeat([]byte{0x42}, 32)
 	kp, err := odoh.CreateDefaultKeyPairFromSeed(seed)
@@ -164,7 +184,7 @@ func TestTargetRejectsMalformedRequests(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create key pair: %v", err)
 	}
-	target := &target{kp: kp, blocked: map[string]struct{}{}}
+	target := newTestTarget(t, kp, "", map[string]struct{}{})
 
 	t.Run("wrong method", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/proxy", nil)
@@ -226,7 +246,7 @@ func FuzzTargetMalformedODoH(f *testing.F) {
 	if err != nil {
 		f.Fatalf("create key pair: %v", err)
 	}
-	target := &target{kp: kp, blocked: map[string]struct{}{}}
+	target := newTestTarget(t, kp, "", map[string]struct{}{})
 
 	f.Fuzz(func(t *testing.T, raw []byte) {
 		if len(raw) > maxBody {
@@ -243,7 +263,7 @@ func FuzzTargetMalformedODoH(f *testing.F) {
 }
 
 func TestVersionedRESTEndpoints(t *testing.T) {
-	tgt := &target{started: time.Now(), blocked: map[string]struct{}{}}
+	tgt := &target{started: time.Now(), blocked: map[string]struct{}{}, respC: map[string]uint64{}, types: map[string]uint64{}, srcSt: map[string]*srcState{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/status", tgt.apiStatus)
 	mux.HandleFunc("/api/v1/health", tgt.health)

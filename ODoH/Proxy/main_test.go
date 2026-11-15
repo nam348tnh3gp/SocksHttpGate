@@ -13,8 +13,8 @@ import (
 func TestProxyForwardsOpaqueODoHMessage(t *testing.T) {
 	payload := []byte{1, 0, 1, 0, 3, 1, 2, 3}
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/proxy" {
-			t.Errorf("target path = %q, want /proxy", r.URL.Path)
+		if r.URL.Path != "/dns-query" {
+			t.Errorf("target path = %q, want /dns-query", r.URL.Path)
 		}
 		if r.Method != http.MethodPost {
 			t.Errorf("target method = %q, want POST", r.Method)
@@ -47,7 +47,7 @@ func TestProxyForwardsOpaqueODoHMessage(t *testing.T) {
 		client:  target.Client(),
 		started: time.Now(),
 	}
-	req := httptest.NewRequest(http.MethodPost, "/proxy", bytes.NewReader(payload))
+	req := httptest.NewRequest(http.MethodPost, "/dns-query", bytes.NewReader(payload))
 	req.Header.Set("Content-Type", odohType)
 	req.Header.Set("X-Forwarded-For", "203.0.113.9")
 	rec := httptest.NewRecorder()
