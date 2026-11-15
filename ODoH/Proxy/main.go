@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -15,10 +16,21 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
+
+//go:embed dashboard.html
+var dashboardHTML string
+
+type logEntry struct {
+	Time    time.Time `json:"time"`
+	Level   string    `json:"level"`
+	Message string    `json:"message"`
+}
 
 const (
 	odohType       = "application/oblivious-dns-message"
@@ -34,14 +46,43 @@ type proxy struct {
 	requests atomic.Uint64
 	errors   atomic.Uint64
 	panics   atomic.Uint64
+
+	qpsCur    atomic.Uint64
+	qpsPeak   atomic.Uint64
+	qpsMu     sync.Mutex
+	qpsWin    [60]uint64
+	qpsIdx    int
+	qpsMin    [60]uint64
+	qpsMinIdx int
+	qpsMinAcc uint64
+	qpsMinCnt int
+
+	bytesIn  atomic.Uint64
+	bytesOut atomic.Uint64
+
+	latMu sync.Mutex
+	latS  []int64
+
+	upMu     sync.Mutex
+	upLastOK time.Time
+	upLastE  time.Time
+	upLastM  string
+	upCF     uint64
+	upOK     uint64
+	upFail   uint64
+	upSumUs  uint64
+	upLatS   []int64
+
+	logMu sync.Mutex
+	logs  []logEntry
 }
 
 func main() {
 	var (
-		flagPort   = flag.String("port", env("PORT", "8080"), "listen port")
-		flagAddr   = flag.String("addr", env("ADDR", ""), "listen address (overrides -port)")
-		flagTarget = flag.String("target", env("ODOH_TARGET_URL", ""), "fixed Target origin (http loopback or https)")
-		flagKeyPEM = flag.String("keypem", env("TLS_CERT", ""), "TLS certificate (PEM) for the Proxy listener")
+		flagPort    = flag.String("port", env("PORT", "8080"), "listen port")
+		flagAddr    = flag.String("addr", env("ADDR", ""), "listen address (overrides -port)")
+		flagTarget  = flag.String("target", env("ODOH_TARGET_URL", ""), "fixed Target origin (http loopback or https)")
+		flagKeyPEM  = flag.String("keypem", env("TLS_CERT", ""), "TLS certificate (PEM) for the Proxy listener")
 		flagKeyFull = flag.String("keyfull", env("TLS_KEY", ""), "TLS private key (PEM) for the Proxy listener (alias: -keyfile)")
 		flagKeyFile = flag.String("keyfile", env("TLS_KEY", ""), "alias of -keyfull")
 	)
@@ -62,6 +103,8 @@ func main() {
 		started: time.Now(),
 		client:  newTargetClient(),
 	}
+	go p.qpsLoop()
+	p.logf("info", "ODoH Proxy started; target=%s", target.Redacted())
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", p.health)
@@ -85,7 +128,7 @@ func main() {
 	})
 
 	// Recover + access log + request ID wrap
-	handler := recoverMiddleware(accessLogMiddleware(secureHeaders(mux)))
+	handler := recoverMiddleware(p, accessLogMiddleware(secureHeaders(mux)))
 
 	addr := *flagAddr
 	if addr == "" {
@@ -102,6 +145,16 @@ func main() {
 		ErrorLog:          log.New(os.Stderr, "[http] ", log.LstdFlags),
 	}
 
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		_, _ = w.Write([]byte(dashboardHTML))
+	})
+	mux.HandleFunc("/api/dashboard", p.handleDashboard)
 	log.Printf("ODoH Proxy started; target=%s; listen=%s; configs_timeout=%v query_timeout=%v",
 		target.Redacted(), addr, configsTimeout, queryTimeout)
 
@@ -220,6 +273,7 @@ func (p *proxy) query(w http.ResponseWriter, r *http.Request) {
 func (p *proxy) forward(w http.ResponseWriter, r *http.Request, path string, withBody bool, timeout time.Duration) {
 	reqID := requestIDFrom(r)
 	start := time.Now()
+	p.qpsCur.Add(1)
 
 	// --- Đọc body (nếu có) ---
 	var body io.Reader
@@ -235,6 +289,7 @@ func (p *proxy) forward(w http.ResponseWriter, r *http.Request, path string, wit
 				fmt.Sprintf("read body: %v", err), time.Since(start))
 			return
 		}
+		p.bytesIn.Add(uint64(len(b)))
 		body = bytes.NewReader(b)
 	}
 
@@ -342,14 +397,19 @@ func (p *proxy) forward(w http.ResponseWriter, r *http.Request, path string, wit
 	w.Header().Set("X-Request-Id", reqID)
 	w.WriteHeader(resp.StatusCode)
 	if _, err := w.Write(bodyBytes); err != nil {
-		// Client disconnect khi ghi — không thể làm gì
 		log.Printf("[%s] write to client failed: %v", reqID, err)
 	}
+	p.bytesOut.Add(uint64(len(bodyBytes)))
+	p.trackUpstreamOK(time.Since(start))
 }
 
 // fail: log lỗi + trả response lỗi cho client (không lộ chi tiết nội bộ).
 func (p *proxy) fail(w http.ResponseWriter, reqID, clientMsg string, code int, detail string, dur time.Duration) {
 	p.errors.Add(1)
+	p.trackUpstreamFail(clientMsg)
+	if dur > 0 {
+		p.trackLatency(dur)
+	}
 	log.Printf("[%s] %s (code=%d, dur=%v): %s",
 		reqID, clientMsg, code, dur.Round(time.Millisecond), detail)
 	w.Header().Set("X-Request-Id", reqID)
@@ -453,7 +513,7 @@ func newRequestID() string {
 }
 
 // recoverMiddleware: bắt panic, trả 500, log stack.
-func recoverMiddleware(next http.Handler) http.Handler {
+func recoverMiddleware(p *proxy, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reqID := r.Header.Get("X-Request-Id")
 		if reqID == "" {
@@ -464,13 +524,12 @@ func recoverMiddleware(next http.Handler) http.Handler {
 
 		defer func() {
 			if rec := recover(); rec != nil {
-				// Lấy proxy instance từ closure không khả thi → dùng global counter
-				atomic.AddUint64(&globalPanics, 1)
-				log.Printf("[%s] PANIC in %s %s: %v\n",
-					reqID, r.Method, r.URL.Path, rec)
-				// Không dùng http.Error vì có thể đã WriteHeader
+				if p != nil {
+					p.panics.Add(1)
+					p.logf("error", "PANIC in %s %s: %v", r.Method, r.URL.Path, rec)
+				}
 				func() {
-					defer func() { _ = recover() }() // nếu header đã gửi → bỏ qua
+					defer func() { _ = recover() }()
 					http.Error(w, "internal error", http.StatusInternalServerError)
 				}()
 			}
@@ -478,8 +537,6 @@ func recoverMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
-
-var globalPanics uint64
 
 // accessLogMiddleware: log mỗi request (method, path, status, dur).
 // Không log body → privacy.
@@ -527,6 +584,161 @@ func truncate(b []byte, n int) string {
 		return string(b)
 	}
 	return string(b[:n]) + "..."
+}
+
+// ==================== Dashboard ====================
+
+// logf appends to p.logs, which is exposed via the public dashboard.
+// NEVER pass query contents, domain names, client IPs, or any per-request
+// identifiers here. Assume everything written via logf will be world-readable.
+func (p *proxy) logf(level, f string, a ...any) {
+	msg := fmt.Sprintf(f, a...)
+	log.Print(msg)
+	p.logMu.Lock()
+	p.logs = append(p.logs, logEntry{Time: time.Now(), Level: level, Message: msg})
+	if len(p.logs) > 200 {
+		p.logs = p.logs[len(p.logs)-200:]
+	}
+	p.logMu.Unlock()
+}
+
+func (p *proxy) qpsLoop() {
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+	for range tick.C {
+		cur := p.qpsCur.Swap(0)
+		if pk := p.qpsPeak.Load(); cur > pk {
+			p.qpsPeak.Store(cur)
+		}
+		p.qpsMu.Lock()
+		p.qpsWin[p.qpsIdx] = cur
+		p.qpsIdx = (p.qpsIdx + 1) % 60
+		p.qpsMinAcc += cur
+		p.qpsMinCnt++
+		if p.qpsMinCnt >= 60 {
+			p.qpsMin[p.qpsMinIdx] = p.qpsMinAcc
+			p.qpsMinIdx = (p.qpsMinIdx + 1) % 60
+			p.qpsMinAcc = 0
+			p.qpsMinCnt = 0
+		}
+		p.qpsMu.Unlock()
+	}
+}
+
+func (p *proxy) trackLatency(d time.Duration) {
+	p.latMu.Lock()
+	if len(p.latS) >= 500 {
+		copy(p.latS, p.latS[1:])
+		p.latS[len(p.latS)-1] = d.Milliseconds()
+	} else {
+		p.latS = append(p.latS, d.Milliseconds())
+	}
+	p.latMu.Unlock()
+}
+
+func (p *proxy) trackUpstreamOK(d time.Duration) {
+	p.upMu.Lock()
+	p.upLastOK = time.Now()
+	p.upOK++
+	p.upCF = 0
+	p.upSumUs += uint64(d.Microseconds())
+	if len(p.upLatS) >= 500 {
+		copy(p.upLatS, p.upLatS[1:])
+		p.upLatS[len(p.upLatS)-1] = d.Milliseconds()
+	} else {
+		p.upLatS = append(p.upLatS, d.Milliseconds())
+	}
+	p.upMu.Unlock()
+	p.trackLatency(d)
+}
+
+func (p *proxy) trackUpstreamFail(msg string) {
+	p.upMu.Lock()
+	p.upLastE = time.Now()
+	p.upLastM = msg
+	p.upFail++
+	p.upCF++
+	p.upMu.Unlock()
+}
+
+func (p *proxy) handleDashboard(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	p.qpsMu.Lock()
+	last1s := p.qpsWin[(p.qpsIdx-1+60)%60]
+	qpsMin := make([]uint64, 60)
+	for i := 0; i < 60; i++ {
+		qpsMin[i] = p.qpsMin[(p.qpsMinIdx+i)%60]
+	}
+	p.qpsMu.Unlock()
+
+	p.latMu.Lock()
+	samples := append([]int64(nil), p.latS...)
+	p.latMu.Unlock()
+	var avg, p95 float64
+	if len(samples) > 0 {
+		var sum int64
+		for _, v := range samples {
+			sum += v
+		}
+		avg = float64(sum) / float64(len(samples))
+		cp := append([]int64(nil), samples...)
+		sort.Slice(cp, func(i, j int) bool { return cp[i] < cp[j] })
+		p95 = float64(cp[int(float64(len(cp)-1)*0.95)])
+	}
+
+	p.upMu.Lock()
+	uh := map[string]any{
+		"total_ok":       p.upOK,
+		"total_fail":     p.upFail,
+		"consec_fails":   p.upCF,
+		"last_error_msg": p.upLastM,
+		"avg_latency_ms": 0.0,
+	}
+	if !p.upLastOK.IsZero() {
+		uh["last_ok"] = p.upLastOK.UTC().Format(time.RFC3339)
+	}
+	if !p.upLastE.IsZero() {
+		uh["last_error"] = p.upLastE.UTC().Format(time.RFC3339)
+	}
+	if n := uint64(len(p.upLatS)); n > 0 {
+		uh["avg_latency_ms"] = float64(p.upSumUs) / float64(n) / 1000.0
+	}
+	p.upMu.Unlock()
+
+	p.logMu.Lock()
+	logs := append([]logEntry(nil), p.logs...)
+	p.logMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Robots-Tag", "noindex, nofollow")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"service":        "ODoH Proxy",
+		"mode":           "proxy",
+		"started":        p.started.UTC().Format(time.RFC3339),
+		"uptime_seconds": int64(time.Since(p.started).Seconds()),
+		"requests":       p.requests.Load(),
+		"blocked":        0,
+		"errors":         p.errors.Load(),
+		"panics":         p.panics.Load(),
+		"qps_1s":         float64(last1s),
+		"qps_peak":       p.qpsPeak.Load(),
+		"avg_latency_ms": avg,
+		"p95_latency_ms": p95,
+		"bytes_in":       p.bytesIn.Load(),
+		"bytes_out":      p.bytesOut.Load(),
+		"qps_minute":     qpsMin,
+		"upstream":       uh,
+		"resp_codes":     []map[string]any{},
+		"type_breakdown": map[string]uint64{},
+		"sources":        []map[string]any{},
+		"logs":           logs,
+	})
 }
 
 func env(k, d string) string {

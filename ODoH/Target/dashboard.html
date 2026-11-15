@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>ODoH Dashboard</title>
+<style>
+:root{--bg:#0d1117;--panel:#161b22;--border:#30363d;--fg:#c9d1d9;--muted:#8b949e;--accent:#58a6ff;--ok:#3fb950;--warn:#d29922;--err:#f85149;--pad:clamp(8px,2vw,16px);--gap:clamp(6px,1vw,12px);--radius:6px}
+*{box-sizing:border-box;margin:0;padding:0;min-width:0}
+html{overflow-x:hidden}
+body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;font-size:clamp(12px,1.6vw,14px);line-height:1.5;padding:var(--pad);overflow-x:hidden;max-width:100%}
+h1{font-size:clamp(15px,2.4vw,20px);margin-bottom:4px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+h2{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin:14px 0 6px;font-weight:600}
+.sub{color:var(--muted);font-size:clamp(11px,1.4vw,13px);margin-bottom:14px;font-family:ui-monospace,monospace;overflow-wrap:anywhere;word-break:break-word}
+.sub .privacy{color:var(--muted);font-style:italic}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,130px),1fr));gap:var(--gap);margin-bottom:var(--gap)}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:clamp(8px,1.2vw,12px);min-width:0;overflow:hidden}
+.card .label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.5px;overflow-wrap:anywhere}
+.card .value{font-size:clamp(15px,2.6vw,22px);font-weight:600;margin-top:4px;font-family:ui-monospace,monospace;overflow-wrap:anywhere;word-break:break-word;line-height:1.2}
+.panels{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,380px),1fr));gap:var(--gap)}
+.panel{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;display:flex;flex-direction:column;height:clamp(260px,42vh,500px);min-width:0}
+.panel-head{padding:8px 12px;border-bottom:1px solid var(--border);font-weight:600;font-size:clamp(11px,1.5vw,13px);display:flex;justify-content:space-between;align-items:center;background:var(--panel);gap:8px;flex-wrap:wrap;min-width:0}
+.panel-head > span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1 1 auto}
+.panel-head > div{flex:0 0 auto;display:flex;gap:8px;align-items:center;flex-wrap:nowrap}
+.panel-body{overflow:auto;flex:1 1 auto;min-height:0;-webkit-overflow-scrolling:touch}
+.table-wrap{width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch;min-width:0}
+table{width:100%;border-collapse:collapse;font-family:ui-monospace,monospace;font-size:clamp(11px,1.3vw,12px)}
+th{text-align:left;padding:6px 10px;color:var(--muted);font-weight:500;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--panel);font-size:11px;text-transform:uppercase;letter-spacing:.5px;z-index:1;white-space:nowrap}
+td{padding:4px 10px;border-bottom:1px solid rgba(48,54,61,.5);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:42vw}
+td.wrap{white-space:normal;word-break:break-word;overflow-wrap:anywhere;max-width:none}
+.badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600;white-space:nowrap}
+.badge.ready{background:rgba(63,185,80,.15);color:var(--ok)}
+.badge.loading{background:rgba(210,153,34,.15);color:var(--warn)}
+.badge.ok{background:rgba(63,185,80,.15);color:var(--ok)}
+.badge.err{background:rgba(210,153,34,.15);color:var(--warn)}
+.badge.error{background:rgba(248,81,73,.15);color:var(--err)}
+.badge.warn{background:rgba(210,153,34,.15);color:var(--warn)}
+.badge.info{background:rgba(88,166,255,.15);color:var(--accent)}
+.badge.pending{background:rgba(139,148,158,.15);color:var(--muted)}
+.conn{font-size:11px;white-space:nowrap}
+.conn.on{color:var(--ok)}
+.conn.off{color:var(--err)}
+.dl-btn{display:inline-block;padding:2px 8px;border:1px solid var(--border);border-radius:4px;color:var(--accent);text-decoration:none;font-size:11px;font-weight:600;background:rgba(88,166,255,.08);transition:all .15s;white-space:nowrap;cursor:pointer}
+.dl-btn:hover{background:rgba(88,166,255,.2);border-color:var(--accent)}
+.dl-btn:disabled{opacity:.5;cursor:not-allowed}
+.bars{display:grid;gap:4px;font-family:ui-monospace,monospace;font-size:clamp(11px,1.3vw,12px)}
+.bar-row{display:grid;grid-template-columns:minmax(60px,110px) 1fr minmax(36px,60px);gap:8px;align-items:center;min-width:0}
+.bar-row > span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bar-row > span:last-child{text-align:right}
+.bar-track{background:#21262d;border-radius:3px;height:16px;overflow:hidden;position:relative;min-width:0}
+.bar-fill{background:linear-gradient(90deg,#388bfd,#58a6ff);height:100%;border-radius:3px}
+.panel[style*="height:auto"]{height:auto;max-height:none}
+@media(max-width:600px){
+  body{padding:10px}
+  h1{font-size:15px}
+  .panel{height:clamp(240px,40vh,420px)}
+  th,td{padding:4px 8px}
+  td{max-width:60vw}
+  .bar-row{grid-template-columns:minmax(48px,70px) 1fr minmax(30px,50px)}
+}
+</style>
+</head>
+<body>
+<h1><span id="title">ODoH</span> <span id="status" class="badge loading">LOADING</span> <span id="mode-badge" class="badge info" style="display:none">—</span></h1>
+<div class="sub">
+Protocol: RFC 9230 · Started: <span id="started">—</span> · Uptime: <span id="uptime">—</span> · <span id="conn" class="conn off">● disconnected</span>
+<br><span class="privacy" id="privacy">privacy: aggregate only</span>
+</div>
+
+<h2>Overview</h2>
+<div class="stats">
+  <div class="card"><div class="label" id="lbl-reqs">Requests</div><div class="value" id="st-requests">-</div></div>
+  <div class="card" id="card-blocked" style="display:none"><div class="label">Blocked</div><div class="value" id="st-blocked" style="color:var(--err)">-</div></div>
+  <div class="card" id="card-passed" style="display:none"><div class="label">Passed</div><div class="value" id="st-passed" style="color:var(--ok)">-</div></div>
+  <div class="card" id="card-blockrate" style="display:none"><div class="label">Block rate</div><div class="value" id="st-blockrate">-</div></div>
+  <div class="card"><div class="label">Errors</div><div class="value" id="st-errors" style="color:var(--warn)">-</div></div>
+  <div class="card"><div class="label">Panics</div><div class="value" id="st-panics" style="color:var(--err)">-</div></div>
+  <div class="card" id="card-blocked-domains" style="display:none"><div class="label">Blocked domains</div><div class="value" id="st-blocked-domains">-</div></div>
+</div>
+
+<h2>Throughput &amp; Latency</h2>
+<div class="stats">
+  <div class="card"><div class="label">QPS (last 1s)</div><div class="value" id="st-qps1">-</div></div>
+  <div class="card"><div class="label">QPS (60m avg)</div><div class="value" id="st-qps60">-</div></div>
+  <div class="card"><div class="label">QPS peak</div><div class="value" id="st-qpspeak">-</div></div>
+  <div class="card"><div class="label">Avg latency</div><div class="value" id="st-lat">-</div></div>
+  <div class="card"><div class="label">p95 latency</div><div class="value" id="st-p95">-</div></div>
+  <div class="card"><div class="label">Bytes in / out</div><div class="value" id="st-bytes">-</div></div>
+</div>
+
+<h2>Upstream health</h2>
+<div class="stats">
+  <div class="card"><div class="label">Last OK</div><div class="value" id="up-lastok" style="font-size:13px">-</div></div>
+  <div class="card"><div class="label">Last error</div><div class="value" id="up-lasterr" style="font-size:13px">-</div></div>
+  <div class="card"><div class="label">Consecutive fails</div><div class="value" id="up-consec">-</div></div>
+  <div class="card"><div class="label">OK / Fail</div><div class="value" id="up-count" style="font-size:13px">-</div></div>
+  <div class="card"><div class="label">Upstream avg</div><div class="value" id="up-avg" style="font-size:16px">-</div></div>
+  <div class="card"><div class="label">Last error msg</div><div class="value" id="up-errmsg" style="font-size:11px;word-break:break-all">-</div></div>
+</div>
+
+<h2>Traffic analysis</h2>
+<div class="panels">
+  <div class="panel" style="height:auto">
+    <div class="panel-head"><span>QPS history (60 min)</span></div>
+    <div class="card" style="margin:0;border:none;border-radius:0">
+      <div id="qps-hist" style="display:flex;gap:1px;align-items:flex-end;height:90px;min-height:90px"><span style="color:var(--muted)">no data</span></div>
+    </div>
+  </div>
+  <div class="panel" id="panel-resp" style="height:auto;display:none">
+    <div class="panel-head"><span>Response codes</span></div>
+    <div class="card" style="margin:0;border:none;border-radius:0"><div class="bars" id="resp-bars"><span style="color:var(--muted)">no data</span></div></div>
+  </div>
+  <div class="panel" id="panel-types" style="height:auto;display:none">
+    <div class="panel-head"><span>Query types</span></div>
+    <div class="card" style="margin:0;border:none;border-radius:0"><div class="bars" id="type-bars"><span style="color:var(--muted)">no data</span></div></div>
+  </div>
+</div>
+
+<h2 id="sources-hdr" style="display:none">Blocklist sources</h2>
+<div class="card" id="sources-card" style="display:none">
+  <div class="table-wrap">
+    <table><thead><tr><th>URL</th><th>Status</th><th>Last OK</th><th>Last Error</th><th>Domains</th><th>Loads</th></tr></thead>
+    <tbody id="src-body"><tr><td colspan="6" style="color:var(--muted)">no remote sources</td></tr></tbody></table>
+  </div>
+</div>
+
+<h2>System log</h2>
+<div class="panel" style="height:clamp(300px,45vh,500px)">
+  <div class="panel-head">
+    <span>Recent events</span>
+    <div>
+      <span style="font-size:11px;color:var(--muted)">events: <span id="lcount">0</span></span>
+      <button class="dl-btn" id="dl-log" type="button">⬇ CSV</button>
+    </div>
+  </div>
+  <div class="panel-body">
+    <table><thead><tr><th>Time</th><th>Level</th><th>Message</th></tr></thead>
+    <tbody id="lbody"><tr><td colspan="3" style="color:var(--muted)">no data</td></tr></tbody></table>
+  </div>
+</div>
+
+<script>
+(function(){
+  var $ = function(id){ return document.getElementById(id); };
+  var statusEl = $('status'), connEl = $('conn');
+  var MAX_LOGS = 200;
+  var lastLogKey = '';
+  var lastLogs = [];
+
+  function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); }
+  function fmtNum(n){ n=Number(n)||0; return n.toLocaleString(); }
+  function fmtMs(v){ return (Number(v)||0).toFixed(1)+' ms'; }
+  function fmtTime(iso){ try { return new Date(iso).toLocaleTimeString(); } catch(e){ return iso||'-'; } }
+  function fmtTimeUTC(iso){ if(iso==null||iso==='') return 'never'; var s=String(iso); return s.replace('T',' ').split('.')[0]+' UTC'; }
+  function fmtBytes(b){ b=Number(b)||0; if(b<1024) return b+' B'; if(b<1048576) return (b/1024).toFixed(1)+' KiB'; if(b<1073741824) return (b/1048576).toFixed(1)+' MiB'; return (b/1073741824).toFixed(2)+' GiB'; }
+  function fmtUptime(s){ s=Number(s)||0; var d=Math.floor(s/86400), h=Math.floor((s%86400)/3600), m=Math.floor((s%3600)/60), sec=Math.floor(s%60); var o=''; if(d)o+=d+'d '; if(h||d)o+=h+'h '; if(m||h||d)o+=m+'m '; o+=sec+'s'; return o.trim(); }
+  function setText(id, v){ var el=$(id); if(el) el.textContent = v; }
+
+  function renderKVBar(elId, arr){
+    var el = $(elId); if(!el) return;
+    el.innerHTML = '';
+    if(!arr || !arr.length){ el.innerHTML = '<span style="color:var(--muted)">no data</span>'; return; }
+    var max = arr[0].count || 1;
+    arr.forEach(function(kv){
+      var row = document.createElement('div'); row.className = 'bar-row';
+      var pct = (kv.count / max * 100).toFixed(0);
+      row.innerHTML = '<span title="'+esc(kv.name)+'">'+esc(kv.name)+'</span>'
+        + '<div class="bar-track"><div class="bar-fill" style="width:'+pct+'%"></div></div>'
+        + '<span>'+fmtNum(kv.count)+'</span>';
+      el.appendChild(row);
+    });
+  }
+
+  function renderTypeBars(m){
+    var el = $('type-bars'); if(!el) return;
+    el.innerHTML = '';
+    var keys = Object.keys(m || {});
+    if(!keys.length){ el.innerHTML = '<span style="color:var(--muted)">no data</span>'; return; }
+    keys.sort(function(a,b){ return m[b]-m[a]; });
+    var max = m[keys[0]] || 1;
+    keys.slice(0, 15).forEach(function(k){
+      var v = m[k]; var pct = (v / max * 100).toFixed(0);
+      var row = document.createElement('div'); row.className = 'bar-row';
+      row.innerHTML = '<span title="'+esc(k)+'">'+esc(k)+'</span>'
+        + '<div class="bar-track"><div class="bar-fill" style="width:'+pct+'%"></div></div>'
+        + '<span>'+fmtNum(v)+'</span>';
+      el.appendChild(row);
+    });
+  }
+
+  function renderQPSHistory(arr){
+    var el = $('qps-hist'); if(!el) return;
+    el.innerHTML = '';
+    if(!arr || !arr.length){ el.innerHTML = '<span style="color:var(--muted)">no data</span>'; return; }
+    var max = 0;
+    arr.forEach(function(v){ if(v > max) max = v; });
+    if(max === 0) max = 1;
+    arr.forEach(function(v, i){
+      var pct = v / max * 100;
+      var bar = document.createElement('div');
+      var color = v > 0 ? 'linear-gradient(180deg,#58a6ff,#388bfd)' : '#21262d';
+      bar.style.cssText = 'flex:1;background:'+color+';border-radius:1px 1px 0 0;min-width:2px;height:'+Math.max(pct,2)+'%';
+      bar.title = (arr.length - 1 - i) + 'm ago: ' + v + ' queries';
+      el.appendChild(bar);
+    });
+  }
+
+  function renderSources(arr){
+    var card = $('sources-card'), hdr = $('sources-hdr'), tb = $('src-body');
+    if(!arr || !arr.length){
+      if(card) card.style.display = 'none';
+      if(hdr) hdr.style.display = 'none';
+      return;
+    }
+    if(card) card.style.display = '';
+    if(hdr) hdr.style.display = '';
+    tb.innerHTML = '';
+    arr.forEach(function(s){
+      var tr = document.createElement('tr');
+      // Backend trả "" khi chưa load lần nào (formatOptTime).
+      var hasSuccess = !!s.last_success;
+      var hasError = !!s.last_error;
+      var cls = hasError ? 'error' : (hasSuccess ? 'ok' : 'pending');
+      var badgeTxt = hasError ? 'error' : (hasSuccess ? 'ok' : 'pending');
+      tr.innerHTML = '<td title="'+esc(s.url)+'">'+esc(s.url)+'</td>'
+        + '<td><span class="badge '+cls+'">'+badgeTxt+'</span></td>'
+        + '<td>'+esc(hasSuccess ? fmtTimeUTC(s.last_success) : '—')+'</td>'
+        + '<td style="color:'+(hasError?'var(--warn)':'var(--muted)')+'" title="'+esc(s.last_error||'—')+'">'+esc(s.last_error||'—')+'</td>'
+        + '<td>'+fmtNum(s.domain_count)+'</td>'
+        + '<td>'+fmtNum(s.total_loads)+' / '+fmtNum(s.failed_loads)+'</td>';
+      tb.appendChild(tr);
+    });
+  }
+
+  function renderLogs(arr){
+    var tb = $('lbody'); if(!tb) return;
+    if(!arr || !arr.length){
+      tb.innerHTML = '<tr><td colspan="3" style="color:var(--muted)">no data</td></tr>';
+      setText('lcount', 0);
+      lastLogs = [];
+      return;
+    }
+    var key = arr.length + '|' + ((arr[arr.length-1] && arr[arr.length-1].time) || '');
+    if(key !== lastLogKey) {
+      lastLogKey = key;
+      var rows = arr.slice(-MAX_LOGS).reverse();
+      var html = '';
+      rows.forEach(function(l){
+        var cls = l.level === 'error' ? 'error' : (l.level === 'warn' ? 'warn' : 'info');
+        html += '<tr>'
+          + '<td>'+esc(fmtTime(l.time))+'</td>'
+          + '<td><span class="badge '+cls+'">'+esc(l.level)+'</span></td>'
+          + '<td class="wrap" title="'+esc(l.message)+'">'+esc(l.message)+'</td>'
+          + '</tr>';
+      });
+      tb.innerHTML = html;
+      setText('lcount', arr.length);
+    }
+    lastLogs = arr;
+  }
+
+  function applyMode(d){
+    // Ưu tiên d.mode do backend khai báo; fallback heuristic cho bản cũ.
+    var isTarget = (d.mode === 'target') ||
+                   (d.mode == null && typeof d.blocked_domains === 'number');
+    var mb = $('mode-badge');
+    mb.style.display = '';
+    if (isTarget) {
+      mb.textContent = 'TARGET';
+      mb.className = 'badge info';
+      $('title').textContent = 'ODoH Target';
+      $('lbl-reqs').textContent = 'Queries';
+      $('card-blocked').style.display = '';
+      $('card-passed').style.display = '';
+      $('card-blockrate').style.display = '';
+      $('card-blocked-domains').style.display = '';
+      $('privacy').textContent = 'privacy: aggregate only — no per-query/client logging';
+    } else {
+      mb.textContent = 'PROXY';
+      mb.className = 'badge info';
+      $('title').textContent = 'ODoH Proxy';
+      $('lbl-reqs').textContent = 'Forwarded';
+      $('card-blocked').style.display = 'none';
+      $('card-passed').style.display = 'none';
+      $('card-blockrate').style.display = 'none';
+      $('card-blocked-domains').style.display = 'none';
+      $('privacy').textContent = 'privacy: opaque forwarding — no domain/query visibility by design';
+    }
+    return isTarget;
+  }
+
+  function refresh(){
+    fetch('/api/dashboard', { cache: 'no-store' })
+      .then(function(r){ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+      .then(function(d){
+        statusEl.textContent = 'RUNNING';
+        statusEl.className = 'badge ready';
+        connEl.textContent = '● live';
+        connEl.className = 'conn on';
+
+        var isTarget = applyMode(d);
+        setText('started', fmtTimeUTC(d.started));
+        setText('uptime', fmtUptime(d.uptime_seconds));
+
+        var reqs = Number(d.requests) || 0;
+        var errors = Number(d.errors) || 0;
+        var blocked = Number(d.blocked) || 0;
+        // Target: queries = blocked + passed + errors_after_query
+        // Proxy:  requests chỉ đếm forward thành công (errors riêng)
+        var passed = isTarget ? Math.max(0, reqs - blocked - errors) : reqs;
+
+        setText('st-requests', fmtNum(reqs));
+        setText('st-blocked', fmtNum(blocked));
+        setText('st-passed', fmtNum(passed));
+        setText('st-blockrate', (isTarget && reqs > 0) ? (blocked * 100 / reqs).toFixed(1) + '%' : '—');
+        setText('st-errors', fmtNum(errors));
+        setText('st-panics', fmtNum(d.panics));
+        if (isTarget) {
+          setText('st-blocked-domains', fmtNum(d.blocked_domains));
+        }
+
+        // QPS: qps_minute là 60 ô × 1 phút, mỗi ô = TỔNG query trong phút đó.
+        setText('st-qps1', (Number(d.qps_1s) || 0).toFixed(1));
+        var qps60 = 0;
+        if (Array.isArray(d.qps_minute) && d.qps_minute.length) {
+          var sum = 0;
+          for (var i = 0; i < d.qps_minute.length; i++) sum += Number(d.qps_minute[i]) || 0;
+          var upSec = Number(d.uptime_seconds) || 0;
+          if (upSec < 60) {
+            // Chưa đủ 1 phút: ô phút còn rỗng, dùng tức thời làm ước lượng
+            qps60 = Number(d.qps_1s) || 0;
+          } else {
+            var upMin = Math.max(1, Math.min(60, Math.floor(upSec / 60)));
+            qps60 = sum / (upMin * 60);
+          }
+        }
+        setText('st-qps60', qps60.toFixed(2));
+        setText('st-qpspeak', fmtNum(d.qps_peak));
+        setText('st-lat', fmtMs(d.avg_latency_ms));
+        setText('st-p95', fmtMs(d.p95_latency_ms));
+        setText('st-bytes', fmtBytes(d.bytes_in) + ' / ' + fmtBytes(d.bytes_out));
+
+        var uh = d.upstream || {};
+        setText('up-lastok', uh.last_ok ? fmtTimeUTC(uh.last_ok) : 'never');
+        setText('up-lasterr', uh.last_error ? fmtTimeUTC(uh.last_error) : 'never');
+        setText('up-consec', fmtNum(uh.consec_fails));
+        setText('up-count', fmtNum(uh.total_ok) + ' / ' + fmtNum(uh.total_fail));
+        setText('up-avg', fmtMs(uh.avg_latency_ms));
+        setText('up-errmsg', uh.last_error_msg || '—');
+
+        renderQPSHistory(d.qps_minute || []);
+
+        // Response codes: chỉ Target, chỉ hiện khi có data
+        var rc = d.resp_codes || [];
+        if (isTarget && rc.length) {
+          $('panel-resp').style.display = '';
+          renderKVBar('resp-bars', rc);
+        } else {
+          $('panel-resp').style.display = 'none';
+        }
+
+        // Query types: chỉ Target, chỉ hiện khi có data
+        var tb = d.type_breakdown || {};
+        if (isTarget && Object.keys(tb).length) {
+          $('panel-types').style.display = '';
+          renderTypeBars(tb);
+        } else {
+          $('panel-types').style.display = 'none';
+        }
+
+        renderSources(d.sources || []);
+        renderLogs(d.logs || []);
+      })
+      .catch(function(){
+        statusEl.textContent = 'DISCONNECTED';
+        statusEl.className = 'badge error';
+        connEl.textContent = '● offline';
+        connEl.className = 'conn off';
+      });
+  }
+
+  // CSV export phía client — không cần backend hỗ trợ
+  $('dl-log').addEventListener('click', function(){
+    if (!lastLogs.length) { alert('No logs to export'); return; }
+    function csvField(s) {
+      s = String(s == null ? '' : s);
+      return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    }
+    var lines = ['time,level,message'];
+    lastLogs.forEach(function(l){
+      lines.push([csvField(l.time), csvField(l.level), csvField(l.message)].join(','));
+    });
+    var blob = new Blob([lines.join('\n') + '\n'], {type: 'text/csv;charset=utf-8'});
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = 'odoh-log-' + new Date().toISOString().slice(0,19).replace(/:/g,'-') + '.csv';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  });
+
+  refresh();
+  var _dashTimer = null;
+  function _startPolling(){ if(_dashTimer!=null) return; _dashTimer = setInterval(refresh, 3000); }
+  function _stopPolling(){ if(_dashTimer==null) return; clearInterval(_dashTimer); _dashTimer = null; }
+  if (document.visibilityState === 'visible') _startPolling();
+  document.addEventListener('visibilitychange', function(){
+    if (document.visibilityState === 'visible') { refresh(); _startPolling(); }
+    else { _stopPolling(); }
+  });
+})();
+</script>
+</body>
+</html>

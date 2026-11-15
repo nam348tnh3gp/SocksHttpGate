@@ -1,26 +1,31 @@
 package main
 
 import (
-
 	"bytes"
 	"context"
 	"crypto/subtle"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
+	odoh "github.com/cloudflare/odoh-go"
 	"github.com/miekg/dns"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
-	odoh "github.com/cloudflare/odoh-go"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+//go:embed dashboard.html
+var dashboardHTML string
 
 const (
 	odohType = "application/oblivious-dns-message"
@@ -28,6 +33,25 @@ const (
 	maxBody  = 65535
 	maxList  = 10 << 20
 )
+
+// defaultBlocklistURL is used when BLOCKLIST_URLS is empty.
+const defaultBlocklistURL = "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
+
+// blockSOA is built once at startup for NXDOMAIN negative caching.
+var blockSOA dns.RR
+
+func init() {
+	soa, err := dns.NewRR("blocked.invalid. 60 IN SOA localhost. hostmaster.localhost. 1 3600 600 604800 60")
+	if err == nil {
+		blockSOA = soa
+	}
+}
+
+type logEntry struct {
+	Time    time.Time `json:"time"`
+	Level   string    `json:"level"`
+	Message string    `json:"message"`
+}
 
 type target struct {
 	kp                              odoh.ObliviousDoHKeyPair
@@ -39,6 +63,54 @@ type target struct {
 	refresh                         time.Duration
 	started                         time.Time
 	queries, blockedQueries, errors atomic.Uint64
+
+	// dashboard metrics
+	qpsCur    atomic.Uint64
+	qpsPeak   atomic.Uint64
+	qpsMu     sync.Mutex
+	qpsWin    [60]uint64
+	qpsIdx    int
+	qpsMin    [60]uint64
+	qpsMinIdx int
+	qpsMinAcc uint64
+	qpsMinCnt int
+
+	bytesIn  atomic.Uint64
+	bytesOut atomic.Uint64
+
+	latMu sync.Mutex
+	latS  []int64
+
+	upMu     sync.Mutex
+	upLastOK time.Time
+	upLastE  time.Time
+	upLastM  string
+	upCF     uint64
+	upOK     uint64
+	upFail   uint64
+	upSumUs  uint64
+	upLatS   []int64
+
+	respMu sync.Mutex
+	respC  map[string]uint64
+
+	typeMu sync.Mutex
+	types  map[string]uint64
+
+	logMu sync.Mutex
+	logs  []logEntry
+
+	// per-source state
+	srcMu sync.Mutex
+	srcSt map[string]*srcState
+}
+
+type srcState struct {
+	LastSuccess time.Time `json:"last_success"`
+	LastError   string    `json:"last_error"`
+	DomainCount int       `json:"domain_count"`
+	TotalLoads  uint64    `json:"total_loads"`
+	FailedLoads uint64    `json:"failed_loads"`
 }
 
 func loadSeed(inline, file string) (string, error) {
@@ -114,8 +186,16 @@ func main() {
 		refresh: refresh,
 		started: time.Now(),
 	}
+	t.respC = map[string]uint64{}
+	t.types = map[string]uint64{}
+	t.srcSt = map[string]*srcState{}
+	for _, s := range t.sources {
+		t.srcSt[s] = &srcState{}
+	}
+	go t.qpsLoop()
+
 	if len(t.sources) > 0 {
-		t.refreshLists()
+		go t.refreshLists()
 		go t.refreshLoop()
 	}
 
@@ -127,6 +207,16 @@ func main() {
 	mux.HandleFunc("/api/v1/status", t.apiStatus)
 	mux.HandleFunc("/.well-known/odohconfigs", t.configs)
 	// Rethink gọi GET /proxy để lấy configs, POST /proxy để query
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		_, _ = w.Write([]byte(dashboardHTML))
+	})
+	mux.HandleFunc("/api/dashboard", t.handleDashboard)
 	mux.HandleFunc("/dns-query", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
@@ -153,8 +243,15 @@ func main() {
 		MaxHeaderBytes:    16 << 10,
 	}
 
-	log.Printf("ODoH Target started; upstream=%s; remote_blocklist_sources=%d; per-query logging disabled", upstream, len(t.sources))
+	t.logf("info", "ODoH Target started; upstream=%s; sources=%d", upstream, len(t.sources))
 	log.Fatal(srv.ListenAndServe())
+}
+
+// incResp safely increments a response-code counter.
+func (t *target) incResp(name string) {
+	t.respMu.Lock()
+	t.respC[name]++
+	t.respMu.Unlock()
 }
 
 // configs publishes the ODoH config (RFC 9230 §5.1) so clients can fetch it.
@@ -169,6 +266,8 @@ func (t *target) configs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (t *target) query(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	t.qpsCur.Add(1)
 	// The archived odoh-go parser has unchecked length reads in its message-body decoder.
 	// A malicious client can craft an authenticated, malformed ODoH plaintext that panics it.
 	// Recover per request so one malformed message cannot terminate the Target process.
@@ -182,20 +281,24 @@ func (t *target) query(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		t.incResp("HTTP_405")
 		return
 	}
 	if mediaType(r.Header.Get("Content-Type")) != odohType {
 		http.Error(w, "unsupported media type", http.StatusUnsupportedMediaType)
+		t.incResp("HTTP_415")
 		return
 	}
 	if accept := r.Header.Get("Accept"); accept != "" && accept != "*/*" && mediaType(accept) != odohType {
 		http.Error(w, "not acceptable", http.StatusNotAcceptable)
+		t.incResp("HTTP_406")
 		return
 	}
 
 	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
 	if err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
+		t.incResp("HTTP_400")
 		return
 	}
 
@@ -241,6 +344,14 @@ func (t *target) query(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	t.queries.Add(1)
+	qtype := dns.TypeToString[q.Question[0].Qtype]
+	if qtype == "" {
+		qtype = "OTHER"
+	}
+	t.typeMu.Lock()
+	t.types[qtype]++
+	t.typeMu.Unlock()
+	t.bytesIn.Add(uint64(len(raw)))
 
 	var answer []byte
 	if t.isBlocked(q.Question[0].Name) {
@@ -248,8 +359,8 @@ func (t *target) query(w http.ResponseWriter, r *http.Request) {
 		reply.SetReply(q)
 		reply.Rcode = dns.RcodeNameError
 		reply.Authoritative = true
-		if soa, se := dns.NewRR("blocked.invalid. 60 IN SOA localhost. hostmaster.localhost. 1 3600 600 604800 60"); se == nil {
-			reply.Ns = []dns.RR{soa}
+		if blockSOA != nil {
+			reply.Ns = []dns.RR{blockSOA}
 		}
 		answer, err = reply.Pack()
 		t.blockedQueries.Add(1)
@@ -259,10 +370,16 @@ func (t *target) query(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil || len(answer) == 0 || len(answer) > 65535 {
 		t.errors.Add(1)
+		msg := "resolve error"
+		if err != nil {
+			msg = err.Error()
+		}
+		t.trackUpstreamFail(msg)
 		if err != nil {
 			log.Printf("resolve error: %v", err)
 		}
 		http.Error(w, "DNS resolution failed", http.StatusBadGateway)
+		t.incResp("HTTP_502")
 		return
 	}
 
@@ -271,12 +388,24 @@ func (t *target) query(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		t.errors.Add(1)
 		http.Error(w, "response encryption failed", http.StatusInternalServerError)
+		t.incResp("HTTP_500")
 		return
 	}
 
+	serialized := out.Marshal()
+	t.bytesOut.Add(uint64(len(serialized)))
+	rcName := "RCODE0"
+	if rm := new(dns.Msg); rm.Unpack(answer) == nil {
+		if n, ok := dns.RcodeToString[rm.Rcode]; ok {
+			rcName = n
+		}
+	}
+	t.incResp(rcName)
+	t.trackUpstreamOK(time.Since(start))
+
 	w.Header().Set("Content-Type", odohType)
 	w.Header().Set("Cache-Control", "no-store")
-	_, _ = w.Write(out.Marshal())
+	_, _ = w.Write(serialized)
 }
 
 func (t *target) resolve(ctx context.Context, wire []byte) ([]byte, error) {
@@ -320,8 +449,18 @@ func (t *target) refreshLists() {
 	success := 0
 
 	for _, src := range t.sources {
+		t.srcMu.Lock()
+		st := t.srcSt[src]
+		if st == nil {
+			st = &srcState{}
+			t.srcSt[src] = st
+		}
+		st.TotalLoads++
+		t.srcMu.Unlock()
+
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, src, nil)
+		ok := false
 		if err == nil {
 			resp, x := t.client.Do(req)
 			if x == nil && resp != nil {
@@ -332,6 +471,7 @@ func (t *target) refreshLists() {
 						addHosts(next, string(b))
 						if len(next) > before {
 							success++
+							ok = true
 						}
 					}
 				}
@@ -339,6 +479,16 @@ func (t *target) refreshLists() {
 			}
 		}
 		cancel()
+
+		t.srcMu.Lock()
+		if ok {
+			st.LastSuccess = time.Now()
+			st.LastError = ""
+		} else {
+			st.LastError = "download failed"
+			st.FailedLoads++
+		}
+		t.srcMu.Unlock()
 	}
 
 	if success == 0 {
@@ -438,6 +588,9 @@ func parseSources(raw string) []string {
 			out = append(out, u.String())
 		}
 	}
+	if len(out) == 0 {
+		return []string{defaultBlocklistURL}
+	}
 	return out
 }
 
@@ -489,6 +642,208 @@ func secureHeaders(next http.Handler) http.Handler {
 		// Do NOT set Cache-Control here; each handler decides.
 		next.ServeHTTP(w, r)
 	})
+}
+
+// ==================== Dashboard ====================
+
+func (t *target) qpsLoop() {
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+	for range tick.C {
+		cur := t.qpsCur.Swap(0)
+		if pk := t.qpsPeak.Load(); cur > pk {
+			t.qpsPeak.Store(cur)
+		}
+		t.qpsMu.Lock()
+		t.qpsWin[t.qpsIdx] = cur
+		t.qpsIdx = (t.qpsIdx + 1) % 60
+		t.qpsMinAcc += cur
+		t.qpsMinCnt++
+		if t.qpsMinCnt >= 60 {
+			t.qpsMin[t.qpsMinIdx] = t.qpsMinAcc
+			t.qpsMinIdx = (t.qpsMinIdx + 1) % 60
+			t.qpsMinAcc = 0
+			t.qpsMinCnt = 0
+		}
+		t.qpsMu.Unlock()
+	}
+}
+
+func (t *target) trackLatency(d time.Duration) {
+	t.latMu.Lock()
+	if len(t.latS) >= 500 {
+		copy(t.latS, t.latS[1:])
+		t.latS[len(t.latS)-1] = d.Milliseconds()
+	} else {
+		t.latS = append(t.latS, d.Milliseconds())
+	}
+	t.latMu.Unlock()
+}
+
+func (t *target) trackUpstreamOK(d time.Duration) {
+	t.upMu.Lock()
+	t.upLastOK = time.Now()
+	t.upOK++
+	t.upCF = 0
+	t.upSumUs += uint64(d.Microseconds())
+	if len(t.upLatS) >= 500 {
+		copy(t.upLatS, t.upLatS[1:])
+		t.upLatS[len(t.upLatS)-1] = d.Milliseconds()
+	} else {
+		t.upLatS = append(t.upLatS, d.Milliseconds())
+	}
+	t.upMu.Unlock()
+	t.trackLatency(d)
+}
+
+func (t *target) trackUpstreamFail(msg string) {
+	t.upMu.Lock()
+	t.upLastE = time.Now()
+	t.upLastM = msg
+	t.upFail++
+	t.upCF++
+	t.upMu.Unlock()
+}
+
+// logf appends to t.logs, which is exposed via the public dashboard.
+// NEVER pass query contents, domain names, client IPs, or any per-request
+// identifiers here. Assume everything written via logf will be world-readable.
+func (t *target) logf(level, f string, a ...any) {
+	msg := fmt.Sprintf(f, a...)
+	log.Print(msg)
+	t.logMu.Lock()
+	t.logs = append(t.logs, logEntry{Time: time.Now(), Level: level, Message: msg})
+	if len(t.logs) > 200 {
+		t.logs = t.logs[len(t.logs)-200:]
+	}
+	t.logMu.Unlock()
+}
+
+func (t *target) handleDashboard(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	t.qpsMu.Lock()
+	last1s := t.qpsWin[(t.qpsIdx-1+60)%60]
+	qpsMin := make([]uint64, 60)
+	for i := 0; i < 60; i++ {
+		qpsMin[i] = t.qpsMin[(t.qpsMinIdx+i)%60]
+	}
+	t.qpsMu.Unlock()
+
+	t.latMu.Lock()
+	samples := append([]int64(nil), t.latS...)
+	t.latMu.Unlock()
+	var avg, p95 float64
+	if len(samples) > 0 {
+		var sum int64
+		for _, v := range samples {
+			sum += v
+		}
+		avg = float64(sum) / float64(len(samples))
+		cp := append([]int64(nil), samples...)
+		sort.Slice(cp, func(i, j int) bool { return cp[i] < cp[j] })
+		p95 = float64(cp[int(float64(len(cp)-1)*0.95)])
+	}
+
+	t.upMu.Lock()
+	uh := map[string]any{
+		"total_ok":       t.upOK,
+		"total_fail":     t.upFail,
+		"consec_fails":   t.upCF,
+		"last_error_msg": t.upLastM,
+		"avg_latency_ms": 0.0,
+	}
+	if !t.upLastOK.IsZero() {
+		uh["last_ok"] = t.upLastOK.UTC().Format(time.RFC3339)
+	}
+	if !t.upLastE.IsZero() {
+		uh["last_error"] = t.upLastE.UTC().Format(time.RFC3339)
+	}
+	if n := uint64(len(t.upLatS)); n > 0 {
+		uh["avg_latency_ms"] = float64(t.upSumUs) / float64(n) / 1000.0
+	}
+	t.upMu.Unlock()
+
+	t.respMu.Lock()
+	respList := make([]map[string]any, 0, len(t.respC))
+	for k, v := range t.respC {
+		respList = append(respList, map[string]any{"name": k, "count": v})
+	}
+	t.respMu.Unlock()
+	sort.Slice(respList, func(i, j int) bool {
+		return respList[i]["count"].(uint64) > respList[j]["count"].(uint64)
+	})
+
+	t.typeMu.Lock()
+	types := make(map[string]uint64, len(t.types))
+	for k, v := range t.types {
+		types[k] = v
+	}
+	t.typeMu.Unlock()
+
+	t.mu.RLock()
+	blockedN := len(t.blocked)
+	t.mu.RUnlock()
+
+	t.srcMu.Lock()
+	srcs := make([]map[string]any, 0, len(t.sources))
+	for _, u := range t.sources {
+		st := t.srcSt[u]
+		if st == nil {
+			st = &srcState{}
+		}
+		srcs = append(srcs, map[string]any{
+			"url":          u,
+			"last_success": formatOptTime(st.LastSuccess),
+			"last_error":   st.LastError,
+			"domain_count": st.DomainCount,
+			"total_loads":  st.TotalLoads,
+			"failed_loads": st.FailedLoads,
+		})
+	}
+	t.srcMu.Unlock()
+
+	t.logMu.Lock()
+	logs := append([]logEntry(nil), t.logs...)
+	t.logMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Robots-Tag", "noindex, nofollow")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"service":         "ODoH Target",
+		"mode":            "target",
+		"started":         t.started.UTC().Format(time.RFC3339),
+		"uptime_seconds":  int64(time.Since(t.started).Seconds()),
+		"requests":        t.queries.Load(),
+		"blocked":         t.blockedQueries.Load(),
+		"errors":          t.errors.Load(),
+		"panics":          0,
+		"blocked_domains": blockedN,
+		"qps_1s":          float64(last1s),
+		"qps_peak":        t.qpsPeak.Load(),
+		"avg_latency_ms":  avg,
+		"p95_latency_ms":  p95,
+		"bytes_in":        t.bytesIn.Load(),
+		"bytes_out":       t.bytesOut.Load(),
+		"qps_minute":      qpsMin,
+		"upstream":        uh,
+		"resp_codes":      respList,
+		"type_breakdown":  types,
+		"sources":         srcs,
+		"logs":            logs,
+	})
+}
+
+func formatOptTime(tm time.Time) string {
+	if tm.IsZero() {
+		return ""
+	}
+	return tm.UTC().Format(time.RFC3339)
 }
 
 func env(k, d string) string {
