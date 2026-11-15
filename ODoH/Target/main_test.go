@@ -13,8 +13,14 @@ import (
 )
 
 // newTestTarget builds a target with all maps initialized, matching main().
-func newTestTarget(t *testing.T, kp odoh.ObliviousDoHKeyPair, upstream string, blocked map[string]struct{}) *target {
-	t.Helper()
+// testingTB is satisfied by both *testing.T and *testing.F.
+type testingTB interface {
+	Helper()
+	Fatalf(format string, args ...any)
+}
+
+func newTestTarget(tb testingTB, kp odoh.ObliviousDoHKeyPair, upstream string, blocked map[string]struct{}) *target {
+	tb.Helper()
 	if blocked == nil {
 		blocked = map[string]struct{}{}
 	}
@@ -246,7 +252,7 @@ func FuzzTargetMalformedODoH(f *testing.F) {
 	if err != nil {
 		f.Fatalf("create key pair: %v", err)
 	}
-	target := newTestTarget(t, kp, "", map[string]struct{}{})
+	target := newTestTarget(f, kp, "", map[string]struct{}{})
 
 	f.Fuzz(func(t *testing.T, raw []byte) {
 		if len(raw) > maxBody {
