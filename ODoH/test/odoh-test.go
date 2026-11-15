@@ -12,7 +12,7 @@ import (
 	"os"
 	"time"
 
-	odoh "github.com/cloudflare/odoh-go"
+	odoh "github.com/nam348tnh3gp/odoh-go"
 	"github.com/miekg/dns"
 )
 
