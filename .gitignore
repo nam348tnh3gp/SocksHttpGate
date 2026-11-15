@@ -8,7 +8,9 @@
 #                  proxy.js, proxy.rb, proxy.ex, proxy.py…),
 #                  Makefile, build.sh, go.mod, package.json, Gemfile…
 # ════════════════════════════════════════════════════════════════════
-
+# Temporary work dirs (must never be committed)
+ODoH/.work/
+.work/
 # ─── Binary build output ────────────────────────────────────────────
 /proxy
 /main
