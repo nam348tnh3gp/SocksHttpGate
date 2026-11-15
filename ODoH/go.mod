@@ -1,6 +1,6 @@
 module sockshttpgate-odoh
 
-go 1.23.0
+go 1.26.0
 
 require (
 	github.com/miekg/dns v1.1.63
