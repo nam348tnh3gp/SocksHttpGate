@@ -9,7 +9,9 @@
 *{box-sizing:border-box;margin:0;padding:0;min-width:0}
 html{overflow-x:hidden}
 body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;font-size:clamp(12px,1.6vw,14px);line-height:1.5;padding:var(--pad);overflow-x:hidden;max-width:100%}
-h1{font-size:clamp(15px,2.4vw,20px);margin-bottom:4px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.topbar{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:4px}
+h1{font-size:clamp(15px,2.4vw,20px);display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.actions{display:flex;gap:8px;align-items:center}
 h2{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin:14px 0 6px;font-weight:600}
 .sub{color:var(--muted);font-size:clamp(11px,1.4vw,13px);margin-bottom:14px;font-family:ui-monospace,monospace;overflow-wrap:anywhere;word-break:break-word}
 .sub .privacy{color:var(--muted);font-style:italic}
@@ -40,8 +42,10 @@ td.wrap{white-space:normal;word-break:break-word;overflow-wrap:anywhere;max-widt
 .conn{font-size:11px;white-space:nowrap}
 .conn.on{color:var(--ok)}
 .conn.off{color:var(--err)}
-.dl-btn{display:inline-block;padding:2px 8px;border:1px solid var(--border);border-radius:4px;color:var(--accent);text-decoration:none;font-size:11px;font-weight:600;background:rgba(88,166,255,.08);transition:all .15s;white-space:nowrap;cursor:pointer}
+.dl-btn{display:inline-block;padding:4px 10px;border:1px solid var(--border);border-radius:4px;color:var(--accent);text-decoration:none;font-size:11px;font-weight:600;background:rgba(88,166,255,.08);transition:all .15s;white-space:nowrap;cursor:pointer}
 .dl-btn:hover{background:rgba(88,166,255,.2);border-color:var(--accent)}
+.dl-btn.danger{color:var(--err);background:rgba(248,81,73,.08)}
+.dl-btn.danger:hover{background:rgba(248,81,73,.2);border-color:var(--err)}
 .dl-btn:disabled{opacity:.5;cursor:not-allowed}
 .bars{display:grid;gap:4px;font-family:ui-monospace,monospace;font-size:clamp(11px,1.3vw,12px)}
 .bar-row{display:grid;grid-template-columns:minmax(60px,110px) 1fr minmax(36px,60px);gap:8px;align-items:center;min-width:0}
@@ -50,6 +54,23 @@ td.wrap{white-space:normal;word-break:break-word;overflow-wrap:anywhere;max-widt
 .bar-track{background:#21262d;border-radius:3px;height:16px;overflow:hidden;position:relative;min-width:0}
 .bar-fill{background:linear-gradient(90deg,#388bfd,#58a6ff);height:100%;border-radius:3px}
 .panel[style*="height:auto"]{height:auto;max-height:none}
+
+/* Modal Đổi mật khẩu */
+.modal-backdrop{position:fixed;inset:0;background:rgba(1,4,9,.82);display:none;align-items:center;justify-content:center;z-index:999;padding:16px}
+.modal-box{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:22px;width:100%;max-width:380px}
+.modal-box h3{font-size:16px;margin-bottom:6px;color:var(--fg)}
+.modal-box p{font-size:12px;color:var(--warn);margin-bottom:14px}
+.modal-box label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
+.modal-box input{width:100%;padding:8px 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--fg);font-size:13px;margin-bottom:12px}
+.modal-box input:focus{outline:none;border-color:var(--accent)}
+.modal-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:6px}
+.btn-primary{padding:7px 14px;background:#238636;border:none;border-radius:6px;color:#fff;font-weight:600;font-size:13px;cursor:pointer}
+.btn-primary:hover{background:#2ea043}
+.btn-secondary{padding:7px 12px;background:transparent;border:1px solid var(--border);border-radius:6px;color:var(--fg);font-size:13px;cursor:pointer}
+.modal-msg{font-size:12px;margin-bottom:10px;display:none}
+.modal-msg.err{color:var(--err)}
+.modal-msg.ok{color:var(--ok)}
+
 @media(max-width:600px){
   body{padding:10px}
   h1{font-size:15px}
@@ -61,7 +82,13 @@ td.wrap{white-space:normal;word-break:break-word;overflow-wrap:anywhere;max-widt
 </style>
 </head>
 <body>
-<h1><span id="title">ODoH</span> <span id="status" class="badge loading">LOADING</span> <span id="mode-badge" class="badge info" style="display:none">—</span></h1>
+<div class="topbar">
+  <h1><span id="title">ODoH</span> <span id="status" class="badge loading">LOADING</span> <span id="mode-badge" class="badge info" style="display:none">—</span></h1>
+  <div class="actions">
+    <button class="dl-btn" id="btn-open-pw" type="button">Đổi mật khẩu</button>
+    <a class="dl-btn danger" href="/api/logout">Đăng xuất</a>
+  </div>
+</div>
 <div class="sub">
 Protocol: RFC 9230 · Started: <span id="started">—</span> · Uptime: <span id="uptime">—</span> · <span id="conn" class="conn off">● disconnected</span>
 <br><span class="privacy" id="privacy">privacy: aggregate only</span>
@@ -70,7 +97,7 @@ Protocol: RFC 9230 · Started: <span id="started">—</span> · Uptime: <span id
 <h2>Overview</h2>
 <div class="stats">
   <div class="card"><div class="label" id="lbl-reqs">Requests</div><div class="value" id="st-requests">-</div></div>
-  <div class="card" id="card-blocked" style="display:none"><div class="label">Blocked</div><div class="value" id="st-blocked" style="color:var(--err)">-</div></div>
+  <div class="card" id="card-blocked"><div class="label" id="lbl-blocked">Rate Limited</div><div class="value" id="st-blocked" style="color:var(--err)">-</div></div>
   <div class="card" id="card-passed" style="display:none"><div class="label">Passed</div><div class="value" id="st-passed" style="color:var(--ok)">-</div></div>
   <div class="card" id="card-blockrate" style="display:none"><div class="label">Block rate</div><div class="value" id="st-blockrate">-</div></div>
   <div class="card"><div class="label">Errors</div><div class="value" id="st-errors" style="color:var(--warn)">-</div></div>
@@ -139,6 +166,27 @@ Protocol: RFC 9230 · Started: <span id="started">—</span> · Uptime: <span id
   </div>
 </div>
 
+<!-- Modal Đổi mật khẩu -->
+<div class="modal-backdrop" id="pw-modal">
+  <div class="modal-box">
+    <h3 id="pw-title">Đổi mật khẩu quản trị</h3>
+    <p id="pw-warn" style="display:none">Bạn đang sử dụng mật khẩu mặc định (admin). Vui lòng đổi mật khẩu mới để bảo mật hệ thống.</p>
+    <div id="pw-msg" class="modal-msg"></div>
+    <form id="pw-form">
+      <label>Mật khẩu hiện tại</label>
+      <input type="password" id="pw-old" autocomplete="current-password" required>
+      <label>Mật khẩu mới (tối thiểu 6 ký tự)</label>
+      <input type="password" id="pw-new" autocomplete="new-password" minlength="6" required>
+      <label>Xác nhận mật khẩu mới</label>
+      <input type="password" id="pw-confirm" autocomplete="new-password" minlength="6" required>
+      <div class="modal-actions">
+        <button type="button" class="btn-secondary" id="pw-cancel">Hủy</button>
+        <button type="submit" class="btn-primary" id="pw-submit">Lưu mật khẩu</button>
+      </div>
+    </form>
+  </div>
+</div>
+
 <script>
 (function(){
   var $ = function(id){ return document.getElementById(id); };
@@ -146,6 +194,7 @@ Protocol: RFC 9230 · Started: <span id="started">—</span> · Uptime: <span id
   var MAX_LOGS = 200;
   var lastLogKey = '';
   var lastLogs = [];
+  var forcePwChange = false;
 
   function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); }
   function fmtNum(n){ n=Number(n)||0; return n.toLocaleString(); }
@@ -155,6 +204,71 @@ Protocol: RFC 9230 · Started: <span id="started">—</span> · Uptime: <span id
   function fmtBytes(b){ b=Number(b)||0; if(b<1024) return b+' B'; if(b<1048576) return (b/1024).toFixed(1)+' KiB'; if(b<1073741824) return (b/1048576).toFixed(1)+' MiB'; return (b/1073741824).toFixed(2)+' GiB'; }
   function fmtUptime(s){ s=Number(s)||0; var d=Math.floor(s/86400), h=Math.floor((s%86400)/3600), m=Math.floor((s%3600)/60), sec=Math.floor(s%60); var o=''; if(d)o+=d+'d '; if(h||d)o+=h+'h '; if(m||h||d)o+=m+'m '; o+=sec+'s'; return o.trim(); }
   function setText(id, v){ var el=$(id); if(el) el.textContent = v; }
+
+  // Password Modal Logic
+  function openPwModal(forced) {
+    forcePwChange = !!forced;
+    $('pw-warn').style.display = forcePwChange ? 'block' : 'none';
+    $('pw-cancel').style.display = forcePwChange ? 'none' : 'inline-block';
+    $('pw-msg').style.display = 'none';
+    $('pw-form').reset();
+    $('pw-modal').style.display = 'flex';
+  }
+  function closePwModal() {
+    if (forcePwChange) return;
+    $('pw-modal').style.display = 'none';
+  }
+  $('btn-open-pw').addEventListener('click', function(){ openPwModal(false); });
+  $('pw-cancel').addEventListener('click', closePwModal);
+
+  $('pw-form').addEventListener('submit', async function(e){
+    e.preventDefault();
+    var msgEl = $('pw-msg');
+    var oldP = $('pw-old').value;
+    var newP = $('pw-new').value;
+    var cfmP = $('pw-confirm').value;
+    msgEl.style.display = 'none';
+
+    if (newP !== cfmP) {
+      msgEl.textContent = 'Mật khẩu xác nhận không khớp';
+      msgEl.className = 'modal-msg err';
+      msgEl.style.display = 'block';
+      return;
+    }
+    if (newP === 'admin') {
+      msgEl.textContent = 'Không được đặt lại mật khẩu mặc định "admin"';
+      msgEl.className = 'modal-msg err';
+      msgEl.style.display = 'block';
+      return;
+    }
+
+    $('pw-submit').disabled = true;
+    try {
+      var r = await fetch('/api/change-password', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ old_password: oldP, new_password: newP })
+      });
+      var d = await r.json().catch(()=>({}));
+      if (!r.ok) {
+        msgEl.textContent = d.error || ('Lỗi ' + r.status);
+        msgEl.className = 'modal-msg err';
+        msgEl.style.display = 'block';
+      } else {
+        forcePwChange = false;
+        msgEl.textContent = 'Đổi mật khẩu thành công!';
+        msgEl.className = 'modal-msg ok';
+        msgEl.style.display = 'block';
+        setTimeout(function(){ $('pw-modal').style.display = 'none'; }, 900);
+      }
+    } catch (err) {
+      msgEl.textContent = 'Lỗi kết nối máy chủ';
+      msgEl.className = 'modal-msg err';
+      msgEl.style.display = 'block';
+    } finally {
+      $('pw-submit').disabled = false;
+    }
+  });
 
   function renderKVBar(elId, arr){
     var el = $(elId); if(!el) return;
@@ -217,7 +331,6 @@ Protocol: RFC 9230 · Started: <span id="started">—</span> · Uptime: <span id
     tb.innerHTML = '';
     arr.forEach(function(s){
       var tr = document.createElement('tr');
-      // Backend trả "" khi chưa load lần nào (formatOptTime).
       var hasSuccess = !!s.last_success;
       var hasError = !!s.last_error;
       var cls = hasError ? 'error' : (hasSuccess ? 'ok' : 'pending');
@@ -260,7 +373,6 @@ Protocol: RFC 9230 · Started: <span id="started">—</span> · Uptime: <span id
   }
 
   function applyMode(d){
-    // Ưu tiên d.mode do backend khai báo; fallback heuristic cho bản cũ.
     var isTarget = (d.mode === 'target') ||
                    (d.mode == null && typeof d.blocked_domains === 'number');
     var mb = $('mode-badge');
@@ -270,6 +382,7 @@ Protocol: RFC 9230 · Started: <span id="started">—</span> · Uptime: <span id
       mb.className = 'badge info';
       $('title').textContent = 'ODoH Target';
       $('lbl-reqs').textContent = 'Queries';
+      $('lbl-blocked').textContent = 'Blocked';
       $('card-blocked').style.display = '';
       $('card-passed').style.display = '';
       $('card-blockrate').style.display = '';
@@ -280,7 +393,8 @@ Protocol: RFC 9230 · Started: <span id="started">—</span> · Uptime: <span id
       mb.className = 'badge info';
       $('title').textContent = 'ODoH Proxy';
       $('lbl-reqs').textContent = 'Forwarded';
-      $('card-blocked').style.display = 'none';
+      $('lbl-blocked').textContent = 'Rate Limited';
+      $('card-blocked').style.display = '';
       $('card-passed').style.display = 'none';
       $('card-blockrate').style.display = 'none';
       $('card-blocked-domains').style.display = 'none';
@@ -291,8 +405,16 @@ Protocol: RFC 9230 · Started: <span id="started">—</span> · Uptime: <span id
 
   function refresh(){
     fetch('/api/dashboard', { cache: 'no-store' })
-      .then(function(r){ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+      .then(function(r){
+        if (r.status === 401) { window.location.reload(); throw new Error('Unauthorized'); }
+        if(!r.ok) throw new Error('HTTP '+r.status);
+        return r.json();
+      })
       .then(function(d){
+        if (d.must_change_password && $('pw-modal').style.display !== 'flex') {
+          openPwModal(true);
+        }
+
         statusEl.textContent = 'RUNNING';
         statusEl.className = 'badge ready';
         connEl.textContent = '● live';
@@ -305,8 +427,6 @@ Protocol: RFC 9230 · Started: <span id="started">—</span> · Uptime: <span id
         var reqs = Number(d.requests) || 0;
         var errors = Number(d.errors) || 0;
         var blocked = Number(d.blocked) || 0;
-        // Target: queries = blocked + passed + errors_after_query
-        // Proxy:  requests chỉ đếm forward thành công (errors riêng)
         var passed = isTarget ? Math.max(0, reqs - blocked - errors) : reqs;
 
         setText('st-requests', fmtNum(reqs));
@@ -319,7 +439,6 @@ Protocol: RFC 9230 · Started: <span id="started">—</span> · Uptime: <span id
           setText('st-blocked-domains', fmtNum(d.blocked_domains));
         }
 
-        // QPS: qps_minute là 60 ô × 1 phút, mỗi ô = TỔNG query trong phút đó.
         setText('st-qps1', (Number(d.qps_1s) || 0).toFixed(1));
         var qps60 = 0;
         if (Array.isArray(d.qps_minute) && d.qps_minute.length) {
@@ -327,7 +446,6 @@ Protocol: RFC 9230 · Started: <span id="started">—</span> · Uptime: <span id
           for (var i = 0; i < d.qps_minute.length; i++) sum += Number(d.qps_minute[i]) || 0;
           var upSec = Number(d.uptime_seconds) || 0;
           if (upSec < 60) {
-            // Chưa đủ 1 phút: ô phút còn rỗng, dùng tức thời làm ước lượng
             qps60 = Number(d.qps_1s) || 0;
           } else {
             var upMin = Math.max(1, Math.min(60, Math.floor(upSec / 60)));
@@ -350,7 +468,6 @@ Protocol: RFC 9230 · Started: <span id="started">—</span> · Uptime: <span id
 
         renderQPSHistory(d.qps_minute || []);
 
-        // Response codes: chỉ Target, chỉ hiện khi có data
         var rc = d.resp_codes || [];
         if (isTarget && rc.length) {
           $('panel-resp').style.display = '';
@@ -359,7 +476,6 @@ Protocol: RFC 9230 · Started: <span id="started">—</span> · Uptime: <span id
           $('panel-resp').style.display = 'none';
         }
 
-        // Query types: chỉ Target, chỉ hiện khi có data
         var tb = d.type_breakdown || {};
         if (isTarget && Object.keys(tb).length) {
           $('panel-types').style.display = '';
@@ -379,7 +495,6 @@ Protocol: RFC 9230 · Started: <span id="started">—</span> · Uptime: <span id
       });
   }
 
-  // CSV export phía client — không cần backend hỗ trợ
   $('dl-log').addEventListener('click', function(){
     if (!lastLogs.length) { alert('No logs to export'); return; }
     function csvField(s) {
